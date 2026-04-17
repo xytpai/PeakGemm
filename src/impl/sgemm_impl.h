@@ -307,6 +307,18 @@ REGISTER_SGEMM_IMPL(/*BLOCK_M*/ 32, /*BLOCK_N*/ 64, /*BLOCK_K*/ 16, /*BLOCK_M_WA
 REGISTER_SGEMM_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
 REGISTER_SGEMM_IMPL(/*BLOCK_M*/ 64, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
 
+void sgemm_peak(
+    float *c,
+    const float *a,
+    const float *b,
+    const int m,
+    const int n,
+    const int k,
+    gpuStream_t stream) {
+    GET_SGEMM_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
+    (c, a, b, m, n, k, stream);
+}
+
 #elif defined(__HIPCC__)
 
 REGISTER_SGEMM_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
