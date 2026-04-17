@@ -3,6 +3,8 @@ import torch
 import argparse
 import functools
 import numpy as np
+import warnings
+warnings.simplefilter('once')
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
@@ -38,6 +40,7 @@ def ref_func(a, b, c):
 
 def func(a, b, c):
     if a.dtype == torch.float:
+        warnings.warn('NOTE: The SGEMM has not been optimized. It\'s treated as a reference path.')
         PeakGemm.sgemm_peak(c, a, b)
 
 
