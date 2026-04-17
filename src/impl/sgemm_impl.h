@@ -438,7 +438,7 @@ void sgemm_(
         sgemm_kernel<scalar_t, /*BLOCK_K*/ BLOCK_K,
                      /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_M_STEPS*/ 2, /*WARP_N_STEPS*/ 2,
                      /*WARP_M_THREADS*/ 8, /*WARP_N_THREADS*/ 8, /*VEC_M*/ 4, /*VEC_N*/ 4,
-                     64, false><<<grid, block, 0, stream>>>(out, a, b, m, n, k, alpha, beta);
+                     64, false><<<grid, block, 0, stream>>>(out, a, b, m, n, k, alpha, beta, 1);
     } else {
         assert(false);
     }

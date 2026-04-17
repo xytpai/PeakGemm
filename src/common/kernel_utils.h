@@ -1,7 +1,6 @@
 #pragma once
 
 #include "device_common.h"
-#include "negzero.h"
 
 namespace kernel_utils {
 
