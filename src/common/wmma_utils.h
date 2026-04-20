@@ -171,10 +171,20 @@ struct WMMA_M16N16K32 {
         c.val[3] = val;
     }
 
+    template <uint32_t VEC_BITS = 3>
+    __device__ __forceinline__ uint32_t swizzle(uint32_t addr) {
+        constexpr uint32_t COL_BITS = 7 - 4; // 32*4B (7bits) - 16B (4bits)
+        constexpr uint32_t COL_MASK = ((1 << COL_BITS) - 1) << VEC_BITS;
+        return ((addr >> VEC_BITS) & COL_MASK) ^ addr;
+    }
+
     __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, int soffset, int stride) {
         auto x = w_tid / 16 * 8;
         auto y = w_tid % 16;
         uint32_t offset_ = soffset + y * stride + x;
+        if constexpr (USE_SWIZZLE) {
+            offset_ = swizzle(offset_);
+        }
         a = *reinterpret_cast<FragmentAT *>(base_ptr + offset_);
     }
 
@@ -182,6 +192,9 @@ struct WMMA_M16N16K32 {
         auto x = w_tid / 16 * 8;
         auto y = w_tid % 16;
         uint32_t offset_ = soffset + y * stride + x;
+        if constexpr (USE_SWIZZLE) {
+            offset_ = swizzle(offset_);
+        }
         b = *reinterpret_cast<FragmentBT *>(base_ptr + offset_);
     }
 
