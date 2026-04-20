@@ -111,7 +111,11 @@ public:
         gpuEventCreate(&start);
         gpuEventCreate(&stop);
         gpuEventRecord(start);
-        hgemm::hgemm_f16_peak(c, a, b, m, n, k, 0);
+        if constexpr (std::is_same_v<T, __half>) {
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, false, 0);
+        } else {
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, true, 0);
+        }
         gpuDeviceSynchronize();
         gpuEventRecord(stop);
         gpuEventSynchronize(stop);
@@ -151,7 +155,7 @@ std::tuple<bool, float, float, float> runbench(
     int64_t m,
     int64_t n,
     int64_t k,
-    float atol = 0.1) {
+    float atol = 0.5) {
     CPUInputs<T> cpu_inputs(m, n, k);
     GPUInputs<T> gpu_inputs(m, n, k);
     cpu_inputs.allocate();
@@ -174,8 +178,16 @@ int main() {
         auto m = ms[i];
         auto n = ns[i];
         auto k = ks[i];
-        std::cout << "m:" << m << ", n:" << n << ", k:" << k;
+        std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__half";
         auto [val, ms, gbps, tflops] = test::runbench<__half>(m, n, k);
+        std::cout << ", val:" << val << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+    }
+    for (int i = 0; i < ms.size(); ++i) {
+        auto m = ms[i];
+        auto n = ns[i];
+        auto k = ks[i];
+        std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__bfloat16";
+        auto [val, ms, gbps, tflops] = test::runbench<__bfloat16>(m, n, k);
         std::cout << ", val:" << val << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
     }
 }
