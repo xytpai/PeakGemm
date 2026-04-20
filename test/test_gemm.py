@@ -39,13 +39,7 @@ def ref_func(a, b, c):
 
 
 def func(a, b, c):
-    if a.dtype == torch.float:
-        warnings.warn('NOTE: The SGEMM has not been optimized. It\'s treated as a reference path.')
-        PeakGemm.sgemm_peak(c, a, b)
-    elif a.dtype == torch.half:
-        PeakGemm.hgemm_f16_peak(c, a, b)
-    else:
-        raise NotImplementedError(f"No kernel for dtype={a.dtype}")
+    PeakGemm.gemm_peak(c, a, b)
 
 
 def benchmark(args, func, ref_func, warmup=10, niters=50, sole_inputs=False):
@@ -120,3 +114,7 @@ if __name__ == '__main__':
     # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=f16
     # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=f16
     # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=f16
+
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16

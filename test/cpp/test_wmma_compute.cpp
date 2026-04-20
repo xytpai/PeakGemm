@@ -159,5 +159,16 @@ int main() {
         }
     }
 
+    {
+        constexpr int WARP_SIZE = 32;
+        using WMMAT = WMMA_M16N8K16<__bfloat16, float, false>;
+        std::cout << "======== " << typeid(WMMAT).name() << ", WARP_SIZE=" << WARP_SIZE << " ========\n";
+        wmma_test<typename WMMAT::ComputeT, WMMAT, ACC_TEST_BLOCK_WARPS, WARP_SIZE, ACC_TEST_LOOP, ACC_TEST_NBLOCKS, true>();
+        for (int i = 0; i < 3; i++) {
+            auto tflops = wmma_test<typename WMMAT::ComputeT, WMMAT, BLOCK_WARPS, WARP_SIZE, LOOP, NBLOCKS, false>();
+            std::cout << tflops << " TFLOPS" << std::endl;
+        }
+    }
+
     return 0;
 }
