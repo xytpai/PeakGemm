@@ -140,3 +140,4 @@
 
 #include "kernel_utils.h"
 #include "float8.h"
+#include "wmma_utils.h"
