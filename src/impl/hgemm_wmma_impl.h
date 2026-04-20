@@ -60,6 +60,7 @@ struct BlockTile {
     __device__ __forceinline__ void ldg_copy_async(
         scalar_t *as, scalar_t *bs,
         const scalar_t *a, int a_stride, const scalar_t *b, int b_stride) {
+#ifdef __CUDACC__
 #pragma unroll
         for (int i = 0; i < LDG_REG_A_COUNT; i++) {
             int tid_ = BLOCK_THREADS * i + tid;
@@ -78,6 +79,48 @@ struct BlockTile {
                 &(reinterpret_cast<ldg_vec_t *>(
                     const_cast<scalar_t *>(b) + (tid_ / LDG_B_X_THREADS) * b_stride)[ldg_b_vec_idx]));
         }
+#elif defined(__HIPCC__)
+        constexpr int DMA_BYTES = 16;
+        constexpr int LDS_U32_PER_DMA = DMA_BYTES / 4;
+        auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
+        auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
+        auto as_lds = reinterpret_cast<as3_uint32_ptr>((size_t)as);
+        auto bs_lds = reinterpret_cast<as3_uint32_ptr>((size_t)bs);
+        as3_uint32_ptr as_warp = as_lds + (wid * WARP_SIZE * LDS_U32_PER_DMA);
+        as3_uint32_ptr bs_warp = bs_lds + (wid * WARP_SIZE * LDS_U32_PER_DMA);
+#pragma unroll
+        for (int i = 0; i < LDG_REG_A_COUNT; i++) {
+            int tid_ = BLOCK_THREADS * i + tid;
+            int local_offset = (tid_ / LDG_A_X_THREADS) * BLOCK_K + ldg_a_vec_idx * LDG_VEC_SIZE;
+            local_offset = wmma.swizzle(local_offset);
+            int global_offset = (local_offset / BLOCK_K) * a_stride + local_offset % BLOCK_K;
+            as3_uint32_ptr dst = as_warp + (w_tid * LDS_U32_PER_DMA) + (i * BLOCK_THREADS * LDS_U32_PER_DMA);
+            llvm_amdgcn_raw_buffer_load_lds(
+                a_rsrc,
+                dst,
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                1);
+        }
+#pragma unroll
+        for (int i = 0; i < LDG_REG_B_COUNT; i++) {
+            int tid_ = BLOCK_THREADS * i + tid;
+            int local_offset = (tid_ / LDG_B_X_THREADS) * BLOCK_K + ldg_b_vec_idx * LDG_VEC_SIZE;
+            local_offset = wmma.swizzle(local_offset);
+            int global_offset = (local_offset / BLOCK_K) * b_stride + local_offset % BLOCK_K;
+            as3_uint32_ptr dst = bs_warp + (w_tid * LDS_U32_PER_DMA) + (i * BLOCK_THREADS * LDS_U32_PER_DMA);
+            llvm_amdgcn_raw_buffer_load_lds(
+                b_rsrc,
+                dst,
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                1);
+        }
+#endif
     }
 
     template <int S = 0>
