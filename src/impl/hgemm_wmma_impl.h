@@ -224,6 +224,8 @@ std::tuple<dim3, int> get_grid(int m, int n, int BLOCK_M, int BLOCK_N) {
     return {dim3(bn, bm, 1), raster_factor};
 }
 
+#ifdef __CUDACC__
+
 #define GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES) \
     hgemm_wmma_m16n8k16_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##WARP_SIZE##_s##STAGES##_
 
@@ -252,8 +254,6 @@ std::tuple<dim3, int> get_grid(int m, int n, int BLOCK_M, int BLOCK_N) {
         }                                                                                                                          \
     }
 
-#ifdef __CUDACC__
-
 REGISTER_HGEMM_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 4)
 
 void hgemm_peak(
@@ -270,6 +270,49 @@ void hgemm_peak(
 }
 
 #elif defined(__HIPCC__)
+
+#define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES) \
+    hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##WARP_SIZE##_s##STAGES##_
+
+#define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)             \
+    void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)(           \
+        short *c, const short *a, const short *b, const int m, const int n, const int k, const bool is_bf16, gpuStream_t stream) { \
+        constexpr int VEC_SIZE = 8;                                                                                                \
+        assert(n % VEC_SIZE == 0);                                                                                                 \
+        assert(k % VEC_SIZE == 0);                                                                                                 \
+        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N);                                                                                \
+        dim3 grid = std::get<0>(gr);                                                                                               \
+        constexpr int BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE;                                                      \
+        dim3 block(BLOCK_SIZE);                                                                                                    \
+        constexpr int WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / 16;                                                                 \
+        constexpr int WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / 16;                                                                 \
+        if (is_bf16 == false) {                                                                                                    \
+            using T = __half;                                                                                                      \
+            using WMMAT = WMMA_M16N16K32<T, float>;                                                                                \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                   \
+                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                     \
+        } else {                                                                                                                   \
+            using T = __bfloat16;                                                                                                  \
+            using WMMAT = WMMA_M16N16K32<T, float>;                                                                                \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                   \
+                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                     \
+        }                                                                                                                          \
+    }
+
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+
+void hgemm_peak(
+    short *c,
+    const short *a,
+    const short *b,
+    const int m,
+    const int n,
+    const int k,
+    const bool is_bf16,
+    gpuStream_t stream) {
+    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+    (c, a, b, m, n, k, is_bf16, stream);
+}
 
 #endif
 

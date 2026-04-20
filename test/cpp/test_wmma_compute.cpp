@@ -96,27 +96,27 @@ float wmma_test() {
     scalar_t *gpu_a;
     scalar_t *gpu_b;
     float *gpu_c;
-    cudaMalloc(&gpu_c, LEN_C * sizeof(float));
-    cudaMalloc(&gpu_a, LEN_A * sizeof(scalar_t));
-    cudaMalloc(&gpu_b, LEN_B * sizeof(scalar_t));
-    cudaMemcpy(gpu_c, cpu_c, LEN_C * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_a, cpu_a, LEN_A * sizeof(scalar_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_b, cpu_b, LEN_B * sizeof(scalar_t), cudaMemcpyHostToDevice);
+    gpuMalloc(&gpu_c, LEN_C * sizeof(float));
+    gpuMalloc(&gpu_a, LEN_A * sizeof(scalar_t));
+    gpuMalloc(&gpu_b, LEN_B * sizeof(scalar_t));
+    gpuMemcpy(gpu_c, cpu_c, LEN_C * sizeof(float), gpuMemcpyHostToDevice);
+    gpuMemcpy(gpu_a, cpu_a, LEN_A * sizeof(scalar_t), gpuMemcpyHostToDevice);
+    gpuMemcpy(gpu_b, cpu_b, LEN_B * sizeof(scalar_t), gpuMemcpyHostToDevice);
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    gpuEvent_t start, stop;
+    gpuEventCreate(&start);
+    gpuEventCreate(&stop);
+    gpuEventRecord(start);
 
     wmma_loop_kernel<scalar_t, WMMAT, BLOCK_WARPS, WARP_SIZE, LOOP><<<numBlocks, threadsPerBlock>>>(gpu_c, gpu_a, gpu_b);
-    cudaDeviceSynchronize();
+    gpuDeviceSynchronize();
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    gpuEventRecord(stop);
+    gpuEventSynchronize(stop);
     float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
+    gpuEventElapsedTime(&ms, start, stop);
 
-    cudaMemcpy(cpu_c, gpu_c, LEN_C * sizeof(float), cudaMemcpyDeviceToHost);
+    gpuMemcpy(cpu_c, gpu_c, LEN_C * sizeof(float), gpuMemcpyDeviceToHost);
 
     if constexpr (VALID) {
         float maxdiff = -1.0;
@@ -128,9 +128,9 @@ float wmma_test() {
         std::cout << "maxdiff:" << maxdiff << "\n";
     }
 
-    cudaFree(gpu_a);
-    cudaFree(gpu_b);
-    cudaFree(gpu_c);
+    gpuFree(gpu_a);
+    gpuFree(gpu_b);
+    gpuFree(gpu_c);
     delete[] cpu_a;
     delete[] cpu_b;
     delete[] cpu_c;
@@ -147,6 +147,8 @@ int main() {
     constexpr int LOOP = 1000000;
     constexpr int NBLOCKS = 4096;
     constexpr int BLOCK_WARPS = 8;
+
+#ifdef __CUDACC__
 
     {
         constexpr int WARP_SIZE = 32;
@@ -169,6 +171,32 @@ int main() {
             std::cout << tflops << " TFLOPS" << std::endl;
         }
     }
+
+#elif defined(__HIPCC__)
+
+    {
+        constexpr int WARP_SIZE = 64;
+        using WMMAT = WMMA_M16N16K32<__half, float, false>;
+        std::cout << "======== " << typeid(WMMAT).name() << ", WARP_SIZE=" << WARP_SIZE << " ========\n";
+        wmma_test<typename WMMAT::ComputeT, WMMAT, ACC_TEST_BLOCK_WARPS, WARP_SIZE, ACC_TEST_LOOP, ACC_TEST_NBLOCKS, true>();
+        for (int i = 0; i < 3; i++) {
+            auto tflops = wmma_test<typename WMMAT::ComputeT, WMMAT, BLOCK_WARPS, WARP_SIZE, LOOP, NBLOCKS, false>();
+            std::cout << tflops << " TFLOPS" << std::endl;
+        }
+    }
+
+    {
+        constexpr int WARP_SIZE = 64;
+        using WMMAT = WMMA_M16N16K32<__bfloat16, float, false>;
+        std::cout << "======== " << typeid(WMMAT).name() << ", WARP_SIZE=" << WARP_SIZE << " ========\n";
+        wmma_test<typename WMMAT::ComputeT, WMMAT, ACC_TEST_BLOCK_WARPS, WARP_SIZE, ACC_TEST_LOOP, ACC_TEST_NBLOCKS, true>();
+        for (int i = 0; i < 3; i++) {
+            auto tflops = wmma_test<typename WMMAT::ComputeT, WMMAT, BLOCK_WARPS, WARP_SIZE, LOOP, NBLOCKS, false>();
+            std::cout << tflops << " TFLOPS" << std::endl;
+        }
+    }
+
+#endif
 
     return 0;
 }
