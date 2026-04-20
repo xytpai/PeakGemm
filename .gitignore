@@ -156,3 +156,9 @@ checkpoints/*.ckpt
 gpucore.*
 log
 *_logs
+*.bc
+*.s
+*.o
+*.hipi
+*.hipfb
+*.resolution.txt
