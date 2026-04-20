@@ -173,9 +173,10 @@ struct WMMA_M16N16K32 {
 
     template <uint32_t VEC_BITS = 3>
     __device__ __forceinline__ uint32_t swizzle(uint32_t addr) {
-        constexpr uint32_t COL_BITS = 7 - 4; // 32*4B (7bits) - 16B (4bits)
+        // constexpr uint32_t COL_BITS = 7 - 4; // 32*4B (7bits) - 16B (4bits)
+        constexpr uint32_t COL_BITS = 4; // 32*4B (7bits) - 16B (4bits)
         constexpr uint32_t COL_MASK = ((1 << COL_BITS) - 1) << VEC_BITS;
-        return ((addr >> VEC_BITS) & COL_MASK) ^ addr;
+        return ((addr >> COL_BITS) & COL_MASK) ^ addr;
     }
 
     __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, int soffset, int stride) {

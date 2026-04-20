@@ -171,9 +171,6 @@ struct CopyAsync {
     static __device__ __forceinline__ void wait() {
 #ifdef __CUDACC__
         asm volatile("cp.async.wait_group %0;\n" ::"n"(S));
-// #elif defined(__HIPCC__)
-//         asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
-//         __builtin_amdgcn_s_barrier();
 #endif
     }
 };

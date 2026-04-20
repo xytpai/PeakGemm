@@ -57,10 +57,10 @@ struct BlockTile {
         }
     }
 
+#ifdef __CUDACC__
     __device__ __forceinline__ void ldg_copy_async(
         scalar_t *as, scalar_t *bs,
         const scalar_t *a, int a_stride, const scalar_t *b, int b_stride) {
-#ifdef __CUDACC__
 #pragma unroll
         for (int i = 0; i < LDG_REG_A_COUNT; i++) {
             int tid_ = BLOCK_THREADS * i + tid;
@@ -79,49 +79,51 @@ struct BlockTile {
                 &(reinterpret_cast<ldg_vec_t *>(
                     const_cast<scalar_t *>(b) + (tid_ / LDG_B_X_THREADS) * b_stride)[ldg_b_vec_idx]));
         }
-#elif defined(__HIPCC__)
+    }
+#endif
+
+#ifdef __HIPCC__
+    __device__ __forceinline__ void ldg_copy_async(
+        scalar_t *as, scalar_t *bs,
+        i32x4 &a_rsrc, int a_begin, int a_stride, i32x4 &b_rsrc, int b_begin, int b_stride) {
         constexpr int DMA_BYTES = 16;
         constexpr int LDS_U32_PER_DMA = DMA_BYTES / 4;
-        auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
-        auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
-        auto as_lds = reinterpret_cast<as3_uint32_ptr>((size_t)as);
-        auto bs_lds = reinterpret_cast<as3_uint32_ptr>((size_t)bs);
-        as3_uint32_ptr as_warp = as_lds + (wid * WARP_SIZE * LDS_U32_PER_DMA);
-        as3_uint32_ptr bs_warp = bs_lds + (wid * WARP_SIZE * LDS_U32_PER_DMA);
+        uint32_t as_warp = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(as) + (wid * WARP_SIZE * DMA_BYTES));
 #pragma unroll
         for (int i = 0; i < LDG_REG_A_COUNT; i++) {
             int tid_ = BLOCK_THREADS * i + tid;
             int local_offset = (tid_ / LDG_A_X_THREADS) * BLOCK_K + ldg_a_vec_idx * LDG_VEC_SIZE;
             local_offset = wmma.swizzle(local_offset);
-            int global_offset = (local_offset / BLOCK_K) * a_stride + local_offset % BLOCK_K;
-            as3_uint32_ptr dst = as_warp + (w_tid * LDS_U32_PER_DMA) + (i * BLOCK_THREADS * LDS_U32_PER_DMA);
+            int global_offset = a_begin + (local_offset / BLOCK_K) * a_stride + local_offset % BLOCK_K;
             llvm_amdgcn_raw_buffer_load_lds(
                 a_rsrc,
-                dst,
+                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
                 0,
-                1);
+                0);
+            as_warp += BLOCK_THREADS * DMA_BYTES;
         }
+        uint32_t bs_warp = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(bs) + (wid * WARP_SIZE * DMA_BYTES));
 #pragma unroll
         for (int i = 0; i < LDG_REG_B_COUNT; i++) {
             int tid_ = BLOCK_THREADS * i + tid;
             int local_offset = (tid_ / LDG_B_X_THREADS) * BLOCK_K + ldg_b_vec_idx * LDG_VEC_SIZE;
             local_offset = wmma.swizzle(local_offset);
-            int global_offset = (local_offset / BLOCK_K) * b_stride + local_offset % BLOCK_K;
-            as3_uint32_ptr dst = bs_warp + (w_tid * LDS_U32_PER_DMA) + (i * BLOCK_THREADS * LDS_U32_PER_DMA);
+            int global_offset = b_begin + (local_offset / BLOCK_K) * b_stride + local_offset % BLOCK_K;
             llvm_amdgcn_raw_buffer_load_lds(
                 b_rsrc,
-                dst,
+                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
                 0,
-                1);
+                0);
+            bs_warp += BLOCK_THREADS * DMA_BYTES;
         }
-#endif
     }
+#endif
 
     template <int S = 0>
     __device__ __forceinline__ void wait() {
@@ -221,41 +223,45 @@ __global__ void hgemm_kernel(
     constexpr int BLOCK_M = BlockTileT::BLOCK_M;
     constexpr int BLOCK_N = BlockTileT::BLOCK_N;
 
-    // get idx
     int tid = threadIdx.x;
     int mi = blockIdx.y;
     int ni = blockIdx.x;
 
-    // get slm
     __shared__ scalar_t as[STAGES][BLOCK_M * BLOCK_K];
     __shared__ scalar_t bs[STAGES][BLOCK_N * BLOCK_K];
 
-    // init regs
     BlockTileT block_tile(tid);
     int current_stage = 0;
     int a_begin = mi * BLOCK_M * k;
     int b_begin = ni * BLOCK_N * k;
     int a_end = a_begin + k;
 
-#pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s) {
-        block_tile.ldg_copy_async(as[s], bs[s], &a[a_begin + s * BLOCK_K], k, &b[b_begin + s * BLOCK_K], k);
-        block_tile.commit();
-    }
-    for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-        block_tile.template wait<STAGES - 2>();
-        __syncthreads();
+#ifdef __HIPCC__
+    auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
+    auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
+#endif
+
+    // Prologue
+    block_tile.ldg_copy_async(as[0], bs[0], a_rsrc, a_begin, k, b_rsrc, b_begin, k);
+    asm volatile("s_waitcnt vmcnt(0)");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
+    // Main k-loop
+    for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+        int write_stage = (current_stage + 1) % STAGES;
+        block_tile.ldg_copy_async(as[write_stage], bs[write_stage], a_rsrc, a_begin + BLOCK_K, k, b_rsrc, b_begin + BLOCK_K, k);
         block_tile.load_matrix(as[current_stage], bs[current_stage]);
         block_tile();
-        if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
-            int write_stage = (current_stage + STAGES - 1) % STAGES;
-            block_tile.ldg_copy_async(as[write_stage], bs[write_stage],
-                                      &a[a_begin + (STAGES - 1) * BLOCK_K], k,
-                                      &b[b_begin + (STAGES - 1) * BLOCK_K], k);
-        }
-        block_tile.commit();
         current_stage = (current_stage + 1) % STAGES;
+        asm volatile("s_waitcnt vmcnt(0)");
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
     }
+
+    // Epilogue
+    block_tile.load_matrix(as[current_stage], bs[current_stage]);
+    block_tile();
 
     block_tile.store_matrix(c, mi, ni, m, n);
 }
@@ -342,7 +348,7 @@ void hgemm_peak(
         }                                                                                                                          \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
 
 void hgemm_peak(
     short *c,
@@ -353,7 +359,7 @@ void hgemm_peak(
     const int k,
     const bool is_bf16,
     gpuStream_t stream) {
-    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
     (c, a, b, m, n, k, is_bf16, stream);
 }
 
