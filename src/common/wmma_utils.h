@@ -6,7 +6,7 @@ using namespace kernel_utils;
 
 namespace wmma_utils {
 
-template <typename scalar_t, typename acc_t>
+template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true>
 struct WMMA_M16N8K16 {
     enum {
         M = 16,
@@ -16,8 +16,13 @@ struct WMMA_M16N8K16 {
     using FragmentAT = aligned_array<scalar_t, 8>;
     using FragmentBT = aligned_array<scalar_t, 4>;
     using FragmentCT = aligned_array<acc_t, 4>;
+    using ComputeT = scalar_t;
 
     __device__ __forceinline__ WMMA_M16N8K16() {
+    }
+
+    __device__ __forceinline__ void init(int w_tid_) {
+        w_tid = w_tid_;
     }
 
     __device__ __forceinline__ void operator()(
@@ -39,11 +44,11 @@ struct WMMA_M16N8K16 {
 #endif
     }
 
-    __device__ __forceinline__ void reset_fragment_c(FragmentCT &c) {
-        c.val[0] = 0;
-        c.val[1] = 0;
-        c.val[2] = 0;
-        c.val[3] = 0;
+    __device__ __forceinline__ void reset_fragment_c(FragmentCT &c, acc_t val = 0) {
+        c.val[0] = val;
+        c.val[1] = val;
+        c.val[2] = val;
+        c.val[3] = val;
     }
 
     template <uint32_t VEC_BITS = 3>
@@ -56,7 +61,10 @@ struct WMMA_M16N8K16 {
     __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, int soffset, int stride) {
 #ifdef __CUDACC__
         auto A = reinterpret_cast<uint32_t *>(&a);
-        uint32_t offset_ = swizzle(soffset + (w_tid % 16) * stride + (w_tid / 16) * 8);
+        uint32_t offset_ = soffset + (w_tid % 16) * stride + (w_tid / 16) * 8;
+        if constexpr (USE_SWIZZLE) {
+            offset_ = swizzle(offset_);
+        }
         auto addr = (uint32_t)__cvta_generic_to_shared(base_ptr + offset_);
         asm volatile(
             "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -68,11 +76,16 @@ struct WMMA_M16N8K16 {
     __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, int soffset, int stride) {
 #ifdef __CUDACC__
         auto B = reinterpret_cast<uint32_t *>(&b);
-        uint32_t offset_ = swizzle(soffset);
         auto y = w_tid % 4 * 2;
         auto x = w_tid / 4;
-        auto ptr0 = base_ptr + swizzle(soffset + x * stride + y);
-        auto ptr1 = base_ptr + swizzle(soffset + x * stride + y + 8);
+        uint32_t offset0 = soffset + x * stride + y;
+        uint32_t offset1 = soffset + x * stride + y + 8;
+        if constexpr (USE_SWIZZLE) {
+            offset0 = swizzle(offset0);
+            offset1 = swizzle(offset1);
+        }
+        auto ptr0 = base_ptr + offset0;
+        auto ptr1 = base_ptr + offset1;
         b.val[0] = ptr0[0];
         b.val[1] = ptr0[1];
         b.val[2] = ptr1[0];

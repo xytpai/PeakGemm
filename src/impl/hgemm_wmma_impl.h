@@ -47,6 +47,7 @@ struct BlockTile {
         tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK),
         ldg_a_vec_idx(tid % LDG_A_X_THREADS),
         ldg_b_vec_idx(tid % LDG_B_X_THREADS) {
+        wmma.init(w_tid);
 #pragma unroll
         for (int mi = 0; mi < WARP_M_STEPS; ++mi) {
 #pragma unroll
@@ -54,7 +55,6 @@ struct BlockTile {
                 wmma.reset_fragment_c(fo[mi][ni]);
             }
         }
-        wmma.w_tid = w_tid;
     }
 
     __device__ __forceinline__ void ldg_copy_async(
@@ -246,9 +246,7 @@ std::tuple<dim3, int> get_grid(int m, int n, int BLOCK_M, int BLOCK_N) {
 
 #ifdef __CUDACC__
 
-REGISTER_HGEMM_F16_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 64, /*BLOCK_N*/ 32, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
-REGISTER_HGEMM_F16_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 64, /*BLOCK_N*/ 64, /*BLOCK_K*/ 32, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
-REGISTER_HGEMM_F16_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
+REGISTER_HGEMM_F16_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 4)
 
 void hgemm_f16_peak(
     __half *c,
@@ -258,7 +256,7 @@ void hgemm_f16_peak(
     const int n,
     const int k,
     gpuStream_t stream) {
-    GET_HGEMM_F16_WMMA_M16N8K16_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 2)
+    GET_HGEMM_F16_WMMA_M16N8K16_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 4)
     (c, a, b, m, n, k, stream);
 }
 
