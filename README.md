@@ -18,7 +18,24 @@ cd PeakGemm
 python3 -m pip install -e . --no-build-isolation
 ```
 
-### Test
+### Cpp Test
+
+```bash
+bash build_rocm.sh test/cpp/test_gemm_half.cpp ; ./a.out
+```
+
+```txt
+m:2048, n:2048, k:2048, dtype=__half, val:1, ms:0.06532, gbps:385.27, tflops:263.011
+m:4096, n:4096, k:4096, dtype=__half, val:1, ms:0.201441, gbps:499.716, tflops:682.279
+m:8192, n:8192, k:8192, dtype=__half, val:1, ms:1.47965, gbps:272.127, tflops:743.089
+m:16384, n:16384, k:16384, dtype=__half, val:1, ms:15.3889, gbps:104.661, tflops:571.587
+m:2048, n:2048, k:2048, dtype=__bfloat16, val:1, ms:0.07468, gbps:336.982, tflops:230.046
+m:4096, n:4096, k:4096, dtype=__bfloat16, val:1, ms:0.196121, gbps:513.271, tflops:700.786
+m:8192, n:8192, k:8192, dtype=__bfloat16, val:1, ms:1.45917, gbps:275.947, tflops:753.518
+m:16384, n:16384, k:16384, dtype=__bfloat16, val:1, ms:15.0604, gbps:106.944, tflops:584.056
+```
+
+### Python Test
 
 ```bash
 python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
