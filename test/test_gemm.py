@@ -42,6 +42,10 @@ def func(a, b, c):
     if a.dtype == torch.float:
         warnings.warn('NOTE: The SGEMM has not been optimized. It\'s treated as a reference path.')
         PeakGemm.sgemm_peak(c, a, b)
+    elif a.dtype == torch.half:
+        PeakGemm.hgemm_f16_peak(c, a, b)
+    else:
+        raise NotImplementedError(f"No kernel for dtype={a.dtype}")
 
 
 def benchmark(args, func, ref_func, warmup=10, niters=50, sole_inputs=False):
@@ -110,9 +114,9 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
-    # python3 test/test_gemm.py --m=2048 --n=2048 --k=2048 --dtype=f32
-    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
-    # python3 test/test_gemm.py --m=8192 --n=8192 --k=8192 --dtype=f32
-    # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=f32
-    # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=f32
-    # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=f32
+    # python3 test/test_gemm.py --m=2048 --n=2048 --k=2048 --dtype=f16
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
+    # python3 test/test_gemm.py --m=8192 --n=8192 --k=8192 --dtype=f16
+    # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=f16
+    # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=f16
+    # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=f16
