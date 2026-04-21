@@ -82,10 +82,10 @@ struct WMMA_M16N8K16 {
 
     __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
         auto B = reinterpret_cast<uint32_t *>(&b);
-        uint32_t y = row + w_tid % 4 * 2;
-        uint32_t x = col + w_tid / 4;
-        uint32_t offset0 = soffset + x * stride + y;
-        uint32_t offset1 = soffset + x * stride + y + 8;
+        uint32_t y = col + w_tid % 4 * 2;
+        uint32_t x = row + w_tid / 4;
+        uint32_t offset0 = x * stride + y;
+        uint32_t offset1 = x * stride + y + 8;
         if constexpr (USE_SWIZZLE) {
             offset0 = swizzle(offset0);
             offset1 = swizzle(offset1);
