@@ -228,7 +228,7 @@ __device__ __forceinline__ void __barrier() {
 #endif
 }
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = false>
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = true>
 __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi, uint32_t &ni) {
 #ifdef __CUDACC__
     mi = blockIdx.y;
@@ -236,17 +236,25 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #elif defined(__HIPCC__)
     if constexpr (L2_SW) {
         uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
-        uint32_t group_m = 2;
-        uint32_t grid_m = (m + BLOCK_M - 1) / BLOCK_M;
-        uint32_t grid_n = (n + BLOCK_N - 1) / BLOCK_N;
-        uint32_t effective_group_m = std::min(group_m, grid_m);
-        uint32_t num_pid_in_group = effective_group_m * grid_n;
-        uint32_t group_id = pid / num_pid_in_group;
-        uint32_t first_pid_m = group_id * effective_group_m;
-        uint32_t group_size_m = effective_group_m;
-        uint32_t pid_in_group = pid % num_pid_in_group;
-        mi = first_pid_m + (pid_in_group % group_size_m);
-        ni = pid_in_group / group_size_m;
+        constexpr uint32_t L2_WINDOW_M = 2;
+        constexpr uint32_t L2_WINDOW_N = 2;
+        constexpr uint32_t LLC_WINDOW_M = 2;
+        constexpr uint32_t LLC_WINDOW_N = 2;
+        constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
+        constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
+        uint32_t m_blocks = gridDim.y;
+        uint32_t n_blocks = gridDim.x;
+        uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
+        uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
+        uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
+        uint32_t l2_tile_idx = pid % (LLC_TILE_M * LLC_TILE_N) / (L2_WINDOW_M * L2_WINDOW_N);
+        uint32_t l2_tile_m = l2_tile_idx / LLC_WINDOW_N;
+        uint32_t l2_tile_n = l2_tile_idx % LLC_WINDOW_N;
+        uint32_t local_idx = pid % (LLC_TILE_M * LLC_TILE_N) % (L2_WINDOW_M * L2_WINDOW_N);
+        uint32_t local_m = local_idx / L2_WINDOW_N;
+        uint32_t local_n = local_idx % L2_WINDOW_N;
+        mi = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_WINDOW_M + local_m;
+        ni = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_WINDOW_N + local_n;
     } else {
         mi = blockIdx.y;
         ni = blockIdx.x;
@@ -264,7 +272,7 @@ template <
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
     uint32_t STAGES = 3>
-__global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
