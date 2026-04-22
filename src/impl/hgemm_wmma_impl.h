@@ -228,7 +228,7 @@ __device__ __forceinline__ void __barrier() {
 #endif
 }
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = false>
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = true>
 __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi, uint32_t &ni) {
 #ifdef __CUDACC__
     mi = blockIdx.y;
