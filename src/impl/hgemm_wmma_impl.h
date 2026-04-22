@@ -427,7 +427,7 @@ void hgemm_peak(
         }                                                                                                                                         \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
 
 void hgemm_peak(
     short *c,
@@ -438,7 +438,7 @@ void hgemm_peak(
     const uint32_t k,
     const bool is_bf16,
     gpuStream_t stream) {
-    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
     (c, a, b, m, n, k, is_bf16, stream);
 }
 
