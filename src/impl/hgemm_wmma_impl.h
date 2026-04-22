@@ -228,6 +228,40 @@ __device__ __forceinline__ void __barrier() {
 #endif
 }
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = true>
+__device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi, uint32_t &ni) {
+#ifdef __CUDACC__
+    mi = blockIdx.y;
+    ni = blockIdx.x;
+#elif defined(__HIPCC__)
+    if constexpr (L2_SW) {
+        uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
+        constexpr uint32_t L2_WINDOW_M = 2;
+        constexpr uint32_t L2_WINDOW_N = 2;
+        constexpr uint32_t LLC_WINDOW_M = 2;
+        constexpr uint32_t LLC_WINDOW_N = 2;
+        constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
+        constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
+        uint32_t m_blocks = gridDim.y;
+        uint32_t n_blocks = gridDim.x;
+        uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
+        uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
+        uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
+        uint32_t l2_tile_idx = pid % (LLC_TILE_M * LLC_TILE_N) / (L2_WINDOW_M * L2_WINDOW_N);
+        uint32_t l2_tile_m = l2_tile_idx / LLC_WINDOW_N;
+        uint32_t l2_tile_n = l2_tile_idx % LLC_WINDOW_N;
+        uint32_t local_idx = pid % (LLC_TILE_M * LLC_TILE_N) % (L2_WINDOW_M * L2_WINDOW_N);
+        uint32_t local_m = local_idx / L2_WINDOW_N;
+        uint32_t local_n = local_idx % L2_WINDOW_N;
+        mi = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_WINDOW_M + local_m;
+        ni = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_WINDOW_N + local_n;
+    } else {
+        mi = blockIdx.y;
+        ni = blockIdx.x;
+    }
+#endif
+}
+
 template <
     typename scalar_t,
     typename WMMAT,
@@ -238,7 +272,7 @@ template <
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
     uint32_t STAGES = 3>
-__global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
@@ -250,8 +284,8 @@ __global__ void hgemm_kernel(
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
 
     uint32_t tid = threadIdx.x;
-    uint32_t mi = blockIdx.y;
-    uint32_t ni = blockIdx.x;
+    uint32_t mi, ni;
+    get_tile_mn<BLOCK_M, BLOCK_N>(m, n, mi, ni);
 
     constexpr uint32_t BLOCK_MK = BLOCK_M * BLOCK_K;
     constexpr uint32_t BLOCK_NK = BLOCK_N * BLOCK_K;
@@ -393,7 +427,7 @@ void hgemm_peak(
         }                                                                                                                                         \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
 
 void hgemm_peak(
     short *c,
@@ -404,7 +438,7 @@ void hgemm_peak(
     const uint32_t k,
     const bool is_bf16,
     gpuStream_t stream) {
-    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
     (c, a, b, m, n, k, is_bf16, stream);
 }
 

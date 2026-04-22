@@ -118,6 +118,8 @@ public:
 #elif defined(__HIPCC__)
 
 typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
+typedef __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16 fp16x4_t;
+typedef __attribute__((__vector_size__(4 * sizeof(__bf16)))) __bf16 bf16x4_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 fp16x8_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 bf16x8_t;
 
@@ -192,6 +194,99 @@ struct WMMA_M16N16K32 {
     __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
         uint32_t y = w_tid % 16;
         uint32_t x = w_tid / 16 * 8;
+        uint32_t row_ = row + y;
+        uint32_t col_ = col + x;
+        if constexpr (USE_SWIZZLE) {
+            col_ = swizzle(row_, col_);
+        }
+        uint32_t offset_ = row_ * stride + col_;
+        b = *reinterpret_cast<FragmentBT *>(base_ptr + offset_);
+    }
+
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t stride, FragmentCT const &c) {
+        uint32_t x = w_tid % 16;
+        uint32_t y_begin = w_tid / 16 * 4;
+        ptr[(y_begin + 0) * stride + x] = (scalar_t)c.val[0];
+        ptr[(y_begin + 1) * stride + x] = (scalar_t)c.val[1];
+        ptr[(y_begin + 2) * stride + x] = (scalar_t)c.val[2];
+        ptr[(y_begin + 3) * stride + x] = (scalar_t)c.val[3];
+    }
+
+public:
+    uint32_t w_tid;
+};
+
+template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true, uint32_t K_BLOCKS16 = 0>
+struct WMMA_M16N16K16 {
+    enum {
+        M = 16,
+        N = 16,
+        K = 16,
+        DATA_BYTES = sizeof(scalar_t),
+    };
+    using FragmentAT = aligned_array<scalar_t, 4>;
+    using FragmentBT = aligned_array<scalar_t, 4>;
+    using FragmentCT = aligned_array<acc_t, 4>;
+    using ComputeT = scalar_t;
+
+    __device__ __forceinline__ WMMA_M16N16K16() {
+    }
+
+    __device__ __forceinline__ void init(uint32_t w_tid_) {
+        w_tid = w_tid_;
+    }
+
+    __device__ __forceinline__ void operator()(
+        FragmentCT &d,
+        FragmentAT const &a,
+        FragmentBT const &b,
+        FragmentCT const &c) {
+        uint32_t const *A = reinterpret_cast<uint32_t const *>(&a);
+        uint32_t const *B = reinterpret_cast<uint32_t const *>(&b);
+        acc_t const *C = reinterpret_cast<acc_t const *>(&c);
+        acc_t *D = reinterpret_cast<acc_t *>(&d);
+        if constexpr (std::is_same_v<scalar_t, __half>) {
+            *(floatx4_t *)D = __builtin_amdgcn_mfma_f32_16x16x16f16(
+                (*(fp16x4_t *)A),
+                (*(fp16x4_t *)B),
+                *(floatx4_t *)C,
+                0, 0, 0);
+        } else {
+            *(floatx4_t *)D = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                (*(bf16x4_t *)A),
+                (*(bf16x4_t *)B),
+                *(floatx4_t *)C,
+                0, 0, 0);
+        }
+    }
+
+    __device__ __forceinline__ void reset_fragment_c(FragmentCT &c, acc_t val = 0) {
+        c.val[0] = val;
+        c.val[1] = val;
+        c.val[2] = val;
+        c.val[3] = val;
+    }
+
+    __device__ __forceinline__ uint32_t swizzle(uint32_t row, uint32_t col) {
+        uint32_t col_in_bytes = col * DATA_BYTES;
+        return (col_in_bytes ^ ((row % K_BLOCKS16) * 16)) / DATA_BYTES;
+    }
+
+    __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
+        uint32_t y = w_tid % 16;
+        uint32_t x = w_tid / 16 * 4;
+        uint32_t row_ = row + y;
+        uint32_t col_ = col + x;
+        if constexpr (USE_SWIZZLE) {
+            col_ = swizzle(row_, col_);
+        }
+        uint32_t offset_ = row_ * stride + col_;
+        a = *reinterpret_cast<FragmentAT *>(base_ptr + offset_);
+    }
+
+    __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
+        uint32_t y = w_tid % 16;
+        uint32_t x = w_tid / 16 * 4;
         uint32_t row_ = row + y;
         uint32_t col_ = col + x;
         if constexpr (USE_SWIZZLE) {

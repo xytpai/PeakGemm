@@ -108,12 +108,12 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
-    # python3 test/test_gemm.py --m=2048 --n=2048 --k=2048 --dtype=f16
-    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
-    # python3 test/test_gemm.py --m=8192 --n=8192 --k=8192 --dtype=f16
-    # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=f16
-    # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=f16
-    # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=f16
+    # python3 test/test_gemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
+    # python3 test/test_gemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
+    # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=bf16
+    # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
+    # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=bf16
 
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
