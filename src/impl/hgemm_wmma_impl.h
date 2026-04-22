@@ -228,6 +228,32 @@ __device__ __forceinline__ void __barrier() {
 #endif
 }
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = false>
+__device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi, uint32_t &ni) {
+#ifdef __CUDACC__
+    mi = blockIdx.y;
+    ni = blockIdx.x;
+#elif defined(__HIPCC__)
+    if constexpr (L2_SW) {
+        uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
+        uint32_t group_m = 2;
+        uint32_t grid_m = (m + BLOCK_M - 1) / BLOCK_M;
+        uint32_t grid_n = (n + BLOCK_N - 1) / BLOCK_N;
+        uint32_t effective_group_m = std::min(group_m, grid_m);
+        uint32_t num_pid_in_group = effective_group_m * grid_n;
+        uint32_t group_id = pid / num_pid_in_group;
+        uint32_t first_pid_m = group_id * effective_group_m;
+        uint32_t group_size_m = effective_group_m;
+        uint32_t pid_in_group = pid % num_pid_in_group;
+        mi = first_pid_m + (pid_in_group % group_size_m);
+        ni = pid_in_group / group_size_m;
+    } else {
+        mi = blockIdx.y;
+        ni = blockIdx.x;
+    }
+#endif
+}
+
 template <
     typename scalar_t,
     typename WMMAT,
@@ -250,8 +276,8 @@ __global__ void hgemm_kernel(
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
 
     uint32_t tid = threadIdx.x;
-    uint32_t mi = blockIdx.y;
-    uint32_t ni = blockIdx.x;
+    uint32_t mi, ni;
+    get_tile_mn<BLOCK_M, BLOCK_N>(m, n, mi, ni);
 
     constexpr uint32_t BLOCK_MK = BLOCK_M * BLOCK_K;
     constexpr uint32_t BLOCK_NK = BLOCK_N * BLOCK_K;
