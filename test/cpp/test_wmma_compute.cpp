@@ -36,8 +36,8 @@ __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
     WMMAT wmma;
     wmma.init(w_tid);
     wmma.reset_fragment_c(c_frag);
-    wmma.load_matrix_a(a_frag, as_, 0, WK);
-    wmma.load_matrix_b(b_frag, bs_, 0, WK);
+    wmma.load_matrix_a(a_frag, as_, 0, 0, WK);
+    wmma.load_matrix_b(b_frag, bs_, 0, 0, WK);
     for (int i = 0; i < LOOP; ++i) {
         wmma(c_frag, a_frag, b_frag, c_frag);
     }

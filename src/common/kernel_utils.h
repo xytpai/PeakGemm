@@ -102,6 +102,54 @@ struct alignas(sizeof(scalar_t) * vec_size) aligned_array {
     scalar_t val[vec_size];
 };
 
+#ifdef __HIPCC__
+
+using i32x2 = int32_t __attribute__((ext_vector_type(2)));
+using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+using i32x4 = int32_t __attribute__((ext_vector_type(4)));
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+using as3_uint32_ptr = uint32_t __attribute__((address_space(3))) *;
+using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
+
+struct buffer_resource {
+    uint64_t ptr;
+    uint32_t range;
+    uint32_t config;
+};
+
+extern "C" __device__ void
+llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,
+                                as3_uint32_ptr lds_ptr,
+                                int size,
+                                int voffset,
+                                int soffset,
+                                int offset,                                        // does not change (0); instruction offset
+                                int aux) __asm("llvm.amdgcn.raw.buffer.load.lds"); // cache coherency
+
+__device__ inline buffer_resource make_buffer_resource(uint64_t ptr, uint32_t range, uint32_t config) {
+    return {ptr, range, config};
+}
+
+__device__ inline i32x4 make_srsrc(const void *ptr, uint32_t range_bytes, uint32_t row_stride_bytes = 0) {
+    std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(ptr); // width = sizeof(void*)
+    std::uint64_t as_u64 = static_cast<std::uint64_t>(as_int);     // widen if host is 32-bit
+    buffer_resource rsrc = make_buffer_resource(as_u64, range_bytes, 0x110000);
+
+    row_stride_bytes &= 0x3FFF;
+    if (row_stride_bytes) {
+        // - The swizzle stride lives in bits 13:0 of word2.
+        //   Max value = 0x3FFF (8 KiB – one cache line per bank).
+        uint64_t stride_field = row_stride_bytes;
+        stride_field = stride_field | 0x4000; // Cache swizzle
+        stride_field = stride_field | 0x8000; // Swizzle enable
+        rsrc.ptr |= stride_field << 48;
+    }
+
+    return *reinterpret_cast<const i32x4 *>(&rsrc);
+}
+
+#endif
+
 struct CopyAsync {
     template <typename T>
     static __device__ __forceinline__ void add(T *dst, T *src) {

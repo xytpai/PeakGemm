@@ -23,7 +23,7 @@ struct WMMA_M16N8K16 {
     __device__ __forceinline__ WMMA_M16N8K16() {
     }
 
-    __device__ __forceinline__ void init(int w_tid_) {
+    __device__ __forceinline__ void init(uint32_t w_tid_) {
         w_tid = w_tid_;
     }
 
@@ -67,9 +67,9 @@ struct WMMA_M16N8K16 {
         return ((addr >> VEC_BITS) & COL_MASK) ^ addr;
     }
 
-    __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, int soffset, int stride) {
+    __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
         auto A = reinterpret_cast<uint32_t *>(&a);
-        uint32_t offset_ = soffset + (w_tid % 16) * stride + (w_tid / 16) * 8;
+        uint32_t offset_ = (row + (w_tid % 16)) * stride + col + (w_tid / 16) * 8;
         if constexpr (USE_SWIZZLE) {
             offset_ = swizzle(offset_);
         }
@@ -80,12 +80,12 @@ struct WMMA_M16N8K16 {
             : "r"(addr));
     }
 
-    __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, int soffset, int stride) {
+    __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
         auto B = reinterpret_cast<uint32_t *>(&b);
-        auto y = w_tid % 4 * 2;
-        auto x = w_tid / 4;
-        uint32_t offset0 = soffset + x * stride + y;
-        uint32_t offset1 = soffset + x * stride + y + 8;
+        uint32_t y = col + w_tid % 4 * 2;
+        uint32_t x = row + w_tid / 4;
+        uint32_t offset0 = x * stride + y;
+        uint32_t offset1 = x * stride + y + 8;
         if constexpr (USE_SWIZZLE) {
             offset0 = swizzle(offset0);
             offset1 = swizzle(offset1);
@@ -98,9 +98,9 @@ struct WMMA_M16N8K16 {
         b.val[3] = ptr1[1];
     }
 
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, int stride, FragmentCT const &c) {
-        auto y = w_tid / 4;
-        auto x = w_tid % 4 * 2;
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t stride, FragmentCT const &c) {
+        uint32_t y = w_tid / 4;
+        uint32_t x = w_tid % 4 * 2;
         using vec_t = aligned_array<scalar_t, 2>;
         vec_t vec0, vec1;
         vec0.val[0] = (acc_t)c.val[0];
@@ -112,7 +112,7 @@ struct WMMA_M16N8K16 {
     }
 
 public:
-    int w_tid;
+    uint32_t w_tid;
 };
 
 #elif defined(__HIPCC__)
@@ -121,12 +121,13 @@ typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 fp16x8_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 bf16x8_t;
 
-template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true>
+template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true, uint32_t K_BLOCKS16 = 0>
 struct WMMA_M16N16K32 {
     enum {
         M = 16,
         N = 16,
         K = 32,
+        DATA_BYTES = sizeof(scalar_t),
     };
     using FragmentAT = aligned_array<scalar_t, 8>;
     using FragmentBT = aligned_array<scalar_t, 8>;
@@ -136,7 +137,7 @@ struct WMMA_M16N16K32 {
     __device__ __forceinline__ WMMA_M16N16K32() {
     }
 
-    __device__ __forceinline__ void init(int w_tid_) {
+    __device__ __forceinline__ void init(uint32_t w_tid_) {
         w_tid = w_tid_;
     }
 
@@ -171,36 +172,38 @@ struct WMMA_M16N16K32 {
         c.val[3] = val;
     }
 
-    template <uint32_t VEC_BITS = 3>
-    __device__ __forceinline__ uint32_t swizzle(uint32_t addr) {
-        constexpr uint32_t COL_BITS = 7 - 4; // 32*4B (7bits) - 16B (4bits)
-        constexpr uint32_t COL_MASK = ((1 << COL_BITS) - 1) << VEC_BITS;
-        return ((addr >> VEC_BITS) & COL_MASK) ^ addr;
+    __device__ __forceinline__ uint32_t swizzle(uint32_t row, uint32_t col) {
+        uint32_t col_in_bytes = col * DATA_BYTES;
+        return (col_in_bytes ^ ((row % K_BLOCKS16) * 16)) / DATA_BYTES;
     }
 
-    __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, int soffset, int stride) {
-        auto x = w_tid / 16 * 8;
-        auto y = w_tid % 16;
-        uint32_t offset_ = soffset + y * stride + x;
+    __device__ __forceinline__ void load_matrix_a(FragmentAT &a, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
+        uint32_t y = w_tid % 16;
+        uint32_t x = w_tid / 16 * 8;
+        uint32_t row_ = row + y;
+        uint32_t col_ = col + x;
         if constexpr (USE_SWIZZLE) {
-            offset_ = swizzle(offset_);
+            col_ = swizzle(row_, col_);
         }
+        uint32_t offset_ = row_ * stride + col_;
         a = *reinterpret_cast<FragmentAT *>(base_ptr + offset_);
     }
 
-    __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, int soffset, int stride) {
-        auto x = w_tid / 16 * 8;
-        auto y = w_tid % 16;
-        uint32_t offset_ = soffset + y * stride + x;
+    __device__ __forceinline__ void load_matrix_b(FragmentBT &b, scalar_t *base_ptr, uint32_t row, uint32_t col, uint32_t stride) {
+        uint32_t y = w_tid % 16;
+        uint32_t x = w_tid / 16 * 8;
+        uint32_t row_ = row + y;
+        uint32_t col_ = col + x;
         if constexpr (USE_SWIZZLE) {
-            offset_ = swizzle(offset_);
+            col_ = swizzle(row_, col_);
         }
+        uint32_t offset_ = row_ * stride + col_;
         b = *reinterpret_cast<FragmentBT *>(base_ptr + offset_);
     }
 
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, int stride, FragmentCT const &c) {
-        auto x = w_tid % 16;
-        auto y_begin = w_tid / 16 * 4;
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t stride, FragmentCT const &c) {
+        uint32_t x = w_tid % 16;
+        uint32_t y_begin = w_tid / 16 * 4;
         ptr[(y_begin + 0) * stride + x] = (scalar_t)c.val[0];
         ptr[(y_begin + 1) * stride + x] = (scalar_t)c.val[1];
         ptr[(y_begin + 2) * stride + x] = (scalar_t)c.val[2];
@@ -208,7 +211,7 @@ struct WMMA_M16N16K32 {
     }
 
 public:
-    int w_tid;
+    uint32_t w_tid;
 };
 
 #endif
