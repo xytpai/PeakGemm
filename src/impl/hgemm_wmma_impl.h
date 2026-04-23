@@ -165,20 +165,34 @@ struct BlockTile {
         }
     }
 
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
-        uint32_t warp_m_begin = block_m_idx * BLOCK_M + wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = block_n_idx * BLOCK_N + wid % BLOCK_N_WARPS * WARP_N;
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t *sptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+        __syncthreads();
+        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
         for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
             uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
 #pragma unroll
             for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
                 uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                if (warp_atom_offset_m < m && warp_atom_offset_n < n) {
-                    auto ptr_ = ptr + warp_atom_offset_m * n + warp_atom_offset_n;
-                    wmma.store_matrix(ptr_, n, fo[mi][ni]);
-                    __syncthreads();
-                }
+                auto ptr_ = sptr + warp_atom_offset_m * BLOCK_N + warp_atom_offset_n;
+                wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
+            }
+        }
+        __syncthreads();
+        constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+        constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+            uint32_t global_tid = BLOCK_THREADS * i + tid;
+            uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
+            uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+            uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
+            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
+            if (m_global_idx < m && n_global_idx < n) {
+                auto ptr_ = sptr + m_local_idx * BLOCK_N + n_local_idx;
+                auto d_ptr_ = ptr + m_global_idx * n + n_global_idx;
+                *reinterpret_cast<ldg_vec_t *>(d_ptr_) = *reinterpret_cast<ldg_vec_t *>(ptr_);
             }
         }
     }
@@ -262,6 +276,15 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #endif
 }
 
+template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+union SharedStorage {
+    struct {
+        scalar_t as[STAGES][BLOCK_M * BLOCK_K];
+        scalar_t bs[STAGES][BLOCK_N * BLOCK_K];
+    };
+    scalar_t cs[BLOCK_M * BLOCK_N];
+};
+
 template <
     typename scalar_t,
     typename WMMAT,
@@ -287,10 +310,7 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hg
     uint32_t mi, ni;
     get_tile_mn<BLOCK_M, BLOCK_N>(m, n, mi, ni);
 
-    constexpr uint32_t BLOCK_MK = BLOCK_M * BLOCK_K;
-    constexpr uint32_t BLOCK_NK = BLOCK_N * BLOCK_K;
-    __shared__ scalar_t as[STAGES][BLOCK_MK];
-    __shared__ scalar_t bs[STAGES][BLOCK_NK];
+    __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> smem;
 
     BlockTileT block_tile(tid);
     uint32_t current_stage = 0;
@@ -302,19 +322,21 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hg
 
 #pragma unroll
     for (uint32_t s = 0; s < STAGES - 1; ++s) {
-        block_tile.ldg_copy_async(as[s], bs[s], &a[a_begin + s * BLOCK_K], k, &b[b_begin + s * BLOCK_K], k);
+        block_tile.ldg_copy_async(smem.as[s], smem.bs[s], &a[a_begin + s * BLOCK_K], k, &b[b_begin + s * BLOCK_K], k);
         block_tile.commit();
     }
     for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         block_tile.template wait<STAGES - 2>();
         __syncthreads();
-        block_tile.load_matrix(as[current_stage], bs[current_stage]);
+        block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
         block_tile();
         if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
             uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-            block_tile.ldg_copy_async(as[write_stage], bs[write_stage],
-                                      &a[a_begin + (STAGES - 1) * BLOCK_K], k,
-                                      &b[b_begin + (STAGES - 1) * BLOCK_K], k);
+            block_tile.ldg_copy_async(
+                smem.as[write_stage],
+                smem.bs[write_stage],
+                &a[a_begin + (STAGES - 1) * BLOCK_K], k,
+                &b[b_begin + (STAGES - 1) * BLOCK_K], k);
         }
         block_tile.commit();
         current_stage = (current_stage + 1) % STAGES;
@@ -325,24 +347,27 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hg
     static_assert(STAGES == 2);
     auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
     auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
-    block_tile.init_hip(&as[0][0], &bs[0][0]);
+    block_tile.init_hip(&smem.as[0][0], &smem.bs[0][0]);
     block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k);
     __barrier();
     for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         uint32_t write_stage = (current_stage + 1) % STAGES;
-        block_tile.ldg_copy_async(write_stage * BLOCK_M * BLOCK_K, write_stage * BLOCK_N * BLOCK_K,
-                                  a_rsrc, a_begin + BLOCK_K, k, b_rsrc, b_begin + BLOCK_K, k);
-        block_tile.load_matrix(as[current_stage], bs[current_stage]);
+        block_tile.ldg_copy_async(
+            write_stage * BLOCK_M * BLOCK_K,
+            write_stage * BLOCK_N * BLOCK_K,
+            a_rsrc, a_begin + BLOCK_K, k,
+            b_rsrc, b_begin + BLOCK_K, k);
+        block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
         block_tile();
-        current_stage = (current_stage + 1) % STAGES;
+        current_stage = write_stage;
         __barrier();
     }
-    block_tile.load_matrix(as[current_stage], bs[current_stage]);
+    block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
     block_tile();
 
 #endif
 
-    block_tile.store_matrix(c, mi, ni, m, n);
+    block_tile.store_matrix(c, smem.cs, mi, ni, m, n);
 }
 
 std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N) {
