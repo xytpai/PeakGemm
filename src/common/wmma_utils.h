@@ -118,6 +118,8 @@ public:
 #elif defined(__HIPCC__)
 
 typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
+typedef __attribute__((__vector_size__(2 * sizeof(__fp16)))) __fp16 fp16x2_t;
+typedef __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16 bf16x2_t;
 typedef __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16 fp16x4_t;
 typedef __attribute__((__vector_size__(4 * sizeof(__bf16)))) __bf16 bf16x4_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 fp16x8_t;

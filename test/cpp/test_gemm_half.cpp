@@ -76,6 +76,8 @@ public:
     T *c;
     T *a;
     T *b;
+    uint32_t *semaphore;
+    uint32_t *signal_state;
 
     GPUInputs(
         int64_t m,
@@ -89,6 +91,10 @@ public:
         gpuMalloc(&c, m * n * sizeof(T));
         gpuMalloc(&a, m * k * sizeof(T));
         gpuMalloc(&b, n * k * sizeof(T));
+        gpuMalloc(&semaphore, SPLIT_K_SEMAPHORE_MAX_LEN * 3 * sizeof(uint32_t));
+        gpuMalloc(&signal_state, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
+        gpuMemset(semaphore, 0, SPLIT_K_SEMAPHORE_MAX_LEN * 3 * sizeof(uint32_t));
+        gpuMemset(signal_state, 0, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
         gpuDeviceSynchronize();
     }
 
@@ -103,6 +109,8 @@ public:
         gpuFree(c);
         gpuFree(a);
         gpuFree(b);
+        gpuFree(semaphore);
+        gpuFree(signal_state);
         gpuDeviceSynchronize();
     }
 
@@ -112,9 +120,9 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
         if constexpr (std::is_same_v<T, __half>) {
-            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, false, 0);
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, false, semaphore, signal_state, 0);
         } else {
-            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, true, 0);
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, true, semaphore, signal_state, 0);
         }
         gpuDeviceSynchronize();
         gpuEventRecord(stop);
@@ -134,24 +142,22 @@ public:
         return std::isnan(out_f) || std::abs(out_f - ref_f) > atol;
     }
 
-    bool validate(CPUInputs<T> &inputs, float atol) {
+    float validate(CPUInputs<T> &inputs, float atol) {
         auto out_cpu = new T[m * n];
         gpuMemcpy(out_cpu, c, m * n * sizeof(T), gpuMemcpyDeviceToHost);
-        bool val = true;
+        float maxdiff = -1;
         for (int i = 0; i < m * n; ++i) {
-            if (is_error(out_cpu[i], inputs.c[i], atol)) {
-                val = false;
-                std::cout << "\n>>> out:" << (float)out_cpu[i] << ", ref_out:" << (float)inputs.c[i] << "\n";
-                break;
-            }
+            float out_f = (float)out_cpu[i];
+            float ref_f = (float)inputs.c[i];
+            maxdiff = std::max(std::abs(out_f - ref_f), maxdiff);
         }
         delete[] out_cpu;
-        return val;
+        return maxdiff;
     }
 };
 
 template <typename T>
-std::tuple<bool, float, float, float> runbench(
+std::tuple<float, float, float, float> runbench(
     int64_t m,
     int64_t n,
     int64_t k,
@@ -164,8 +170,8 @@ std::tuple<bool, float, float, float> runbench(
     gpu_inputs.reset(cpu_inputs);
     cpu_inputs();
     auto r = gpu_inputs();
-    bool val = gpu_inputs.validate(cpu_inputs, atol * k / 4096);
-    return {val, std::get<0>(r), std::get<1>(r), std::get<2>(r)};
+    float maxdiff = gpu_inputs.validate(cpu_inputs, atol * k / 4096);
+    return {maxdiff, std::get<0>(r), std::get<1>(r), std::get<2>(r)};
 }
 
 } // namespace test
@@ -179,15 +185,15 @@ int main() {
         auto n = ns[i];
         auto k = ks[i];
         std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__half";
-        auto [val, ms, gbps, tflops] = test::runbench<__half>(m, n, k);
-        std::cout << ", val:" << val << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+        auto [maxdiff, ms, gbps, tflops] = test::runbench<__half>(m, n, k);
+        std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
     }
     for (int i = 0; i < ms.size(); ++i) {
         auto m = ms[i];
         auto n = ns[i];
         auto k = ks[i];
         std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__bfloat16";
-        auto [val, ms, gbps, tflops] = test::runbench<__bfloat16>(m, n, k);
-        std::cout << ", val:" << val << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+        auto [maxdiff, ms, gbps, tflops] = test::runbench<__bfloat16>(m, n, k);
+        std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
     }
 }
