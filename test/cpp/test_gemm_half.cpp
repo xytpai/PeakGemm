@@ -177,9 +177,9 @@ std::tuple<float, float, float, float> runbench(
 } // namespace test
 
 int main() {
-    std::vector<int> ms = {2048, 4096, 8192, 16384};
-    std::vector<int> ns = {2048, 4096, 8192, 16384};
-    std::vector<int> ks = {2048, 4096, 8192, 16384};
+    std::vector<int> ms = {4, 2048, 4096, 8192, 16384};
+    std::vector<int> ns = {4096, 2048, 4096, 8192, 16384};
+    std::vector<int> ks = {8192, 2048, 4096, 8192, 16384};
     for (int i = 0; i < ms.size(); ++i) {
         auto m = ms[i];
         auto n = ns[i];
