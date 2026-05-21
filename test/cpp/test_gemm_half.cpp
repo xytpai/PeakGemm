@@ -77,7 +77,7 @@ public:
     T *a;
     T *b;
     uint32_t *semaphore;
-    uint32_t *signal_state;
+    uint32_t *signal;
 
     GPUInputs(
         int64_t m,
@@ -91,10 +91,10 @@ public:
         gpuMalloc(&c, m * n * sizeof(T));
         gpuMalloc(&a, m * k * sizeof(T));
         gpuMalloc(&b, n * k * sizeof(T));
-        gpuMalloc(&semaphore, SPLIT_K_SEMAPHORE_MAX_LEN * 3 * sizeof(uint32_t));
-        gpuMalloc(&signal_state, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
-        gpuMemset(semaphore, 0, SPLIT_K_SEMAPHORE_MAX_LEN * 3 * sizeof(uint32_t));
-        gpuMemset(signal_state, 0, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
+        gpuMalloc(&semaphore, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
+        gpuMalloc(&signal, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
+        gpuMemset(semaphore, 0, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
+        gpuMemset(signal, 0, SPLIT_K_SEMAPHORE_MAX_LEN * sizeof(uint32_t));
         gpuDeviceSynchronize();
     }
 
@@ -110,7 +110,7 @@ public:
         gpuFree(a);
         gpuFree(b);
         gpuFree(semaphore);
-        gpuFree(signal_state);
+        gpuFree(signal);
         gpuDeviceSynchronize();
     }
 
@@ -120,9 +120,9 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
         if constexpr (std::is_same_v<T, __half>) {
-            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, false, semaphore, signal_state, 0);
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, false, semaphore, signal, 0);
         } else {
-            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, true, semaphore, signal_state, 0);
+            hgemm::hgemm_peak((short *)c, (short *)a, (short *)b, m, n, k, true, semaphore, signal, 0);
         }
         gpuDeviceSynchronize();
         gpuEventRecord(stop);

@@ -27,7 +27,7 @@ __device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, _
 }
 #endif
 
-#define SPLIT_K_SEMAPHORE_MAX_LEN 128
+#define SPLIT_K_SEMAPHORE_MAX_LEN 256
 
 template <
     typename scalar_t,
@@ -331,7 +331,7 @@ template <
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
@@ -339,7 +339,7 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hg
     const uint32_t n,
     const uint32_t k,
     uint32_t *semaphore,
-    uint32_t *signal_state) {
+    uint32_t *signal) {
     using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
     constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
@@ -532,7 +532,7 @@ void hgemm_peak(
 #define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES, SPLIT_K)   \
     void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES, SPLIT_K)( \
         short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16,       \
-        uint32_t *semaphore, uint32_t *signal_state, gpuStream_t stream) {                                                        \
+        uint32_t *semaphore, uint32_t *signal, gpuStream_t stream) {                                                              \
         constexpr uint32_t VEC_SIZE = 8;                                                                                          \
         assert(n % VEC_SIZE == 0);                                                                                                \
         assert(k % VEC_SIZE == 0);                                                                                                \
@@ -552,12 +552,12 @@ void hgemm_peak(
             using T = __half;                                                                                                     \
             using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                       \
             hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
-                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal_state);  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);        \
         } else {                                                                                                                  \
             using T = __bfloat16;                                                                                                 \
             using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                       \
             hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
-                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal_state);  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);        \
         }                                                                                                                         \
     }
 
@@ -573,15 +573,15 @@ void hgemm_peak(
     const uint32_t k,
     const bool is_bf16,
     uint32_t *semaphore,
-    uint32_t *signal_state,
+    uint32_t *signal,
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
         GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 9)
-        (c, a, b, m, n, k, is_bf16, semaphore, signal_state, stream);
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
         GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
-        (c, a, b, m, n, k, is_bf16, semaphore, signal_state, stream);
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     }
 }
 
