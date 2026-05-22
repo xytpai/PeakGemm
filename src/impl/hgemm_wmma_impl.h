@@ -582,7 +582,7 @@ std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, ui
     }
 
 REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 4)
 
 void hgemm_peak(
     short *c,
@@ -597,7 +597,7 @@ void hgemm_peak(
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 4)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
         GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
