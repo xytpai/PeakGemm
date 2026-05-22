@@ -36,6 +36,7 @@ template <
     uint32_t BLOCK_K,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS,
+    uint32_t BLOCK_K_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS>
 struct BlockTile {
@@ -48,9 +49,12 @@ struct BlockTile {
         WARP_ATOM_M = WMMAT::M,
         WARP_ATOM_N = WMMAT::N,
         WARP_ATOM_K = WMMAT::K,
-        WARP_K_STEPS = BLOCK_K / WARP_ATOM_K,
+        WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K,
+        WARP_K_STEPS = BLOCK_K / WARP_GROUP_K,
+        K_SLICE = BLOCK_K / BLOCK_K_WARPS,
         LDG_VEC_SIZE = 16 / sizeof(scalar_t),
-        BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE,
+        BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE,
+        BLOCK_MN_WARPS = BLOCK_M_WARPS * BLOCK_N_WARPS,
         WARP_M = WARP_M_STEPS * WARP_ATOM_M,
         WARP_N = WARP_N_STEPS * WARP_ATOM_N,
         BLOCK_M = BLOCK_M_WARPS * WARP_M,
@@ -64,6 +68,7 @@ struct BlockTile {
         DMA_BYTES = 16,
     };
     static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
+    static_assert(BLOCK_K % WARP_GROUP_K == 0 && WARP_K_STEPS >= 1 && K_SLICE % WARP_ATOM_K == 0);
     using ldg_vec_t = aligned_array<scalar_t, LDG_VEC_SIZE>;
 
     __device__ __forceinline__ BlockTile(uint32_t tid) :
@@ -78,6 +83,8 @@ struct BlockTile {
                 wmma.reset_fragment_c(fo[mi][ni]);
             }
         }
+        wid_mn = wid % BLOCK_MN_WARPS;
+        wid_k = wid / BLOCK_MN_WARPS;
     }
 
 #ifdef __CUDACC__
@@ -168,15 +175,16 @@ struct BlockTile {
     }
 
     __device__ __forceinline__ void load_matrix(scalar_t *as, scalar_t *bs) {
-        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_k_slice_base = wid_k * K_SLICE;
 #pragma unroll
         for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
             uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
 #pragma unroll
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_m;
-                uint32_t col = ki * WARP_ATOM_K;
+                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
                 wmma.load_matrix_a(fa[ki][mi], as, row, col, BLOCK_K);
             }
         }
@@ -186,24 +194,24 @@ struct BlockTile {
 #pragma unroll
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_n;
-                uint32_t col = ki * WARP_ATOM_K;
+                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
                 wmma.load_matrix_b(fb[ki][ni], bs, row, col, BLOCK_K);
             }
         }
     }
 
     template <bool USE_ATOMIC = false>
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t *sptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_K_WARPS][BLOCK_M * BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
         __syncthreads();
-        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
         for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
             uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
 #pragma unroll
             for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
                 uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                auto ptr_ = sptr + warp_atom_offset_m * BLOCK_N + warp_atom_offset_n;
+                auto ptr_ = &cs[wid_k][warp_atom_offset_m * BLOCK_N + warp_atom_offset_n];
                 wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
             }
         }
@@ -218,15 +226,21 @@ struct BlockTile {
             uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
             uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
             if (m_global_idx < m && n_global_idx < n) {
-                auto src_ptr = sptr + m_local_idx * BLOCK_N + n_local_idx;
+                auto src = *reinterpret_cast<ldg_vec_t *>(&cs[wid_k][m_local_idx * BLOCK_N + n_local_idx]);
+                if constexpr (BLOCK_K_WARPS > 1) {
+#pragma unroll
+                    for (uint32_t k_warp = 1; k_warp < BLOCK_K_WARPS; ++k_warp) {
+                        src += *reinterpret_cast<ldg_vec_t *>(&cs[k_warp][m_local_idx * BLOCK_N + n_local_idx]);
+                    }
+                }
                 auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
                 if constexpr (USE_ATOMIC) {
 #pragma unroll
                     for (uint32_t pk_idx = 0; pk_idx < LDG_VEC_SIZE; pk_idx += 2) {
-                        atomic_pack_add_scalar<scalar_t>(&dst_ptr[pk_idx], &src_ptr[pk_idx]);
+                        atomic_pack_add_scalar<scalar_t>(&dst_ptr[pk_idx], &src[pk_idx]);
                     }
                 } else {
-                    *reinterpret_cast<ldg_vec_t *>(dst_ptr) = *reinterpret_cast<ldg_vec_t *>(src_ptr);
+                    *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
                 }
             }
         }
@@ -251,6 +265,8 @@ private:
     uint32_t w_tid;
     uint32_t ldg_a_vec_idx;
     uint32_t ldg_b_vec_idx;
+    uint32_t wid_mn;
+    uint32_t wid_k;
     ldg_vec_t ldg_a_reg[LDG_REG_A_COUNT];
     ldg_vec_t ldg_b_reg[LDG_REG_B_COUNT];
     WMMAT wmma;
@@ -312,13 +328,13 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #endif
 }
 
-template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t BLOCK_K_WARPS>
 union SharedStorage {
     struct {
         scalar_t as[STAGES][BLOCK_M * BLOCK_K];
         scalar_t bs[STAGES][BLOCK_N * BLOCK_K];
     };
-    scalar_t cs[BLOCK_M * BLOCK_N];
+    scalar_t cs[BLOCK_K_WARPS][BLOCK_M * BLOCK_N];
 };
 
 template <
@@ -328,11 +344,12 @@ template <
     uint32_t BLOCK_K,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS,
+    uint32_t BLOCK_K_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
@@ -341,7 +358,7 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, 2) __global__ void 
     const uint32_t k,
     uint32_t *semaphore,
     uint32_t *signal) {
-    using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
+    using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
     constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
     constexpr bool IS_SPLIT_K = SPLIT_K > 1;
@@ -361,7 +378,7 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, 2) __global__ void 
         signal_idx = blockIdx.x;
     }
 
-    __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> smem;
+    __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_K_WARPS> smem;
 
     BlockTileT block_tile(tid);
     uint32_t current_stage = 0;
@@ -529,43 +546,43 @@ std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, ui
 
 #elif defined(__HIPCC__)
 
-#define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES, SPLIT_K) \
-    hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_spk##SPLIT_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##WARP_SIZE##_s##STAGES##_
+#define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K) \
+    hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_spk##SPLIT_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##BLOCK_K_WARPS##x##WARP_SIZE##_s##STAGES##_
 
-#define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES, SPLIT_K)   \
-    void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES, SPLIT_K)( \
-        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16,       \
-        uint32_t *semaphore, uint32_t *signal, gpuStream_t stream) {                                                              \
-        constexpr uint32_t VEC_SIZE = 8;                                                                                          \
-        assert(n % VEC_SIZE == 0);                                                                                                \
-        assert(k % VEC_SIZE == 0);                                                                                                \
-        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N, SPLIT_K);                                                                      \
-        dim3 grid = std::get<0>(gr);                                                                                              \
-        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE;                                                \
-        dim3 block(BLOCK_SIZE);                                                                                                   \
-        constexpr uint32_t WARP_M = BLOCK_M_WARPS * 16;                                                                           \
-        constexpr uint32_t WARP_N = BLOCK_N_WARPS * 16;                                                                           \
-        constexpr uint32_t WARP_M_STEPS = (BLOCK_M + WARP_M - 1) / WARP_M;                                                        \
-        constexpr uint32_t WARP_N_STEPS = (BLOCK_N + WARP_N - 1) / WARP_N;                                                        \
-        if (SPLIT_K > 1) {                                                                                                        \
-            assert(std::get<1>(gr) < SPLIT_K_SEMAPHORE_MAX_LEN);                                                                  \
-            assert(k % (SPLIT_K * BLOCK_K) == 0);                                                                                 \
-        }                                                                                                                         \
-        if (is_bf16 == false) {                                                                                                   \
-            using T = __half;                                                                                                     \
-            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                       \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
-                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);        \
-        } else {                                                                                                                  \
-            using T = __bfloat16;                                                                                                 \
-            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                       \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
-                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);        \
-        }                                                                                                                         \
+#define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)   \
+    void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)( \
+        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16,                      \
+        uint32_t *semaphore, uint32_t *signal, gpuStream_t stream) {                                                                             \
+        constexpr uint32_t VEC_SIZE = 8;                                                                                                         \
+        assert(n % VEC_SIZE == 0);                                                                                                               \
+        assert(k % VEC_SIZE == 0);                                                                                                               \
+        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N, SPLIT_K);                                                                                     \
+        dim3 grid = std::get<0>(gr);                                                                                                             \
+        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE;                                               \
+        dim3 block(BLOCK_SIZE);                                                                                                                  \
+        constexpr uint32_t WARP_M = BLOCK_M_WARPS * 16;                                                                                          \
+        constexpr uint32_t WARP_N = BLOCK_N_WARPS * 16;                                                                                          \
+        constexpr uint32_t WARP_M_STEPS = (BLOCK_M + WARP_M - 1) / WARP_M;                                                                       \
+        constexpr uint32_t WARP_N_STEPS = (BLOCK_N + WARP_N - 1) / WARP_N;                                                                       \
+        if (SPLIT_K > 1) {                                                                                                                       \
+            assert(std::get<1>(gr) < SPLIT_K_SEMAPHORE_MAX_LEN);                                                                                 \
+            assert(k % (SPLIT_K * BLOCK_K) == 0);                                                                                                \
+        }                                                                                                                                        \
+        if (is_bf16 == false) {                                                                                                                  \
+            using T = __half;                                                                                                                    \
+            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                      \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                       \
+        } else {                                                                                                                                 \
+            using T = __bfloat16;                                                                                                                \
+            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                      \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                       \
+        }                                                                                                                                        \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
 
 void hgemm_peak(
     short *c,
@@ -580,10 +597,10 @@ void hgemm_peak(
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     }
 }

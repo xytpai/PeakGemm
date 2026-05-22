@@ -187,6 +187,7 @@ int main() {
         std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__half";
         auto [maxdiff, ms, gbps, tflops] = test::runbench<__half>(m, n, k);
         std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+        assert(maxdiff < 0.125 / 8192 * k * 2);
     }
     for (int i = 0; i < ms.size(); ++i) {
         auto m = ms[i];
@@ -195,5 +196,6 @@ int main() {
         std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__bfloat16";
         auto [maxdiff, ms, gbps, tflops] = test::runbench<__bfloat16>(m, n, k);
         std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+        assert(maxdiff < 1.0 / 8192 * k * 2);
     }
 }

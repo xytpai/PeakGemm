@@ -100,6 +100,19 @@ struct alignas(sizeof(T) * VEC_SIZE) vec_t {
 template <typename scalar_t, int vec_size>
 struct alignas(sizeof(scalar_t) * vec_size) aligned_array {
     scalar_t val[vec_size];
+    __device__ __forceinline__ scalar_t &operator[](int i) {
+        return val[i];
+    }
+    __device__ __forceinline__ scalar_t const &operator[](int i) const {
+        return val[i];
+    }
+    aligned_array &operator+=(const aligned_array &other) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            val[i] += other.val[i];
+        }
+        return *this;
+    }
 };
 
 #ifdef __HIPCC__
