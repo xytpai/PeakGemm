@@ -315,7 +315,7 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #endif
 #ifdef __HIPCC__
     if constexpr (L2_SW) {
-        uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
+        uint32_t pid = blockIdx.x;
         constexpr uint32_t L2_WINDOW_M = 2;
         constexpr uint32_t L2_WINDOW_N = 2;
         constexpr uint32_t LLC_WINDOW_M = 2;
@@ -363,7 +363,7 @@ template <
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 1) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
@@ -628,7 +628,7 @@ void hgemm_peak(
         }                                                                                                                                        \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 4)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
 REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
 
 void hgemm_peak(
@@ -644,7 +644,7 @@ void hgemm_peak(
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 4)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
         GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
