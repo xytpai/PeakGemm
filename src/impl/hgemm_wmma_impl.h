@@ -312,7 +312,8 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #ifdef __CUDACC__
     mi = blockIdx.x / bn;
     ni = blockIdx.x % bn;
-#elif defined(__HIPCC__)
+#endif
+#ifdef __HIPCC__
     if constexpr (L2_SW) {
         uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
         constexpr uint32_t L2_WINDOW_M = 2;
@@ -321,8 +322,8 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
         constexpr uint32_t LLC_WINDOW_N = 2;
         constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
         constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
-        uint32_t m_blocks = gridDim.y;
-        uint32_t n_blocks = gridDim.x;
+        uint32_t m_blocks = (m + BLOCK_M - 1) / BLOCK_M;
+        uint32_t n_blocks = (n + BLOCK_N - 1) / BLOCK_N;
         uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
         uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
         uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
@@ -362,7 +363,7 @@ template <
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *BLOCK_K_WARPS *WARP_SIZE, 2) __global__ void hgemm_kernel(
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
@@ -459,29 +460,51 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *BLOCK_K_WARPS *WARP_SIZE, 2) __g
         current_stage = (current_stage + 1) % STAGES;
     }
 
-#elif defined(__HIPCC__)
+#endif
 
-    static_assert(STAGES == 2);
+#ifdef __HIPCC__
+
     auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
     auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
     block_tile.init_hip(&smem.as[0][0], &smem.bs[0][0]);
-    block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k, m_remain, n_remain, k_remain);
-    __barrier();
-    for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-        uint32_t write_stage = (current_stage + 1) % STAGES;
-        block_tile.ldg_copy_async(
-            write_stage * BLOCK_M * BLOCK_K,
-            write_stage * BLOCK_N * BLOCK_K,
-            a_rsrc, a_begin + BLOCK_K, k,
-            b_rsrc, b_begin + BLOCK_K, k,
-            m_remain, n_remain, k_remain);
+
+    constexpr bool ENABLE_MULTI_STAGE = false;
+
+    if constexpr (ENABLE_MULTI_STAGE) {
+#pragma unroll
+        for (uint32_t s = 0; s < STAGES - 1; ++s) {
+            block_tile.ldg_copy_async(s * BLOCK_M * BLOCK_K, s * BLOCK_N * BLOCK_K, a_rsrc, a_begin + s * BLOCK_K, k, b_rsrc, b_begin + s * BLOCK_K, k, m_remain, n_remain, k_remain);
+        }
+        for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+            __barrier(); // FIXME: need aligment on async copy count
+            block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
+            block_tile();
+            if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
+                uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
+                block_tile.ldg_copy_async(write_stage * BLOCK_M * BLOCK_K, write_stage * BLOCK_N * BLOCK_K, a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k, b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k, m_remain, n_remain, k_remain);
+            }
+            current_stage = (current_stage + 1) % STAGES;
+        }
+    } else {
+        static_assert(STAGES == 2);
+        block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k, m_remain, n_remain, k_remain);
+        __barrier();
+        for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+            uint32_t write_stage = (current_stage + 1) % STAGES;
+            block_tile.ldg_copy_async(
+                write_stage * BLOCK_M * BLOCK_K,
+                write_stage * BLOCK_N * BLOCK_K,
+                a_rsrc, a_begin + BLOCK_K, k,
+                b_rsrc, b_begin + BLOCK_K, k,
+                m_remain, n_remain, k_remain);
+            block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
+            block_tile();
+            current_stage = write_stage;
+            __barrier();
+        }
         block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
         block_tile();
-        current_stage = write_stage;
-        __barrier();
     }
-    block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-    block_tile();
 
 #endif
 
@@ -566,7 +589,9 @@ void hgemm_peak(
     }
 }
 
-#elif defined(__HIPCC__)
+#endif
+
+#ifdef __HIPCC__
 
 #define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K) \
     hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_spk##SPLIT_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##BLOCK_K_WARPS##x##WARP_SIZE##_s##STAGES##_
