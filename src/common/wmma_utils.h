@@ -170,10 +170,10 @@ struct WMMA_M16N16K32 {
     }
 
     __device__ __forceinline__ void reset_fragment_c(FragmentCT &c, acc_t val = 0) {
-        c.val[0] = val;
-        c.val[1] = val;
-        c.val[2] = val;
-        c.val[3] = val;
+        c[0] = val;
+        c[1] = val;
+        c[2] = val;
+        c[3] = val;
     }
 
     __device__ __forceinline__ uint32_t swizzle(uint32_t row, uint32_t col) {
@@ -208,10 +208,10 @@ struct WMMA_M16N16K32 {
     __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t stride, FragmentCT const &c) {
         uint32_t x = w_tid % 16;
         uint32_t y_begin = w_tid / 16 * 4;
-        ptr[(y_begin + 0) * stride + x] = (scalar_t)c.val[0];
-        ptr[(y_begin + 1) * stride + x] = (scalar_t)c.val[1];
-        ptr[(y_begin + 2) * stride + x] = (scalar_t)c.val[2];
-        ptr[(y_begin + 3) * stride + x] = (scalar_t)c.val[3];
+        ptr[(y_begin + 0) * stride + x] = (scalar_t)c[0];
+        ptr[(y_begin + 1) * stride + x] = (scalar_t)c[1];
+        ptr[(y_begin + 2) * stride + x] = (scalar_t)c[2];
+        ptr[(y_begin + 3) * stride + x] = (scalar_t)c[3];
     }
 
 public:
