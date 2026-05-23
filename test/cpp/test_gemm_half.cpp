@@ -177,6 +177,19 @@ std::tuple<float, float, float, float> runbench(
 } // namespace test
 
 int main() {
+#ifdef BENCH_MODE
+    std::vector<int> ms = {8192, 8192};
+    std::vector<int> ns = {8192, 8192};
+    std::vector<int> ks = {8192, 8192};
+    for (int i = 0; i < ms.size(); ++i) {
+        auto m = ms[i];
+        auto n = ns[i];
+        auto k = ks[i];
+        std::cout << "m:" << m << ", n:" << n << ", k:" << k << ", dtype=__bfloat16";
+        auto [maxdiff, ms, gbps, tflops] = test::runbench<__bfloat16>(m, n, k);
+        std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
+    }
+#else
     std::vector<int> ms = {4, 2048, 4096, 8192, 16384};
     std::vector<int> ns = {4096, 2048, 4096, 8192, 16384};
     std::vector<int> ks = {8192, 2048, 4096, 8192, 16384};
@@ -198,4 +211,5 @@ int main() {
         std::cout << ", maxdiff:" << maxdiff << ", ms:" << ms << ", gbps:" << gbps << ", tflops:" << tflops << "\n";
         assert(maxdiff < 1.0 / 8192 * k * 4);
     }
+#endif
 }

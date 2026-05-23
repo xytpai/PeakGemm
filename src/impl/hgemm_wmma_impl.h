@@ -272,6 +272,52 @@ struct BlockTile {
         }
     }
 
+    __device__ __forceinline__ void compute_tile_streaming(scalar_t *as, scalar_t *bs) {
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_k_slice_base = wid_k * K_SLICE;
+
+#pragma unroll
+        for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+            uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
+
+            FragmentBT b_frag[WARP_N_STEPS];
+
+#pragma unroll
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                wmma.load_matrix_b(
+                    b_frag[ni],
+                    bs,
+                    warp_atom_offset_n,
+                    k_col,
+                    BLOCK_K);
+            }
+
+#pragma unroll
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                FragmentAT a_frag;
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+
+                wmma.load_matrix_a(
+                    a_frag,
+                    as,
+                    warp_atom_offset_m,
+                    k_col,
+                    BLOCK_K);
+
+#pragma unroll
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    wmma(
+                        fo[mi][ni],
+                        a_frag,
+                        b_frag[ni],
+                        fo[mi][ni]);
+                }
+            }
+        }
+    }
+
 private:
     uint32_t tid;
     uint32_t wid;
@@ -525,13 +571,11 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) 
                 a_rsrc, a_begin + BLOCK_K, k,
                 b_rsrc, b_begin + BLOCK_K, k,
                 m_remain, n_remain, k_remain);
-            block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-            block_tile();
+            block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
             current_stage = write_stage;
             __barrier();
         }
-        block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-        block_tile();
+        block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
     }
 
 #endif
