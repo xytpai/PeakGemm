@@ -42,7 +42,7 @@ def func(a, b, c):
     PeakGemm.gemm_peak(c, a, b)
 
 
-def benchmark(args, func, ref_func, warmup=10, niters=50, sole_inputs=False):
+def benchmark(args, func, ref_func, warmup=10, niters=100, sole_inputs=False):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)

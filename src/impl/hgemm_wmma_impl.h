@@ -213,47 +213,66 @@ struct BlockTile {
         }
     }
 
-    template <bool USE_ATOMIC = false>
+    template <bool C_SHUFFLE = false, bool USE_ATOMIC = false>
     __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_K_WARPS][BLOCK_M * BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
-        __syncthreads();
         uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        if constexpr (!C_SHUFFLE) {
+            uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+            uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
-        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-            uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                uint32_t m_global_idx = block_m_idx * BLOCK_M + warp_atom_offset_m;
 #pragma unroll
-            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-                uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                auto ptr_ = &cs[wid_k][warp_atom_offset_m * BLOCK_N + warp_atom_offset_n];
-                wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
-            }
-        }
-        __syncthreads();
-        constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
-        constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
-#pragma unroll
-        for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
-            uint32_t global_tid = BLOCK_THREADS * i + tid;
-            uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
-            uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
-            uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
-            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
-            if (m_global_idx < m && n_global_idx < n) {
-                auto src = *reinterpret_cast<ldg_vec_t *>(&cs[wid_k][m_local_idx * BLOCK_N + n_local_idx]);
-                if constexpr (BLOCK_K_WARPS > 1) {
-#pragma unroll
-                    for (uint32_t k_warp = 1; k_warp < BLOCK_K_WARPS; ++k_warp) {
-                        src += *reinterpret_cast<ldg_vec_t *>(&cs[k_warp][m_local_idx * BLOCK_N + n_local_idx]);
-                    }
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+
+                    uint32_t n_global_idx = block_n_idx * BLOCK_N + warp_atom_offset_n;
+
+                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                    wmma.store_matrix(dst_ptr, n, fo[mi][ni]);
                 }
-                auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
-                if constexpr (USE_ATOMIC) {
+            }
+        } else {
+            __syncthreads();
 #pragma unroll
-                    for (uint32_t pk_idx = 0; pk_idx < LDG_VEC_SIZE; pk_idx += 2) {
-                        atomic_pack_add_scalar<scalar_t>(&dst_ptr[pk_idx], &src[pk_idx]);
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+#pragma unroll
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                    auto ptr_ = &cs[wid_k][warp_atom_offset_m * BLOCK_N + warp_atom_offset_n];
+                    wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
+                }
+            }
+            __syncthreads();
+            constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+            constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+#pragma unroll
+            for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+                uint32_t global_tid = BLOCK_THREADS * i + tid;
+                uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
+                uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+                uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
+                uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
+                if (m_global_idx < m && n_global_idx < n) {
+                    auto src = *reinterpret_cast<ldg_vec_t *>(&cs[wid_k][m_local_idx * BLOCK_N + n_local_idx]);
+                    if constexpr (BLOCK_K_WARPS > 1) {
+#pragma unroll
+                        for (uint32_t k_warp = 1; k_warp < BLOCK_K_WARPS; ++k_warp) {
+                            src += *reinterpret_cast<ldg_vec_t *>(&cs[k_warp][m_local_idx * BLOCK_N + n_local_idx]);
+                        }
                     }
-                } else {
-                    *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
+                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                    if constexpr (USE_ATOMIC) {
+#pragma unroll
+                        for (uint32_t pk_idx = 0; pk_idx < LDG_VEC_SIZE; pk_idx += 2) {
+                            atomic_pack_add_scalar<scalar_t>(&dst_ptr[pk_idx], &src[pk_idx]);
+                        }
+                    } else {
+                        *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
+                    }
                 }
             }
         }
@@ -594,9 +613,9 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) 
                 signal[signal_idx] = 0;
             }
         }
-        block_tile.template store_matrix<true>(c, smem.cs, mi, ni, m, n);
+        block_tile.template store_matrix<true, true>(c, smem.cs, mi, ni, m, n);
     } else {
-        block_tile.template store_matrix<false>(c, smem.cs, mi, ni, m, n);
+        block_tile.template store_matrix<false, false>(c, smem.cs, mi, ni, m, n);
     }
 }
 
