@@ -137,43 +137,41 @@ struct BlockTile {
         uint32_t m_bound, uint32_t n_bound, uint32_t k_bound) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
+        uint32_t row, col_;
+        col_ = ldg_a_vec_idx * LDG_VEC_SIZE;
+        col_ = col_ < k_bound ? col_ : 0;
+        row = tid / LDG_A_X_THREADS;
+        constexpr uint32_t BLOCK_DMA_STRIDE = BLOCK_THREADS * DMA_BYTES;
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_A_COUNT; i++) {
-            uint32_t tid_ = BLOCK_THREADS * i + tid;
-            uint32_t row = tid_ / LDG_A_X_THREADS;
-            uint32_t col = ldg_a_vec_idx * LDG_VEC_SIZE;
-            row = row < m_bound ? row : 0;
-            col = col < k_bound ? col : 0;
-            col = wmma.swizzle(row, col);
-            uint32_t global_offset = a_begin + row * a_stride + col;
+            uint32_t col = wmma.swizzle(row, col_);
+            uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + col;
             llvm_amdgcn_raw_buffer_load_lds(
                 a_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_),
+                (as3_uint32_ptr) static_cast<uintptr_t>(as_ + as_offset * sizeof(scalar_t) + i * BLOCK_DMA_STRIDE),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
                 0,
                 0);
-            as_warp_ += BLOCK_THREADS * DMA_BYTES;
+            row += BLOCK_THREADS / LDG_A_X_THREADS;
         }
+        col_ = ldg_b_vec_idx * LDG_VEC_SIZE;
+        col_ = col_ < k_bound ? col_ : 0;
+        row = tid / LDG_B_X_THREADS;
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_B_COUNT; i++) {
-            uint32_t tid_ = BLOCK_THREADS * i + tid;
-            uint32_t row = tid_ / LDG_B_X_THREADS;
-            uint32_t col = ldg_b_vec_idx * LDG_VEC_SIZE;
-            row = row < n_bound ? row : 0;
-            col = col < k_bound ? col : 0;
-            col = wmma.swizzle(row, col);
-            uint32_t global_offset = b_begin + row * b_stride + col;
+            uint32_t col = wmma.swizzle(row, col_);
+            uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + col;
             llvm_amdgcn_raw_buffer_load_lds(
                 b_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_),
+                (as3_uint32_ptr) static_cast<uintptr_t>(bs_ + bs_offset * sizeof(scalar_t) + i * BLOCK_DMA_STRIDE),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
                 0,
                 0);
-            bs_warp_ += BLOCK_THREADS * DMA_BYTES;
+            row += BLOCK_THREADS / LDG_B_X_THREADS;
         }
     }
 #endif
