@@ -42,7 +42,7 @@ def func(a, b, c):
     PeakGemm.gemm_peak(c, a, b)
 
 
-def benchmark(args, func, ref_func, warmup=10, niters=100, sole_inputs=False):
+def benchmark(args, func, ref_func, warmup=10, niters=110, sole_inputs=False):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
@@ -114,6 +114,8 @@ if __name__ == '__main__':
     # python3 test/test_gemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # python3 test/test_gemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
     # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=bf16
+
+    # python3 test/test_gemm.py --m=4 --n=4096 --k=8192 --dtype=bf16
 
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
