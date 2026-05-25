@@ -163,3 +163,5 @@ log
 *.hipfb
 *.resolution.txt
 *.s.tmp
+mi*
+.rocprof*

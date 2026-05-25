@@ -7,6 +7,41 @@ using namespace wmma_utils;
 
 namespace hgemm {
 
+template <typename T>
+__device__ __forceinline__ void atomic_pack_add_scalar(T *pk_dst, T *pk_src) {
+    // static_assert(false);
+}
+
+#ifdef __CUDACC__
+template <>
+__device__ __forceinline__ void atomic_pack_add_scalar<__bfloat16>(__bfloat16 *pk_dst, __bfloat16 *pk_src) {
+    atomicAdd(&pk_dst[0], pk_src[0]);
+    atomicAdd(&pk_dst[1], pk_src[1]);
+}
+template <>
+__device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, __half *pk_src) {
+    atomicAdd(&pk_dst[0], pk_src[0]);
+    atomicAdd(&pk_dst[1], pk_src[1]);
+}
+#endif
+
+#ifdef __HIPCC__
+template <>
+__device__ __forceinline__ void atomic_pack_add_scalar<__bfloat16>(__bfloat16 *pk_dst, __bfloat16 *pk_src) {
+    auto dst = reinterpret_cast<bf16x2_t *>(pk_dst);
+    bf16x2_t val = *reinterpret_cast<bf16x2_t *>(pk_src);
+    __builtin_amdgcn_global_atomic_fadd_v2bf16(dst, val);
+}
+template <>
+__device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, __half *pk_src) {
+    auto dst = reinterpret_cast<fp16x2_t *>(pk_dst);
+    fp16x2_t val = *reinterpret_cast<fp16x2_t *>(pk_src);
+    __builtin_amdgcn_global_atomic_fadd_v2f16(dst, val);
+}
+#endif
+
+#define SPLIT_K_SEMAPHORE_MAX_LEN 256
+
 template <
     typename scalar_t,
     typename WMMAT,
@@ -14,6 +49,7 @@ template <
     uint32_t BLOCK_K,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS,
+    uint32_t BLOCK_K_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS>
 struct BlockTile {
@@ -26,9 +62,12 @@ struct BlockTile {
         WARP_ATOM_M = WMMAT::M,
         WARP_ATOM_N = WMMAT::N,
         WARP_ATOM_K = WMMAT::K,
-        WARP_K_STEPS = BLOCK_K / WARP_ATOM_K,
+        WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K,
+        WARP_K_STEPS = BLOCK_K / WARP_GROUP_K,
+        K_SLICE = BLOCK_K / BLOCK_K_WARPS,
         LDG_VEC_SIZE = 16 / sizeof(scalar_t),
-        BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE,
+        BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE,
+        BLOCK_MN_WARPS = BLOCK_M_WARPS * BLOCK_N_WARPS,
         WARP_M = WARP_M_STEPS * WARP_ATOM_M,
         WARP_N = WARP_N_STEPS * WARP_ATOM_N,
         BLOCK_M = BLOCK_M_WARPS * WARP_M,
@@ -42,6 +81,7 @@ struct BlockTile {
         DMA_BYTES = 16,
     };
     static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
+    static_assert(BLOCK_K % WARP_GROUP_K == 0 && WARP_K_STEPS >= 1 && K_SLICE % WARP_ATOM_K == 0);
     using ldg_vec_t = aligned_array<scalar_t, LDG_VEC_SIZE>;
 
     __device__ __forceinline__ BlockTile(uint32_t tid) :
@@ -56,6 +96,8 @@ struct BlockTile {
                 wmma.reset_fragment_c(fo[mi][ni]);
             }
         }
+        wid_mn = wid % BLOCK_MN_WARPS;
+        wid_k = wid / BLOCK_MN_WARPS;
     }
 
 #ifdef __CUDACC__
@@ -91,7 +133,8 @@ struct BlockTile {
 
     __device__ __forceinline__ void ldg_copy_async(
         uint32_t as_offset, uint32_t bs_offset,
-        i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride) {
+        i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride,
+        uint32_t m_bound, uint32_t n_bound, uint32_t k_bound) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
 #pragma unroll
@@ -99,16 +142,18 @@ struct BlockTile {
             uint32_t tid_ = BLOCK_THREADS * i + tid;
             uint32_t row = tid_ / LDG_A_X_THREADS;
             uint32_t col = ldg_a_vec_idx * LDG_VEC_SIZE;
-            col = wmma.swizzle(row, col);
-            uint32_t global_offset = a_begin + row * a_stride + col;
-            llvm_amdgcn_raw_buffer_load_lds(
-                a_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_),
-                DMA_BYTES,
-                global_offset * sizeof(scalar_t),
-                0,
-                0,
-                0);
+            if (row < m_bound && col < k_bound) {
+                col = wmma.swizzle(row, col);
+                uint32_t global_offset = a_begin + row * a_stride + col;
+                llvm_amdgcn_raw_buffer_load_lds(
+                    a_rsrc,
+                    (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_),
+                    DMA_BYTES,
+                    global_offset * sizeof(scalar_t),
+                    0,
+                    0,
+                    0);
+            }
             as_warp_ += BLOCK_THREADS * DMA_BYTES;
         }
 #pragma unroll
@@ -116,16 +161,18 @@ struct BlockTile {
             uint32_t tid_ = BLOCK_THREADS * i + tid;
             uint32_t row = tid_ / LDG_B_X_THREADS;
             uint32_t col = ldg_b_vec_idx * LDG_VEC_SIZE;
-            col = wmma.swizzle(row, col);
-            uint32_t global_offset = b_begin + row * b_stride + col;
-            llvm_amdgcn_raw_buffer_load_lds(
-                b_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_),
-                DMA_BYTES,
-                global_offset * sizeof(scalar_t),
-                0,
-                0,
-                0);
+            if (row < n_bound && col < k_bound) {
+                col = wmma.swizzle(row, col);
+                uint32_t global_offset = b_begin + row * b_stride + col;
+                llvm_amdgcn_raw_buffer_load_lds(
+                    b_rsrc,
+                    (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_),
+                    DMA_BYTES,
+                    global_offset * sizeof(scalar_t),
+                    0,
+                    0,
+                    0);
+            }
             bs_warp_ += BLOCK_THREADS * DMA_BYTES;
         }
     }
@@ -141,15 +188,16 @@ struct BlockTile {
     }
 
     __device__ __forceinline__ void load_matrix(scalar_t *as, scalar_t *bs) {
-        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_k_slice_base = wid_k * K_SLICE;
 #pragma unroll
         for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
             uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
 #pragma unroll
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_m;
-                uint32_t col = ki * WARP_ATOM_K;
+                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
                 wmma.load_matrix_a(fa[ki][mi], as, row, col, BLOCK_K);
             }
         }
@@ -159,40 +207,73 @@ struct BlockTile {
 #pragma unroll
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_n;
-                uint32_t col = ki * WARP_ATOM_K;
+                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
                 wmma.load_matrix_b(fb[ki][ni], bs, row, col, BLOCK_K);
             }
         }
     }
 
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t *sptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
-        __syncthreads();
-        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+    template <bool C_SHUFFLE = false, bool USE_ATOMIC = false>
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_K_WARPS][BLOCK_M * BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        if constexpr (!C_SHUFFLE) {
+            uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+            uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
-        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-            uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                uint32_t m_global_idx = block_m_idx * BLOCK_M + warp_atom_offset_m;
 #pragma unroll
-            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-                uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                auto ptr_ = sptr + warp_atom_offset_m * BLOCK_N + warp_atom_offset_n;
-                wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+
+                    uint32_t n_global_idx = block_n_idx * BLOCK_N + warp_atom_offset_n;
+
+                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                    wmma.store_matrix(dst_ptr, n, fo[mi][ni]);
+                }
             }
-        }
-        __syncthreads();
-        constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
-        constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+        } else {
+            __syncthreads();
 #pragma unroll
-        for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
-            uint32_t global_tid = BLOCK_THREADS * i + tid;
-            uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
-            uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
-            uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
-            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
-            if (m_global_idx < m && n_global_idx < n) {
-                auto ptr_ = sptr + m_local_idx * BLOCK_N + n_local_idx;
-                auto d_ptr_ = ptr + m_global_idx * n + n_global_idx;
-                *reinterpret_cast<ldg_vec_t *>(d_ptr_) = *reinterpret_cast<ldg_vec_t *>(ptr_);
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+#pragma unroll
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                    auto ptr_ = &cs[wid_k][warp_atom_offset_m * BLOCK_N + warp_atom_offset_n];
+                    wmma.store_matrix(ptr_, BLOCK_N, fo[mi][ni]);
+                }
+            }
+            __syncthreads();
+            constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+            constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+#pragma unroll
+            for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+                uint32_t global_tid = BLOCK_THREADS * i + tid;
+                uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
+                uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+                uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
+                uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
+                if (m_global_idx < m && n_global_idx < n) {
+                    auto src = *reinterpret_cast<ldg_vec_t *>(&cs[wid_k][m_local_idx * BLOCK_N + n_local_idx]);
+                    if constexpr (BLOCK_K_WARPS > 1) {
+#pragma unroll
+                        for (uint32_t k_warp = 1; k_warp < BLOCK_K_WARPS; ++k_warp) {
+                            src += *reinterpret_cast<ldg_vec_t *>(&cs[k_warp][m_local_idx * BLOCK_N + n_local_idx]);
+                        }
+                    }
+                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                    if constexpr (USE_ATOMIC) {
+#pragma unroll
+                        for (uint32_t pk_idx = 0; pk_idx < LDG_VEC_SIZE; pk_idx += 2) {
+                            atomic_pack_add_scalar<scalar_t>(&dst_ptr[pk_idx], &src[pk_idx]);
+                        }
+                    } else {
+                        *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
+                    }
+                }
             }
         }
     }
@@ -210,12 +291,60 @@ struct BlockTile {
         }
     }
 
+    __device__ __forceinline__ void compute_tile_streaming(scalar_t *as, scalar_t *bs) {
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_k_slice_base = wid_k * K_SLICE;
+
+#pragma unroll
+        for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+            uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
+
+            FragmentBT b_frag[WARP_N_STEPS];
+
+#pragma unroll
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                wmma.load_matrix_b(
+                    b_frag[ni],
+                    bs,
+                    warp_atom_offset_n,
+                    k_col,
+                    BLOCK_K);
+            }
+
+#pragma unroll
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                FragmentAT a_frag;
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+
+                wmma.load_matrix_a(
+                    a_frag,
+                    as,
+                    warp_atom_offset_m,
+                    k_col,
+                    BLOCK_K);
+
+#pragma unroll
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    wmma(
+                        fo[mi][ni],
+                        a_frag,
+                        b_frag[ni],
+                        fo[mi][ni]);
+                }
+            }
+        }
+    }
+
 private:
     uint32_t tid;
     uint32_t wid;
     uint32_t w_tid;
     uint32_t ldg_a_vec_idx;
     uint32_t ldg_b_vec_idx;
+    uint32_t wid_mn;
+    uint32_t wid_k;
     ldg_vec_t ldg_a_reg[LDG_REG_A_COUNT];
     ldg_vec_t ldg_b_reg[LDG_REG_B_COUNT];
     WMMAT wmma;
@@ -242,47 +371,77 @@ __device__ __forceinline__ void __barrier() {
 #endif
 }
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = true>
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, bool L2_SW = false>
 __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi, uint32_t &ni) {
+    uint32_t bn = (n + BLOCK_N - 1) / BLOCK_N;
 #ifdef __CUDACC__
-    mi = blockIdx.y;
-    ni = blockIdx.x;
-#elif defined(__HIPCC__)
+    mi = blockIdx.x / bn;
+    ni = blockIdx.x % bn;
+#endif
+#ifdef __HIPCC__
     if constexpr (L2_SW) {
-        uint32_t pid = blockIdx.y * gridDim.x + blockIdx.x;
-        constexpr uint32_t L2_WINDOW_M = 2;
-        constexpr uint32_t L2_WINDOW_N = 2;
-        constexpr uint32_t LLC_WINDOW_M = 2;
-        constexpr uint32_t LLC_WINDOW_N = 2;
-        constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
-        constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
-        uint32_t m_blocks = gridDim.y;
-        uint32_t n_blocks = gridDim.x;
-        uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
-        uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
-        uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
-        uint32_t l2_tile_idx = pid % (LLC_TILE_M * LLC_TILE_N) / (L2_WINDOW_M * L2_WINDOW_N);
-        uint32_t l2_tile_m = l2_tile_idx / LLC_WINDOW_N;
-        uint32_t l2_tile_n = l2_tile_idx % LLC_WINDOW_N;
-        uint32_t local_idx = pid % (LLC_TILE_M * LLC_TILE_N) % (L2_WINDOW_M * L2_WINDOW_N);
-        uint32_t local_m = local_idx / L2_WINDOW_N;
-        uint32_t local_n = local_idx % L2_WINDOW_N;
-        mi = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_WINDOW_M + local_m;
-        ni = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_WINDOW_N + local_n;
+        // Algo1
+        uint32_t wgid = blockIdx.x;
+        uint32_t num_pid_m = (m + BLOCK_M - 1) / BLOCK_M;
+        uint32_t num_pid_n = (n + BLOCK_N - 1) / BLOCK_N;
+        constexpr uint32_t NUM_XCDS = 8;
+        constexpr uint32_t WGM = 4;
+        constexpr uint32_t NUM_CUS = 32 * NUM_XCDS;
+        constexpr uint32_t SWIZZLE_THRESHOLD = 4 * NUM_CUS;
+        uint32_t num_wg = num_pid_m * num_pid_n;
+        if (num_wg <= SWIZZLE_THRESHOLD || num_wg % NUM_XCDS != 0) {
+            mi = wgid / num_pid_n;
+            ni = wgid % num_pid_n;
+            return;
+        }
+        uint32_t intra_xcd = wgid / NUM_XCDS;
+        uint32_t xcd = wgid % NUM_XCDS;
+        wgid = xcd * (num_wg / NUM_XCDS) + intra_xcd;
+        uint32_t num_wgid_in_group = WGM * num_pid_n;
+        uint32_t group_id = wgid / num_wgid_in_group;
+        uint32_t intra_group = wgid % num_wgid_in_group;
+        uint32_t first_pid_m = group_id * WGM;
+        uint32_t group_size_m = min(num_pid_m - first_pid_m, WGM);
+        uint32_t pid_n = intra_group / group_size_m;
+        uint32_t intra_group_m = intra_group % group_size_m;
+        uint32_t pid_m = first_pid_m + intra_group_m;
+        mi = pid_m;
+        ni = pid_n;
+        // Algo2
+        // uint32_t pid = blockIdx.x;
+        // constexpr uint32_t L2_WINDOW_M = 2;
+        // constexpr uint32_t L2_WINDOW_N = 2;
+        // constexpr uint32_t LLC_WINDOW_M = 2;
+        // constexpr uint32_t LLC_WINDOW_N = 2;
+        // constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
+        // constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
+        // uint32_t m_blocks = (m + BLOCK_M - 1) / BLOCK_M;
+        // uint32_t n_blocks = (n + BLOCK_N - 1) / BLOCK_N;
+        // uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
+        // uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
+        // uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
+        // uint32_t l2_tile_idx = pid % (LLC_TILE_M * LLC_TILE_N) / (L2_WINDOW_M * L2_WINDOW_N);
+        // uint32_t l2_tile_m = l2_tile_idx / LLC_WINDOW_N;
+        // uint32_t l2_tile_n = l2_tile_idx % LLC_WINDOW_N;
+        // uint32_t local_idx = pid % (LLC_TILE_M * LLC_TILE_N) % (L2_WINDOW_M * L2_WINDOW_N);
+        // uint32_t local_m = local_idx / L2_WINDOW_N;
+        // uint32_t local_n = local_idx % L2_WINDOW_N;
+        // mi = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_WINDOW_M + local_m;
+        // ni = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_WINDOW_N + local_n;
     } else {
-        mi = blockIdx.y;
-        ni = blockIdx.x;
+        mi = blockIdx.x / bn;
+        ni = blockIdx.x % bn;
     }
 #endif
 }
 
-template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t BLOCK_K_WARPS>
 union SharedStorage {
     struct {
         scalar_t as[STAGES][BLOCK_M * BLOCK_K];
         scalar_t bs[STAGES][BLOCK_N * BLOCK_K];
     };
-    scalar_t cs[BLOCK_M * BLOCK_N];
+    scalar_t cs[BLOCK_K_WARPS][BLOCK_M * BLOCK_N];
 };
 
 template <
@@ -292,31 +451,83 @@ template <
     uint32_t BLOCK_K,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS,
+    uint32_t BLOCK_K_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
-    uint32_t STAGES = 3>
-__launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hgemm_kernel(
+    uint32_t STAGES,
+    uint32_t SPLIT_K>
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
     const uint32_t m,
     const uint32_t n,
-    const uint32_t k) {
-    using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
+    const uint32_t k,
+    uint32_t *semaphore,
+    uint32_t *signal) {
+    using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
     constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
+    constexpr bool IS_SPLIT_K = SPLIT_K > 1;
 
     uint32_t tid = threadIdx.x;
+    uint32_t ks = (k + SPLIT_K - 1) / SPLIT_K;
+    uint32_t ks_idx = blockIdx.y;
+    uint32_t ks_begin = ks_idx * ks;
     uint32_t mi, ni;
     get_tile_mn<BLOCK_M, BLOCK_N>(m, n, mi, ni);
+    uint32_t m_offset = mi * BLOCK_M;
+    uint32_t n_offset = ni * BLOCK_N;
+    uint32_t m_remain = (m_offset < m) ? (m - m_offset) : 0;
+    uint32_t n_remain = (n_offset < n) ? (n - n_offset) : 0;
+    uint32_t signal_idx;
+    if constexpr (IS_SPLIT_K) {
+        signal_idx = blockIdx.x;
+    }
 
-    __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> smem;
+    __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_K_WARPS> smem;
 
     BlockTileT block_tile(tid);
     uint32_t current_stage = 0;
-    uint32_t a_begin = mi * BLOCK_M * k;
-    uint32_t b_begin = ni * BLOCK_N * k;
-    uint32_t a_end = a_begin + k;
+    uint32_t a_begin = m_offset * k + ks_begin;
+    uint32_t b_begin = n_offset * k + ks_begin;
+    uint32_t a_end = std::min(a_begin + ks, a_begin + k - ks_begin);
+    uint32_t k_remain = std::min(BLOCK_K, a_end - a_begin);
+
+    if constexpr (IS_SPLIT_K) {
+        if (ks_idx == 0) {
+            // zero c
+            constexpr uint32_t LDG_VEC_SIZE = BlockTileT::LDG_VEC_SIZE;
+            constexpr uint32_t BLOCK_THREADS = BlockTileT::BLOCK_THREADS;
+            constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+            constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+            using ldg_vec_t = aligned_array<scalar_t, LDG_VEC_SIZE>;
+            ldg_vec_t zeros;
+#pragma unroll
+            for (int i = 0; i < LDG_VEC_SIZE; ++i) {
+                zeros.val[i] = 0;
+            }
+#pragma unroll
+            for (int i = 0; i < LDG_REG_C_COUNT; ++i) {
+                uint32_t global_tid = BLOCK_THREADS * i + tid;
+                uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
+                uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+                uint32_t row_idx = m_offset + m_local_idx;
+                uint32_t col_idx = n_offset + n_local_idx;
+                if (row_idx < m && col_idx < n) {
+                    *reinterpret_cast<ldg_vec_t *>(&c[row_idx * n + col_idx]) = zeros; // bypass l2 write
+                }
+            }
+            __threadfence();
+            __syncthreads();
+            // trigger signal when zeroc is done by the first block
+            if (tid == 0) {
+                signal[signal_idx] = 1;
+                __threadfence();
+            }
+            __syncthreads();
+        }
+    }
 
 #ifdef __CUDACC__
 
@@ -342,72 +553,112 @@ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, 2) __global__ void hg
         current_stage = (current_stage + 1) % STAGES;
     }
 
-#elif defined(__HIPCC__)
+#endif
 
-    static_assert(STAGES == 2);
+#ifdef __HIPCC__
+
     auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
     auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
     block_tile.init_hip(&smem.as[0][0], &smem.bs[0][0]);
-    block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k);
-    __barrier();
-    for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-        uint32_t write_stage = (current_stage + 1) % STAGES;
-        block_tile.ldg_copy_async(
-            write_stage * BLOCK_M * BLOCK_K,
-            write_stage * BLOCK_N * BLOCK_K,
-            a_rsrc, a_begin + BLOCK_K, k,
-            b_rsrc, b_begin + BLOCK_K, k);
-        block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-        block_tile();
-        current_stage = write_stage;
+
+    constexpr bool ENABLE_MULTI_STAGE = false;
+
+    if constexpr (ENABLE_MULTI_STAGE) {
+#pragma unroll
+        for (uint32_t s = 0; s < STAGES - 1; ++s) {
+            block_tile.ldg_copy_async(s * BLOCK_M * BLOCK_K, s * BLOCK_N * BLOCK_K, a_rsrc, a_begin + s * BLOCK_K, k, b_rsrc, b_begin + s * BLOCK_K, k, m_remain, n_remain, k_remain);
+        }
+        for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+            __barrier(); // FIXME: need aligment on async copy count
+            block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
+            block_tile();
+            if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
+                uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
+                block_tile.ldg_copy_async(write_stage * BLOCK_M * BLOCK_K, write_stage * BLOCK_N * BLOCK_K, a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k, b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k, m_remain, n_remain, k_remain);
+            }
+            current_stage = (current_stage + 1) % STAGES;
+        }
+    } else {
+        static_assert(STAGES == 2);
+        block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k, m_remain, n_remain, k_remain);
         __barrier();
+        for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+            uint32_t write_stage = (current_stage + 1) % STAGES;
+            block_tile.ldg_copy_async(
+                write_stage * BLOCK_M * BLOCK_K,
+                write_stage * BLOCK_N * BLOCK_K,
+                a_rsrc, a_begin + BLOCK_K, k,
+                b_rsrc, b_begin + BLOCK_K, k,
+                m_remain, n_remain, k_remain);
+            block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
+            current_stage = write_stage;
+            __barrier();
+        }
+        block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
     }
-    block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-    block_tile();
 
 #endif
 
-    block_tile.store_matrix(c, smem.cs, mi, ni, m, n);
+    if constexpr (IS_SPLIT_K) {
+        // spin-wait until signal triggered
+        if (tid == 0) {
+            while (*reinterpret_cast<uint32_t volatile *>(&signal[signal_idx]) == 0) {}
+        }
+        __syncthreads();
+        // clean semaphore and signal if this is the last block within split-k group
+        if (tid == 0) {
+            uint32_t arrive_idx = atomicAdd(&semaphore[signal_idx], static_cast<uint32_t>(1));
+            if (arrive_idx == SPLIT_K - 1) {
+                semaphore[signal_idx] = 0;
+                signal[signal_idx] = 0;
+            }
+        }
+        block_tile.template store_matrix<true, true>(c, smem.cs, mi, ni, m, n);
+    } else {
+        block_tile.template store_matrix<false, false>(c, smem.cs, mi, ni, m, n);
+    }
 }
 
-std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N) {
+std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SPLIT_K) {
     uint32_t bm = (m + BLOCK_M - 1) / BLOCK_M;
     uint32_t bn = (n + BLOCK_N - 1) / BLOCK_N;
-    uint32_t raster_factor = 1;
-    return {dim3(bn, bm, 1), raster_factor};
+    uint32_t grid_dim_x = bm * bn;
+    return {dim3(grid_dim_x, SPLIT_K, 1), grid_dim_x};
 }
 
 #ifdef __CUDACC__
 
-#define GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES) \
-    hgemm_wmma_m16n8k16_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##WARP_SIZE##_s##STAGES##_
+#define GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K) \
+    hgemm_wmma_m16n8k16_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_spk##SPLIT_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##BLOCK_K_WARPS##x##WARP_SIZE##_s##STAGES##_
 
-#define REGISTER_HGEMM_WMMA_M16N8K16_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)                             \
-    void GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)(                           \
-        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16, gpuStream_t stream) { \
-        constexpr uint32_t VEC_SIZE = 8;                                                                                                          \
-        assert(n % VEC_SIZE == 0);                                                                                                                \
-        assert(k % VEC_SIZE == 0);                                                                                                                \
-        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N);                                                                                               \
-        dim3 grid = std::get<0>(gr);                                                                                                              \
-        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE;                                                                \
-        dim3 block(BLOCK_SIZE);                                                                                                                   \
-        constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / 16;                                                                           \
-        constexpr uint32_t WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / 8;                                                                            \
-        if (is_bf16 == false) {                                                                                                                   \
-            using T = __half;                                                                                                                     \
-            using WMMAT = WMMA_M16N8K16<T, float>;                                                                                                \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                                  \
-                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                                    \
-        } else {                                                                                                                                  \
-            using T = __bfloat16;                                                                                                                 \
-            using WMMAT = WMMA_M16N8K16<T, float>;                                                                                                \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                                  \
-                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                                    \
-        }                                                                                                                                         \
+#define REGISTER_HGEMM_WMMA_M16N8K16_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)   \
+    void GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)( \
+        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16,                     \
+        uint32_t *semaphore, uint32_t *signal, gpuStream_t stream) {                                                                            \
+        constexpr uint32_t VEC_SIZE = 8;                                                                                                        \
+        assert(n % VEC_SIZE == 0);                                                                                                              \
+        assert(k % VEC_SIZE == 0);                                                                                                              \
+        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N, SPLIT_K);                                                                                    \
+        dim3 grid = std::get<0>(gr);                                                                                                            \
+        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE;                                              \
+        dim3 block(BLOCK_SIZE);                                                                                                                 \
+        constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / 16;                                                                         \
+        constexpr uint32_t WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / 8;                                                                          \
+        if (is_bf16 == false) {                                                                                                                 \
+            using T = __half;                                                                                                                   \
+            using WMMAT = WMMA_M16N8K16<T, float>;                                                                                              \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                 \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                      \
+        } else {                                                                                                                                \
+            using T = __bfloat16;                                                                                                               \
+            using WMMAT = WMMA_M16N8K16<T, float>;                                                                                              \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                 \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                      \
+        }                                                                                                                                       \
     }
 
-REGISTER_HGEMM_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 4)
+REGISTER_HGEMM_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2, /*SPLIT_K*/ 4)
+REGISTER_HGEMM_WMMA_M16N8K16_IMPL(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 32, /*STAGES*/ 4, /*SPLIT_K*/ 1)
 
 void hgemm_peak(
     short *c,
@@ -417,42 +668,59 @@ void hgemm_peak(
     const uint32_t n,
     const uint32_t k,
     const bool is_bf16,
+    uint32_t *semaphore,
+    uint32_t *signal,
     gpuStream_t stream) {
-    GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 32, /*STAGES*/ 4)
-    (c, a, b, m, n, k, is_bf16, stream);
+    if (m <= 256) {
+        GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 1, /*BLOCK_K_WARPS*/ 2, /*WARP_SIZE*/ 32, /*STAGES*/ 2, /*SPLIT_K*/ 4)
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
+    } else {
+        GET_HGEMM_WMMA_M16N8K16_IMPL_NAME(/*BLOCK_M*/ 128, /*BLOCK_N*/ 128, /*BLOCK_K*/ 16, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 32, /*STAGES*/ 4, /*SPLIT_K*/ 1)
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
+    }
 }
 
-#elif defined(__HIPCC__)
+#endif
 
-#define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES) \
-    hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##WARP_SIZE##_s##STAGES##_
+#ifdef __HIPCC__
 
-#define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)                            \
-    void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_SIZE, STAGES)(                          \
-        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16, gpuStream_t stream) { \
-        constexpr uint32_t VEC_SIZE = 8;                                                                                                          \
-        assert(n % VEC_SIZE == 0);                                                                                                                \
-        assert(k % VEC_SIZE == 0);                                                                                                                \
-        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N);                                                                                               \
-        dim3 grid = std::get<0>(gr);                                                                                                              \
-        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE;                                                                \
-        dim3 block(BLOCK_SIZE);                                                                                                                   \
-        constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / 16;                                                                           \
-        constexpr uint32_t WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / 16;                                                                           \
-        if (is_bf16 == false) {                                                                                                                   \
-            using T = __half;                                                                                                                     \
-            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                       \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                                  \
-                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                                    \
-        } else {                                                                                                                                  \
-            using T = __bfloat16;                                                                                                                 \
-            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                       \
-            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS,                                  \
-                         STAGES><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);                                                    \
-        }                                                                                                                                         \
+#define GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K) \
+    hgemm_wmma_m16n16k32_##BLOCK_M##x##BLOCK_N##x##BLOCK_K##_spk##SPLIT_K##_w##BLOCK_M_WARPS##x##BLOCK_N_WARPS##x##BLOCK_K_WARPS##x##WARP_SIZE##_s##STAGES##_
+
+#define REGISTER_HGEMM_WMMA_M16N16K32_IMPL(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)   \
+    void GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_SIZE, STAGES, SPLIT_K)( \
+        short *c, const short *a, const short *b, const uint32_t m, const uint32_t n, const uint32_t k, const bool is_bf16,                      \
+        uint32_t *semaphore, uint32_t *signal, gpuStream_t stream) {                                                                             \
+        constexpr uint32_t VEC_SIZE = 8;                                                                                                         \
+        assert(n % VEC_SIZE == 0);                                                                                                               \
+        assert(k % VEC_SIZE == 0);                                                                                                               \
+        auto gr = get_grid(m, n, BLOCK_M, BLOCK_N, SPLIT_K);                                                                                     \
+        dim3 grid = std::get<0>(gr);                                                                                                             \
+        constexpr uint32_t BLOCK_SIZE = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE;                                               \
+        dim3 block(BLOCK_SIZE);                                                                                                                  \
+        constexpr uint32_t WARP_M = BLOCK_M_WARPS * 16;                                                                                          \
+        constexpr uint32_t WARP_N = BLOCK_N_WARPS * 16;                                                                                          \
+        constexpr uint32_t WARP_M_STEPS = (BLOCK_M + WARP_M - 1) / WARP_M;                                                                       \
+        constexpr uint32_t WARP_N_STEPS = (BLOCK_N + WARP_N - 1) / WARP_N;                                                                       \
+        if (SPLIT_K > 1) {                                                                                                                       \
+            assert(std::get<1>(gr) < SPLIT_K_SEMAPHORE_MAX_LEN);                                                                                 \
+            assert(k % (SPLIT_K * BLOCK_K) == 0);                                                                                                \
+        }                                                                                                                                        \
+        if (is_bf16 == false) {                                                                                                                  \
+            using T = __half;                                                                                                                    \
+            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                      \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                       \
+        } else {                                                                                                                                 \
+            using T = __bfloat16;                                                                                                                \
+            using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;                                                                      \
+            hgemm_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS,                  \
+                         STAGES, SPLIT_K><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k, semaphore, signal);                       \
+        }                                                                                                                                        \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
 
 void hgemm_peak(
     short *c,
@@ -462,9 +730,17 @@ void hgemm_peak(
     const uint32_t n,
     const uint32_t k,
     const bool is_bf16,
+    uint32_t *semaphore,
+    uint32_t *signal,
     gpuStream_t stream) {
-    GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*WARP_SIZE*/ 64, /*STAGES*/ 2)
-    (c, a, b, m, n, k, is_bf16, stream);
+    assert(n % 8 == 0 && k % 8 == 0);
+    if (m <= 256) {
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
+    } else {
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
+        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
+    }
 }
 
 #endif

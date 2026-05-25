@@ -118,10 +118,23 @@ public:
 #elif defined(__HIPCC__)
 
 typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
+typedef __attribute__((__vector_size__(2 * sizeof(__fp16)))) __fp16 fp16x2_t;
+typedef __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16 bf16x2_t;
 typedef __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16 fp16x4_t;
 typedef __attribute__((__vector_size__(4 * sizeof(__bf16)))) __bf16 bf16x4_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 fp16x8_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 bf16x8_t;
+
+__device__ __forceinline__ floatx4_t mfma_f32_16x16x32_bf16_inline_acc(
+    bf16x8_t &a,
+    bf16x8_t &b,
+    floatx4_t &acc) {
+    asm volatile(
+        "v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0"
+        : "+a"(acc)
+        : "v"(a), "v"(b));
+    return acc;
+}
 
 template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true, uint32_t K_BLOCKS16 = 0>
 struct WMMA_M16N16K32 {
@@ -168,10 +181,10 @@ struct WMMA_M16N16K32 {
     }
 
     __device__ __forceinline__ void reset_fragment_c(FragmentCT &c, acc_t val = 0) {
-        c.val[0] = val;
-        c.val[1] = val;
-        c.val[2] = val;
-        c.val[3] = val;
+        c[0] = val;
+        c[1] = val;
+        c[2] = val;
+        c[3] = val;
     }
 
     __device__ __forceinline__ uint32_t swizzle(uint32_t row, uint32_t col) {
@@ -206,10 +219,10 @@ struct WMMA_M16N16K32 {
     __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t stride, FragmentCT const &c) {
         uint32_t x = w_tid % 16;
         uint32_t y_begin = w_tid / 16 * 4;
-        ptr[(y_begin + 0) * stride + x] = (scalar_t)c.val[0];
-        ptr[(y_begin + 1) * stride + x] = (scalar_t)c.val[1];
-        ptr[(y_begin + 2) * stride + x] = (scalar_t)c.val[2];
-        ptr[(y_begin + 3) * stride + x] = (scalar_t)c.val[3];
+        ptr[(y_begin + 0) * stride + x] = (scalar_t)c[0];
+        ptr[(y_begin + 1) * stride + x] = (scalar_t)c[1];
+        ptr[(y_begin + 2) * stride + x] = (scalar_t)c[2];
+        ptr[(y_begin + 3) * stride + x] = (scalar_t)c[3];
     }
 
 public:
