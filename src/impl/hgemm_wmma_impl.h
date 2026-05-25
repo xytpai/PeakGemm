@@ -148,7 +148,7 @@ struct BlockTile {
             uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + col;
             llvm_amdgcn_raw_buffer_load_lds(
                 a_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(as_ + as_offset * sizeof(scalar_t) + i * BLOCK_DMA_STRIDE),
+                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
@@ -165,7 +165,7 @@ struct BlockTile {
             uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + col;
             llvm_amdgcn_raw_buffer_load_lds(
                 b_rsrc,
-                (as3_uint32_ptr) static_cast<uintptr_t>(bs_ + bs_offset * sizeof(scalar_t) + i * BLOCK_DMA_STRIDE),
+                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
                 DMA_BYTES,
                 global_offset * sizeof(scalar_t),
                 0,
