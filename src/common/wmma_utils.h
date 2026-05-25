@@ -125,6 +125,17 @@ typedef __attribute__((__vector_size__(4 * sizeof(__bf16)))) __bf16 bf16x4_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 fp16x8_t;
 typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 bf16x8_t;
 
+__device__ __forceinline__ floatx4_t mfma_f32_16x16x32_bf16_inline_acc(
+    bf16x8_t &a,
+    bf16x8_t &b,
+    floatx4_t &acc) {
+    asm volatile(
+        "v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0"
+        : "+a"(acc)
+        : "v"(a), "v"(b));
+    return acc;
+}
+
 template <typename scalar_t, typename acc_t, bool USE_SWIZZLE = true, uint32_t K_BLOCKS16 = 0>
 struct WMMA_M16N16K32 {
     enum {
