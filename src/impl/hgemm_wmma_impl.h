@@ -142,18 +142,18 @@ struct BlockTile {
             uint32_t tid_ = BLOCK_THREADS * i + tid;
             uint32_t row = tid_ / LDG_A_X_THREADS;
             uint32_t col = ldg_a_vec_idx * LDG_VEC_SIZE;
-            if (row < m_bound && col < k_bound) {
-                col = wmma.swizzle(row, col);
-                uint32_t global_offset = a_begin + row * a_stride + col;
-                llvm_amdgcn_raw_buffer_load_lds(
-                    a_rsrc,
-                    (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_),
-                    DMA_BYTES,
-                    global_offset * sizeof(scalar_t),
-                    0,
-                    0,
-                    0);
-            }
+            row = row < m_bound ? row : 0;
+            col = col < k_bound ? col : 0;
+            col = wmma.swizzle(row, col);
+            uint32_t global_offset = a_begin + row * a_stride + col;
+            llvm_amdgcn_raw_buffer_load_lds(
+                a_rsrc,
+                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_),
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                0);
             as_warp_ += BLOCK_THREADS * DMA_BYTES;
         }
 #pragma unroll
@@ -161,18 +161,18 @@ struct BlockTile {
             uint32_t tid_ = BLOCK_THREADS * i + tid;
             uint32_t row = tid_ / LDG_B_X_THREADS;
             uint32_t col = ldg_b_vec_idx * LDG_VEC_SIZE;
-            if (row < n_bound && col < k_bound) {
-                col = wmma.swizzle(row, col);
-                uint32_t global_offset = b_begin + row * b_stride + col;
-                llvm_amdgcn_raw_buffer_load_lds(
-                    b_rsrc,
-                    (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_),
-                    DMA_BYTES,
-                    global_offset * sizeof(scalar_t),
-                    0,
-                    0,
-                    0);
-            }
+            row = row < n_bound ? row : 0;
+            col = col < k_bound ? col : 0;
+            col = wmma.swizzle(row, col);
+            uint32_t global_offset = b_begin + row * b_stride + col;
+            llvm_amdgcn_raw_buffer_load_lds(
+                b_rsrc,
+                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_),
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                0);
             bs_warp_ += BLOCK_THREADS * DMA_BYTES;
         }
     }
@@ -561,40 +561,26 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) 
     auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
     block_tile.init_hip(&smem.as[0][0], &smem.bs[0][0]);
 
-    constexpr bool ENABLE_MULTI_STAGE = false;
-
-    if constexpr (ENABLE_MULTI_STAGE) {
+    constexpr uint32_t COPY_INSTS_PER_STAGE = BlockTileT::LDG_REG_A_COUNT + BlockTileT::LDG_REG_B_COUNT;
 #pragma unroll
-        for (uint32_t s = 0; s < STAGES - 1; ++s) {
-            block_tile.ldg_copy_async(s * BLOCK_M * BLOCK_K, s * BLOCK_N * BLOCK_K, a_rsrc, a_begin + s * BLOCK_K, k, b_rsrc, b_begin + s * BLOCK_K, k, m_remain, n_remain, k_remain);
-        }
-        for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-            __barrier(); // FIXME: need aligment on async copy count
-            block_tile.load_matrix(smem.as[current_stage], smem.bs[current_stage]);
-            block_tile();
-            if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
-                uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-                block_tile.ldg_copy_async(write_stage * BLOCK_M * BLOCK_K, write_stage * BLOCK_N * BLOCK_K, a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k, b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k, m_remain, n_remain, k_remain);
-            }
-            current_stage = (current_stage + 1) % STAGES;
-        }
-    } else {
-        static_assert(STAGES == 2);
-        block_tile.ldg_copy_async(0, 0, a_rsrc, a_begin, k, b_rsrc, b_begin, k, m_remain, n_remain, k_remain);
-        __barrier();
-        for (; a_begin < a_end - BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-            uint32_t write_stage = (current_stage + 1) % STAGES;
+    for (uint32_t s = 0; s < STAGES - 1; ++s) {
+        block_tile.ldg_copy_async(s * BLOCK_M * BLOCK_K, s * BLOCK_N * BLOCK_K, a_rsrc, a_begin + s * BLOCK_K, k, b_rsrc, b_begin + s * BLOCK_K, k, m_remain, n_remain, k_remain);
+    }
+    for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+        if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
+            __barrier<(STAGES - 2) * COPY_INSTS_PER_STAGE>();
+            uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
             block_tile.ldg_copy_async(
                 write_stage * BLOCK_M * BLOCK_K,
                 write_stage * BLOCK_N * BLOCK_K,
-                a_rsrc, a_begin + BLOCK_K, k,
-                b_rsrc, b_begin + BLOCK_K, k,
+                a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k,
+                b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k,
                 m_remain, n_remain, k_remain);
-            block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
-            current_stage = write_stage;
+        } else {
             __barrier();
         }
         block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
+        current_stage = (current_stage + 1) % STAGES;
     }
 
 #endif
@@ -719,7 +705,7 @@ void hgemm_peak(
         }                                                                                                                                        \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
 REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
 
 void hgemm_peak(
@@ -735,7 +721,7 @@ void hgemm_peak(
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 8)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 64, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
         GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
