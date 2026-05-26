@@ -38,6 +38,10 @@ __device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, _
     fp16x2_t val = *reinterpret_cast<fp16x2_t *>(pk_src);
     __builtin_amdgcn_global_atomic_fadd_v2f16(dst, val);
 }
+template <uint32_t P>
+__device__ __forceinline__ void hip_s_setprio() {
+    asm volatile("s_setprio %0" ::"n"(P));
+}
 #endif
 
 #define SPLIT_K_SEMAPHORE_MAX_LEN 256
@@ -126,6 +130,7 @@ struct BlockTile {
 #endif
 
 #ifdef __HIPCC__
+
     __device__ __forceinline__ void init_hip(scalar_t *as, scalar_t *bs) {
         as_ = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(as) + (wid * WARP_SIZE * DMA_BYTES));
         bs_ = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(bs) + (wid * WARP_SIZE * DMA_BYTES));
@@ -174,6 +179,7 @@ struct BlockTile {
             row += BLOCK_THREADS / LDG_B_X_THREADS;
         }
     }
+
 #endif
 
     template <uint32_t S = 0>
@@ -287,6 +293,11 @@ struct BlockTile {
                 }
             }
         }
+    }
+
+    __device__ __forceinline__ void compute_tile(scalar_t *as, scalar_t *bs) {
+        load_matrix(as, bs);
+        operator()();
     }
 
     __device__ __forceinline__ void compute_tile_streaming(scalar_t *as, scalar_t *bs) {
@@ -454,15 +465,17 @@ template <
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2) __global__ void hgemm_kernel(
-    scalar_t *c,
-    const scalar_t *a,
-    const scalar_t *b,
-    const uint32_t m,
-    const uint32_t n,
-    const uint32_t k,
-    uint32_t *semaphore,
-    uint32_t *signal) {
+__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
+    // __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512)))
+    __global__ void hgemm_kernel(
+        scalar_t *c,
+        const scalar_t *a,
+        const scalar_t *b,
+        const uint32_t m,
+        const uint32_t n,
+        const uint32_t k,
+        uint32_t *semaphore,
+        uint32_t *signal) {
     using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
     constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
