@@ -13,6 +13,7 @@ __device__ __forceinline__ void atomic_pack_add_scalar(T *pk_dst, T *pk_src) {
 }
 
 #ifdef __CUDACC__
+#define LAUNCH_CONFIG __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
 template <>
 __device__ __forceinline__ void atomic_pack_add_scalar<__bfloat16>(__bfloat16 *pk_dst, __bfloat16 *pk_src) {
     atomicAdd(&pk_dst[0], pk_src[0]);
@@ -28,6 +29,7 @@ __device__ __forceinline__ void sched_barrier() {
 #endif
 
 #ifdef __HIPCC__
+#define LAUNCH_CONFIG __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE)))
 __device__ __forceinline__ void sched_barrier() {
     __builtin_amdgcn_sched_barrier(0);
 }
@@ -390,17 +392,15 @@ template <
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
     uint32_t SPLIT_K>
-__launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
-    // __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512)))
-    __global__ void hgemm_kernel(
-        scalar_t *c,
-        const scalar_t *a,
-        const scalar_t *b,
-        const uint32_t m,
-        const uint32_t n,
-        const uint32_t k,
-        uint32_t *semaphore,
-        uint32_t *signal) {
+LAUNCH_CONFIG __global__ void hgemm_kernel(
+    scalar_t *c,
+    const scalar_t *a,
+    const scalar_t *b,
+    const uint32_t m,
+    const uint32_t n,
+    const uint32_t k,
+    uint32_t *semaphore,
+    uint32_t *signal) {
     using BlockTileT = BlockTile<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, WARP_M_STEPS, WARP_N_STEPS>;
     constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
