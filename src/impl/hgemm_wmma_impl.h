@@ -341,54 +341,27 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
 #endif
 #ifdef __HIPCC__
     if constexpr (L2_SW) {
-        // Algo1
-        uint32_t wgid = blockIdx.x;
-        uint32_t num_pid_m = (m + BLOCK_M - 1) / BLOCK_M;
-        uint32_t num_pid_n = (n + BLOCK_N - 1) / BLOCK_N;
+        uint32_t bm = (m + BLOCK_M - 1) / BLOCK_M;
+        uint32_t pid = blockIdx.x;
         constexpr uint32_t NUM_XCDS = 8;
-        constexpr uint32_t WGM = 4;
-        constexpr uint32_t NUM_CUS = 32 * NUM_XCDS;
-        constexpr uint32_t SWIZZLE_THRESHOLD = 4 * NUM_CUS;
-        uint32_t num_wg = num_pid_m * num_pid_n;
-        if (num_wg <= SWIZZLE_THRESHOLD || num_wg % NUM_XCDS != 0) {
-            mi = wgid / num_pid_n;
-            ni = wgid % num_pid_n;
+        constexpr uint32_t NUM_PID_M_IN_GROUP = 4;
+        constexpr uint32_t CU_NUM = 256;
+        if (gridDim.x <= (CU_NUM * NUM_PID_M_IN_GROUP) || gridDim.x % NUM_XCDS != 0) {
+            mi = pid / bn;
+            ni = pid % bn;
             return;
         }
-        uint32_t intra_xcd = wgid / NUM_XCDS;
-        uint32_t xcd = wgid % NUM_XCDS;
-        wgid = xcd * (num_wg / NUM_XCDS) + intra_xcd;
-        uint32_t num_wgid_in_group = WGM * num_pid_n;
-        uint32_t group_id = wgid / num_wgid_in_group;
-        uint32_t intra_group = wgid % num_wgid_in_group;
-        uint32_t first_pid_m = group_id * WGM;
-        uint32_t group_size_m = min(num_pid_m - first_pid_m, WGM);
-        uint32_t pid_n = intra_group / group_size_m;
-        uint32_t intra_group_m = intra_group % group_size_m;
-        uint32_t pid_m = first_pid_m + intra_group_m;
-        mi = pid_m;
-        ni = pid_n;
-        // Algo2
-        // uint32_t pid = blockIdx.x;
-        // constexpr uint32_t L2_WINDOW_M = 2;
-        // constexpr uint32_t L2_WINDOW_N = 2;
-        // constexpr uint32_t LLC_WINDOW_M = 2;
-        // constexpr uint32_t LLC_WINDOW_N = 2;
-        // constexpr uint32_t LLC_TILE_M = L2_WINDOW_M * LLC_WINDOW_M;
-        // constexpr uint32_t LLC_TILE_N = L2_WINDOW_N * LLC_WINDOW_N;
-        // uint32_t m_blocks = (m + BLOCK_M - 1) / BLOCK_M;
-        // uint32_t n_blocks = (n + BLOCK_N - 1) / BLOCK_N;
-        // uint32_t llc_tile_idx = pid / (LLC_TILE_M * LLC_TILE_N);
-        // uint32_t llc_tile_m = llc_tile_idx / (n_blocks / LLC_TILE_N);
-        // uint32_t llc_tile_n = llc_tile_idx % (n_blocks / LLC_TILE_N);
-        // uint32_t l2_tile_idx = pid % (LLC_TILE_M * LLC_TILE_N) / (L2_WINDOW_M * L2_WINDOW_N);
-        // uint32_t l2_tile_m = l2_tile_idx / LLC_WINDOW_N;
-        // uint32_t l2_tile_n = l2_tile_idx % LLC_WINDOW_N;
-        // uint32_t local_idx = pid % (LLC_TILE_M * LLC_TILE_N) % (L2_WINDOW_M * L2_WINDOW_N);
-        // uint32_t local_m = local_idx / L2_WINDOW_N;
-        // uint32_t local_n = local_idx % L2_WINDOW_N;
-        // mi = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_WINDOW_M + local_m;
-        // ni = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_WINDOW_N + local_n;
+        uint32_t intra_xcd_id = pid / NUM_XCDS;
+        uint32_t xcd_id = pid % NUM_XCDS;
+        uint32_t num_pids_in_xcd = (gridDim.x + NUM_XCDS - 1) / NUM_XCDS;
+        uint32_t swizzled_pid = xcd_id * num_pids_in_xcd + intra_xcd_id;
+        uint32_t num_pid_in_group = NUM_PID_M_IN_GROUP * bn;
+        uint32_t group_id = swizzled_pid / num_pid_in_group;
+        uint32_t intra_group_id = swizzled_pid % num_pid_in_group;
+        uint32_t first_pid_m = group_id * NUM_PID_M_IN_GROUP;
+        uint32_t group_size_m = min(bm - first_pid_m, NUM_PID_M_IN_GROUP);
+        ni = intra_group_id / group_size_m;
+        mi = first_pid_m + intra_group_id % group_size_m;
     } else {
         mi = blockIdx.x / bn;
         ni = blockIdx.x % bn;
@@ -438,7 +411,7 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
     uint32_t ks_idx = blockIdx.y;
     uint32_t ks_begin = ks_idx * ks;
     uint32_t mi, ni;
-    get_tile_mn<BLOCK_M, BLOCK_N>(m, n, mi, ni);
+    get_tile_mn<BLOCK_M, BLOCK_N, !IS_SPLIT_K>(m, n, mi, ni);
     uint32_t m_offset = mi * BLOCK_M;
     uint32_t n_offset = ni * BLOCK_N;
     uint32_t m_remain = (m_offset < m) ? (m - m_offset) : 0;
