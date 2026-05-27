@@ -148,14 +148,14 @@ struct BlockTile {
         uint32_t m_bound, uint32_t n_bound, uint32_t k_bound) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
-        uint32_t row, col_;
-        col_ = ldg_a_vec_idx * LDG_VEC_SIZE;
-        col_ = col_ < k_bound ? col_ : 0;
-        row = tid / LDG_A_X_THREADS;
+        uint32_t a_col = ldg_a_vec_idx * LDG_VEC_SIZE;
+        uint32_t b_col = ldg_b_vec_idx * LDG_VEC_SIZE;
+        a_col = a_col < k_bound ? a_col : 0;
+        b_col = b_col < k_bound ? b_col : 0;
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_A_COUNT; i++) {
-            uint32_t col = wmma.swizzle(row, col_);
-            uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + col;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
+            uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + wmma.swizzle(row, a_col);
             llvm_amdgcn_raw_buffer_load_lds(
                 a_rsrc,
                 (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
@@ -164,15 +164,11 @@ struct BlockTile {
                 0,
                 0,
                 0);
-            row += BLOCK_THREADS / LDG_A_X_THREADS;
         }
-        col_ = ldg_b_vec_idx * LDG_VEC_SIZE;
-        col_ = col_ < k_bound ? col_ : 0;
-        row = tid / LDG_B_X_THREADS;
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_B_COUNT; i++) {
-            uint32_t col = wmma.swizzle(row, col_);
-            uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + col;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
+            uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + wmma.swizzle(row, b_col);
             llvm_amdgcn_raw_buffer_load_lds(
                 b_rsrc,
                 (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
@@ -181,7 +177,6 @@ struct BlockTile {
                 0,
                 0,
                 0);
-            row += BLOCK_THREADS / LDG_B_X_THREADS;
         }
     }
 
