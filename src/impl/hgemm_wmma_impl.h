@@ -265,18 +265,8 @@ struct BlockTile {
 #pragma unroll
         for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
             uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
-            FragmentAT a_frag[WARP_M_STEPS];
             FragmentBT b_frag[WARP_N_STEPS];
-#pragma unroll
-            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-                wmma.load_matrix_a(
-                    a_frag[mi],
-                    as,
-                    warp_atom_offset_m,
-                    k_col,
-                    BLOCK_K);
-            }
+            FragmentAT a_frag[WARP_M_STEPS];
 #pragma unroll
             for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
                 uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
@@ -284,6 +274,17 @@ struct BlockTile {
                     b_frag[ni],
                     bs,
                     warp_atom_offset_n,
+                    k_col,
+                    BLOCK_K);
+            }
+            sched_barrier();
+#pragma unroll
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                wmma.load_matrix_a(
+                    a_frag[mi],
+                    as,
+                    warp_atom_offset_m,
                     k_col,
                     BLOCK_K);
             }
