@@ -29,7 +29,7 @@ __device__ __forceinline__ void sched_barrier() {
 #endif
 
 #ifdef __HIPCC__
-#define LAUNCH_CONFIG __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE)))
+#define LAUNCH_CONFIG __attribute__((amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE)))
 __device__ __forceinline__ void sched_barrier() {
     __builtin_amdgcn_sched_barrier(0);
 }
