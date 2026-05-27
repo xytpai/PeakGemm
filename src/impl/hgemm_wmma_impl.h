@@ -23,9 +23,14 @@ __device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, _
     atomicAdd(&pk_dst[0], pk_src[0]);
     atomicAdd(&pk_dst[1], pk_src[1]);
 }
+__device__ __forceinline__ void sched_barrier() {
+}
 #endif
 
 #ifdef __HIPCC__
+__device__ __forceinline__ void sched_barrier() {
+    __builtin_amdgcn_sched_barrier(0);
+}
 template <>
 __device__ __forceinline__ void atomic_pack_add_scalar<__bfloat16>(__bfloat16 *pk_dst, __bfloat16 *pk_src) {
     auto dst = reinterpret_cast<bf16x2_t *>(pk_dst);
@@ -83,6 +88,7 @@ struct BlockTile {
         LDG_REG_A_COUNT = BLOCK_MK_SIZE / LDG_VEC_SIZE / BLOCK_THREADS,
         LDG_REG_B_COUNT = BLOCK_NK_SIZE / LDG_VEC_SIZE / BLOCK_THREADS,
         DMA_BYTES = 16,
+        BLOCK_DMA_STRIDE = BLOCK_THREADS * DMA_BYTES,
     };
     static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
     static_assert(BLOCK_K % WARP_GROUP_K == 0 && WARP_K_STEPS >= 1 && K_SLICE % WARP_ATOM_K == 0);
@@ -146,7 +152,6 @@ struct BlockTile {
         col_ = ldg_a_vec_idx * LDG_VEC_SIZE;
         col_ = col_ < k_bound ? col_ : 0;
         row = tid / LDG_A_X_THREADS;
-        constexpr uint32_t BLOCK_DMA_STRIDE = BLOCK_THREADS * DMA_BYTES;
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_A_COUNT; i++) {
             uint32_t col = wmma.swizzle(row, col_);
@@ -189,32 +194,6 @@ struct BlockTile {
 
     __device__ __forceinline__ void commit() {
         CopyAsync::commit();
-    }
-
-    __device__ __forceinline__ void load_matrix(scalar_t *as, scalar_t *bs) {
-        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
-        uint32_t warp_k_slice_base = wid_k * K_SLICE;
-#pragma unroll
-        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-            uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-#pragma unroll
-            for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
-                uint32_t row = warp_atom_offset_m;
-                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
-                wmma.load_matrix_a(fa[ki][mi], as, row, col, BLOCK_K);
-            }
-        }
-#pragma unroll
-        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-#pragma unroll
-            for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
-                uint32_t row = warp_atom_offset_n;
-                uint32_t col = warp_k_slice_base + ki * WARP_ATOM_K;
-                wmma.load_matrix_b(fb[ki][ni], bs, row, col, BLOCK_K);
-            }
-        }
     }
 
     template <bool C_SHUFFLE = false, bool USE_ATOMIC = false>
@@ -282,35 +261,25 @@ struct BlockTile {
         }
     }
 
-    __device__ __forceinline__ void operator()() {
-#pragma unroll
-        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-#pragma unroll
-            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-#pragma unroll
-                for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
-                    wmma(fo[mi][ni], fa[ki][mi], fb[ki][ni], fo[mi][ni]);
-                }
-            }
-        }
-    }
-
-    __device__ __forceinline__ void compute_tile(scalar_t *as, scalar_t *bs) {
-        load_matrix(as, bs);
-        operator()();
-    }
-
     __device__ __forceinline__ void compute_tile_streaming(scalar_t *as, scalar_t *bs) {
         uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
         uint32_t warp_k_slice_base = wid_k * K_SLICE;
-
 #pragma unroll
         for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
             uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
-
+            FragmentAT a_frag[WARP_M_STEPS];
             FragmentBT b_frag[WARP_N_STEPS];
-
+#pragma unroll
+            for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                wmma.load_matrix_a(
+                    a_frag[mi],
+                    as,
+                    warp_atom_offset_m,
+                    k_col,
+                    BLOCK_K);
+            }
 #pragma unroll
             for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
                 uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
@@ -321,24 +290,14 @@ struct BlockTile {
                     k_col,
                     BLOCK_K);
             }
-
+            sched_barrier();
 #pragma unroll
             for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-                FragmentAT a_frag;
-                uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-
-                wmma.load_matrix_a(
-                    a_frag,
-                    as,
-                    warp_atom_offset_m,
-                    k_col,
-                    BLOCK_K);
-
 #pragma unroll
                 for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
                     wmma(
                         fo[mi][ni],
-                        a_frag,
+                        a_frag[mi],
                         b_frag[ni],
                         fo[mi][ni]);
                 }
@@ -357,8 +316,6 @@ private:
     ldg_vec_t ldg_a_reg[LDG_REG_A_COUNT];
     ldg_vec_t ldg_b_reg[LDG_REG_B_COUNT];
     WMMAT wmma;
-    FragmentAT fa[WARP_K_STEPS][WARP_M_STEPS];
-    FragmentBT fb[WARP_K_STEPS][WARP_N_STEPS];
     FragmentCT fo[WARP_M_STEPS][WARP_N_STEPS];
 #ifdef __HIPCC__
     uint32_t as_;
@@ -575,7 +532,12 @@ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
     constexpr uint32_t COPY_INSTS_PER_STAGE = BlockTileT::LDG_REG_A_COUNT + BlockTileT::LDG_REG_B_COUNT;
 #pragma unroll
     for (uint32_t s = 0; s < STAGES - 1; ++s) {
-        block_tile.ldg_copy_async(s * BLOCK_M * BLOCK_K, s * BLOCK_N * BLOCK_K, a_rsrc, a_begin + s * BLOCK_K, k, b_rsrc, b_begin + s * BLOCK_K, k, m_remain, n_remain, k_remain);
+        block_tile.ldg_copy_async(
+            s * BLOCK_M * BLOCK_K,
+            s * BLOCK_N * BLOCK_K,
+            a_rsrc, a_begin + s * BLOCK_K, k,
+            b_rsrc, b_begin + s * BLOCK_K, k,
+            m_remain, n_remain, k_remain);
     }
     for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
