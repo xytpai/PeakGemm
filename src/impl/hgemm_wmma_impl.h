@@ -310,8 +310,6 @@ private:
     uint32_t ldg_b_vec_idx;
     uint32_t wid_mn;
     uint32_t wid_k;
-    ldg_vec_t ldg_a_reg[LDG_REG_A_COUNT];
-    ldg_vec_t ldg_b_reg[LDG_REG_B_COUNT];
     WMMAT wmma;
     FragmentCT fo[WARP_M_STEPS][WARP_N_STEPS];
 #ifdef __HIPCC__
