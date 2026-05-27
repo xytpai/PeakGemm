@@ -346,7 +346,8 @@ __device__ __forceinline__ void get_tile_mn(uint32_t m, uint32_t n, uint32_t &mi
         constexpr uint32_t NUM_XCDS = 8;
         constexpr uint32_t NUM_PID_M_IN_GROUP = 4;
         constexpr uint32_t CU_NUM = 256;
-        if (gridDim.x <= (CU_NUM * NUM_PID_M_IN_GROUP) || gridDim.x % NUM_XCDS != 0) {
+        // if (gridDim.x % NUM_XCDS != 0) {
+        if (true) {
             mi = pid / bn;
             ni = pid % bn;
             return;
