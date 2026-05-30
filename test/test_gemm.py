@@ -116,6 +116,7 @@ if __name__ == '__main__':
     # python3 test/test_gemm.py --m=32 --n=384 --k=16384 --dtype=bf16
 
     # python3 test/test_gemm.py --m=4 --n=4096 --k=8192 --dtype=bf16
+    # python3 test/test_gemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
 
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f32
     # python3 test/test_gemm.py --m=4096 --n=4096 --k=4096 --dtype=f16

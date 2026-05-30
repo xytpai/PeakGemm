@@ -185,6 +185,40 @@ struct BlockTile {
         }
     }
 
+    template <uint32_t i>
+    __device__ __forceinline__ void ldg_copy_async_a(uint32_t as_offset, i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride, uint32_t m_bound, uint32_t k_bound) {
+        uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
+        uint32_t a_col = ldg_a_vec_idx * LDG_VEC_SIZE;
+        a_col = a_col < k_bound ? a_col : 0;
+        uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
+        uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + wmma.swizzle(row, a_col);
+        llvm_amdgcn_raw_buffer_load_lds(
+            a_rsrc,
+            (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
+            DMA_BYTES,
+            global_offset * sizeof(scalar_t),
+            0,
+            0,
+            0);
+    }
+
+    template <uint32_t i>
+    __device__ __forceinline__ void ldg_copy_async_b(uint32_t bs_offset, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride, uint32_t n_bound, uint32_t k_bound) {
+        uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
+        uint32_t b_col = ldg_b_vec_idx * LDG_VEC_SIZE;
+        b_col = b_col < k_bound ? b_col : 0;
+        uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
+        uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + wmma.swizzle(row, b_col);
+        llvm_amdgcn_raw_buffer_load_lds(
+            b_rsrc,
+            (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
+            DMA_BYTES,
+            global_offset * sizeof(scalar_t),
+            0,
+            0,
+            0);
+    }
+
 #endif
 
     template <uint32_t S = 0>
@@ -303,6 +337,230 @@ struct BlockTile {
                         fo[mi][ni]);
                 }
             }
+        }
+    }
+
+    __device__ __forceinline__ void ldg_compute_tile_streaming(
+        scalar_t *as, scalar_t *bs,
+        uint32_t as_offset, uint32_t bs_offset,
+        i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride,
+        uint32_t m_bound, uint32_t n_bound, uint32_t k_bound) {
+        constexpr uint32_t M_HALF_STEPS = WARP_M_STEPS / 2;
+        constexpr uint32_t N_HALF_STEPS = WARP_N_STEPS / 2;
+        if constexpr (M_HALF_STEPS >= 1 && N_HALF_STEPS >= 1 && LDG_REG_A_COUNT == 4 && LDG_REG_B_COUNT == 4) {
+            ldg_compute_tile_streaming_ex(
+                as, bs, as_offset, bs_offset, a_rsrc, a_begin, a_stride, b_rsrc, b_begin, b_stride,
+                m_bound, n_bound, k_bound);
+        } else {
+            uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
+            uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
+            uint32_t a_col = ldg_a_vec_idx * LDG_VEC_SIZE;
+            uint32_t b_col = ldg_b_vec_idx * LDG_VEC_SIZE;
+            a_col = a_col < k_bound ? a_col : 0;
+            b_col = b_col < k_bound ? b_col : 0;
+#pragma unroll
+            for (uint32_t i = 0; i < LDG_REG_A_COUNT; i++) {
+                uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
+                uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + wmma.swizzle(row, a_col);
+                llvm_amdgcn_raw_buffer_load_lds(
+                    a_rsrc,
+                    (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
+                    DMA_BYTES,
+                    global_offset * sizeof(scalar_t),
+                    0,
+                    0,
+                    0);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < LDG_REG_B_COUNT; i++) {
+                uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
+                uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + wmma.swizzle(row, b_col);
+                llvm_amdgcn_raw_buffer_load_lds(
+                    b_rsrc,
+                    (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
+                    DMA_BYTES,
+                    global_offset * sizeof(scalar_t),
+                    0,
+                    0,
+                    0);
+            }
+            uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+            uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+            uint32_t warp_k_slice_base = wid_k * K_SLICE;
+#pragma unroll
+            for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+                uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
+                FragmentBT b_frag[WARP_N_STEPS];
+                FragmentAT a_frag[WARP_M_STEPS];
+#pragma unroll
+                for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                    uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                    wmma.load_matrix_b(
+                        b_frag[ni],
+                        bs,
+                        warp_atom_offset_n,
+                        k_col,
+                        BLOCK_K);
+                }
+                sched_barrier();
+#pragma unroll
+                for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                    uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                    wmma.load_matrix_a(
+                        a_frag[mi],
+                        as,
+                        warp_atom_offset_m,
+                        k_col,
+                        BLOCK_K);
+                }
+                sched_barrier();
+#pragma unroll
+                for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+#pragma unroll
+                    for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                        wmma(
+                            fo[mi][ni],
+                            a_frag[mi],
+                            b_frag[ni],
+                            fo[mi][ni]);
+                    }
+                }
+            }
+        }
+    }
+
+    __device__ __forceinline__ void ldg_compute_tile_streaming_ex(
+        scalar_t *as, scalar_t *bs,
+        uint32_t as_offset, uint32_t bs_offset,
+        i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride,
+        i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride,
+        uint32_t m_bound, uint32_t n_bound, uint32_t k_bound) {
+        constexpr uint32_t M_HALF_STEPS = WARP_M_STEPS / 2;
+        constexpr uint32_t N_HALF_STEPS = WARP_N_STEPS / 2;
+        static_assert(M_HALF_STEPS >= 1);
+        static_assert(N_HALF_STEPS >= 1);
+        static_assert(LDG_REG_A_COUNT == 4);
+        static_assert(LDG_REG_B_COUNT == 4);
+        uint32_t warp_m_begin = wid_mn / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid_mn % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_k_slice_base = wid_k * K_SLICE;
+
+#pragma unroll
+        for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+            uint32_t k_col = warp_k_slice_base + ki * WARP_ATOM_K;
+
+            FragmentBT b0_frag[N_HALF_STEPS];
+            FragmentBT b1_frag[N_HALF_STEPS];
+            FragmentAT a0_frag[M_HALF_STEPS];
+            FragmentAT a1_frag[M_HALF_STEPS];
+
+#pragma unroll
+            for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                wmma.load_matrix_b(b0_frag[ni], bs, warp_n_begin + ni * WARP_ATOM_N, k_col, BLOCK_K);
+            }
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+                wmma.load_matrix_a(a0_frag[mi], as, warp_m_begin + mi * WARP_ATOM_M, k_col, BLOCK_K);
+            }
+            if (ki == 0) {
+                ldg_copy_async_a<0>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+                ldg_copy_async_a<1>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+            }
+            sched_barrier();
+
+            hip_s_setprio<1>();
+            sched_barrier();
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+#pragma unroll
+                for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                    wmma(
+                        fo[mi][ni],
+                        a0_frag[mi],
+                        b0_frag[ni],
+                        fo[mi][ni]);
+                }
+            }
+            sched_barrier();
+            hip_s_setprio<0>();
+            sched_barrier();
+
+#pragma unroll
+            for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                wmma.load_matrix_b(b1_frag[ni], bs, warp_n_begin + (N_HALF_STEPS + ni) * WARP_ATOM_N, k_col, BLOCK_K);
+            }
+            if (ki == 0) {
+                ldg_copy_async_b<0>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+                ldg_copy_async_b<1>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+            }
+            sched_barrier();
+
+            hip_s_setprio<1>();
+            sched_barrier();
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+#pragma unroll
+                for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                    wmma(
+                        fo[mi][N_HALF_STEPS + ni],
+                        a0_frag[mi],
+                        b1_frag[ni],
+                        fo[mi][N_HALF_STEPS + ni]);
+                }
+            }
+            sched_barrier();
+            hip_s_setprio<0>();
+            sched_barrier();
+
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+                wmma.load_matrix_a(a1_frag[mi], as, warp_m_begin + (M_HALF_STEPS + mi) * WARP_ATOM_M, k_col, BLOCK_K);
+            }
+            if (ki == 0) {
+                ldg_copy_async_a<2>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+                ldg_copy_async_a<3>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+            }
+            sched_barrier();
+
+            hip_s_setprio<1>();
+            sched_barrier();
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+#pragma unroll
+                for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                    wmma(
+                        fo[M_HALF_STEPS + mi][ni],
+                        a1_frag[mi],
+                        b0_frag[ni],
+                        fo[M_HALF_STEPS + mi][ni]);
+                }
+            }
+            sched_barrier();
+            hip_s_setprio<0>();
+            sched_barrier();
+
+            if (ki == 0) {
+                ldg_copy_async_b<2>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+                ldg_copy_async_b<3>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+            }
+            sched_barrier();
+
+            hip_s_setprio<1>();
+            sched_barrier();
+#pragma unroll
+            for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
+#pragma unroll
+                for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
+                    wmma(
+                        fo[M_HALF_STEPS + mi][N_HALF_STEPS + ni],
+                        a1_frag[mi],
+                        b1_frag[ni],
+                        fo[M_HALF_STEPS + mi][N_HALF_STEPS + ni]);
+                }
+            }
+            sched_barrier();
+            hip_s_setprio<0>();
+            sched_barrier();
         }
     }
 
@@ -530,13 +788,13 @@ LAUNCH_CONFIG __global__ void hgemm_kernel(
     for (; a_begin < a_end - (STAGES - 1) * BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         __barrier<(STAGES - 2) * COPY_INSTS_PER_STAGE>();
         uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-        block_tile.ldg_copy_async(
+        block_tile.ldg_compute_tile_streaming_ex(
+            smem.as[current_stage], smem.bs[current_stage],
             write_stage * BLOCK_M * BLOCK_K,
             write_stage * BLOCK_N * BLOCK_K,
             a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k,
             b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k,
             m_remain, n_remain, k_remain);
-        block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
         current_stage = (current_stage + 1) % STAGES;
     }
     run_epilogue_stages<STAGES, COPY_INSTS_PER_STAGE, 0, STAGES - 1>(block_tile, smem, current_stage);
@@ -663,8 +921,8 @@ void hgemm_peak(
         }                                                                                                                                        \
     }
 
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
-REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
+// REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 16, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
+REGISTER_HGEMM_WMMA_M16N16K32_IMPL(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
 
 void hgemm_peak(
     short *c,
@@ -679,10 +937,10 @@ void hgemm_peak(
     gpuStream_t stream) {
     assert(n % 8 == 0 && k % 8 == 0);
     if (m <= 256) {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
-        (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
+        // GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 16, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 1, /*BLOCK_N_WARPS*/ 2, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 4, /*SPLIT_K*/ 8)
+        // (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     } else {
-        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 4, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
+        GET_HGEMM_WMMA_M16N16K32_IMPL_NAME(/*BLOCK_M*/ 256, /*BLOCK_N*/ 256, /*BLOCK_K*/ 64, /*BLOCK_M_WARPS*/ 2, /*BLOCK_N_WARPS*/ 4, /*BLOCK_K_WARPS*/ 1, /*WARP_SIZE*/ 64, /*STAGES*/ 2, /*SPLIT_K*/ 1)
         (c, a, b, m, n, k, is_bf16, semaphore, signal, stream);
     }
 }
