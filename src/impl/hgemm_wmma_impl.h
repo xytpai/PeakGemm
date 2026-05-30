@@ -29,7 +29,7 @@ __device__ __forceinline__ void sched_barrier() {
 #endif
 
 #ifdef __HIPCC__
-#define LAUNCH_CONFIG __attribute__((amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE)))
+#define LAUNCH_CONFIG __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE)))
 __device__ __forceinline__ void sched_barrier() {
     __builtin_amdgcn_sched_barrier(0);
 }
@@ -48,6 +48,9 @@ __device__ __forceinline__ void atomic_pack_add_scalar<__half>(__half *pk_dst, _
 template <uint32_t P>
 __device__ __forceinline__ void hip_s_setprio() {
     asm volatile("s_setprio %0" ::"n"(P));
+}
+__device__ __forceinline__ void hip_s_barrier() {
+    asm volatile("s_barrier");
 }
 #endif
 
@@ -380,6 +383,23 @@ union SharedStorage {
     scalar_t cs[BLOCK_K_WARPS][BLOCK_M * BLOCK_N];
 };
 
+template <uint32_t STAGES, uint32_t COPY_INSTS_PER_STAGE, uint32_t S, typename bt_t, typename sm_t>
+__device__ void run_epilogue_stage(bt_t &block_tile, sm_t &smem, uint32_t &current_stage) {
+    __barrier<(STAGES - 2 - S) * COPY_INSTS_PER_STAGE>();
+    block_tile.compute_tile_streaming(
+        smem.as[current_stage],
+        smem.bs[current_stage]);
+    current_stage = (current_stage + 1) % STAGES;
+}
+
+template <uint32_t STAGES, uint32_t COPY_INSTS_PER_STAGE, uint32_t S, uint32_t END, typename bt_t, typename sm_t>
+__device__ void run_epilogue_stages(bt_t &block_tile, sm_t &smem, uint32_t &current_stage) {
+    if constexpr (S < END) {
+        run_epilogue_stage<STAGES, COPY_INSTS_PER_STAGE, S, bt_t, sm_t>(block_tile, smem, current_stage);
+        run_epilogue_stages<STAGES, COPY_INSTS_PER_STAGE, S + 1, END, bt_t, sm_t>(block_tile, smem, current_stage);
+    }
+}
+
 template <
     typename scalar_t,
     typename WMMAT,
@@ -507,22 +527,19 @@ LAUNCH_CONFIG __global__ void hgemm_kernel(
             b_rsrc, b_begin + s * BLOCK_K, k,
             m_remain, n_remain, k_remain);
     }
-    for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
-        if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
-            __barrier<(STAGES - 2) * COPY_INSTS_PER_STAGE>();
-            uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-            block_tile.ldg_copy_async(
-                write_stage * BLOCK_M * BLOCK_K,
-                write_stage * BLOCK_N * BLOCK_K,
-                a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k,
-                b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k,
-                m_remain, n_remain, k_remain);
-        } else {
-            __barrier();
-        }
+    for (; a_begin < a_end - (STAGES - 1) * BLOCK_K; a_begin += BLOCK_K, b_begin += BLOCK_K) {
+        __barrier<(STAGES - 2) * COPY_INSTS_PER_STAGE>();
+        uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
+        block_tile.ldg_copy_async(
+            write_stage * BLOCK_M * BLOCK_K,
+            write_stage * BLOCK_N * BLOCK_K,
+            a_rsrc, a_begin + (STAGES - 1) * BLOCK_K, k,
+            b_rsrc, b_begin + (STAGES - 1) * BLOCK_K, k,
+            m_remain, n_remain, k_remain);
         block_tile.compute_tile_streaming(smem.as[current_stage], smem.bs[current_stage]);
         current_stage = (current_stage + 1) % STAGES;
     }
+    run_epilogue_stages<STAGES, COPY_INSTS_PER_STAGE, 0, STAGES - 1>(block_tile, smem, current_stage);
 
 #endif
 
