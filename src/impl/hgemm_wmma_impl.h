@@ -189,9 +189,10 @@ struct BlockTile {
     __device__ __forceinline__ void ldg_copy_async_a(uint32_t as_offset, i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride, uint32_t m_bound, uint32_t k_bound) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
         uint32_t a_col = ldg_a_vec_idx * LDG_VEC_SIZE;
-        a_col = a_col < k_bound ? a_col : 0;
+        // a_col = a_col < k_bound ? a_col : 0;
         uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
-        uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + wmma.swizzle(row, a_col);
+        // uint32_t global_offset = a_begin + (row < m_bound ? row : 0) * a_stride + wmma.swizzle(row, a_col);
+        uint32_t global_offset = a_begin + row * a_stride + wmma.swizzle(row, a_col);
         llvm_amdgcn_raw_buffer_load_lds(
             a_rsrc,
             (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
@@ -206,9 +207,10 @@ struct BlockTile {
     __device__ __forceinline__ void ldg_copy_async_b(uint32_t bs_offset, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride, uint32_t n_bound, uint32_t k_bound) {
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
         uint32_t b_col = ldg_b_vec_idx * LDG_VEC_SIZE;
-        b_col = b_col < k_bound ? b_col : 0;
+        // b_col = b_col < k_bound ? b_col : 0;
         uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
-        uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + wmma.swizzle(row, b_col);
+        // uint32_t global_offset = b_begin + (row < n_bound ? row : 0) * b_stride + wmma.swizzle(row, b_col);
+        uint32_t global_offset = b_begin + row * b_stride + wmma.swizzle(row, b_col);
         llvm_amdgcn_raw_buffer_load_lds(
             b_rsrc,
             (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
@@ -444,6 +446,10 @@ struct BlockTile {
             FragmentBT b1_frag[N_HALF_STEPS];
             FragmentAT a0_frag[M_HALF_STEPS];
             FragmentAT a1_frag[M_HALF_STEPS];
+            if (ki == 0) {
+                ldg_copy_async_b<0>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+                ldg_copy_async_b<1>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+            }
 #pragma unroll
             for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
                 wmma.load_matrix_b(b0_frag[ni], bs, warp_n_begin + ni * WARP_ATOM_N, k_col, BLOCK_K);
@@ -452,13 +458,8 @@ struct BlockTile {
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
                 wmma.load_matrix_a(a0_frag[mi], as, warp_m_begin + mi * WARP_ATOM_M, k_col, BLOCK_K);
             }
-            if (ki == 0) {
-                ldg_copy_async_a<0>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
-                ldg_copy_async_a<1>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
-            }
             sched_barrier();
             hip_s_setprio<1>();
-            // sched_barrier();
 #pragma unroll
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
 #pragma unroll
@@ -472,18 +473,16 @@ struct BlockTile {
             }
             sched_barrier();
             hip_s_setprio<0>();
-            // sched_barrier();
+            if (ki == 0) {
+                ldg_copy_async_a<0>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+                ldg_copy_async_a<1>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+            }
 #pragma unroll
             for (uint32_t ni = 0; ni < N_HALF_STEPS; ++ni) {
                 wmma.load_matrix_b(b1_frag[ni], bs, warp_n_begin + (N_HALF_STEPS + ni) * WARP_ATOM_N, k_col, BLOCK_K);
             }
-            if (ki == 0) {
-                ldg_copy_async_b<0>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
-                ldg_copy_async_b<1>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
-            }
             sched_barrier();
             hip_s_setprio<1>();
-            // sched_barrier();
 #pragma unroll
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
 #pragma unroll
@@ -497,18 +496,16 @@ struct BlockTile {
             }
             sched_barrier();
             hip_s_setprio<0>();
-            // sched_barrier();
+            if (ki == 0) {
+                ldg_copy_async_b<2>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+                ldg_copy_async_b<3>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+            }
 #pragma unroll
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
                 wmma.load_matrix_a(a1_frag[mi], as, warp_m_begin + (M_HALF_STEPS + mi) * WARP_ATOM_M, k_col, BLOCK_K);
             }
-            if (ki == 0) {
-                ldg_copy_async_a<2>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
-                ldg_copy_async_a<3>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
-            }
             sched_barrier();
             hip_s_setprio<1>();
-            // sched_barrier();
 #pragma unroll
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
 #pragma unroll
@@ -522,14 +519,12 @@ struct BlockTile {
             }
             sched_barrier();
             hip_s_setprio<0>();
-            // sched_barrier();
             if (ki == 0) {
-                ldg_copy_async_b<2>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
-                ldg_copy_async_b<3>(bs_offset, b_rsrc, b_begin, b_stride, n_bound, k_bound);
+                ldg_copy_async_a<2>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
+                ldg_copy_async_a<3>(as_offset, a_rsrc, a_begin, a_stride, m_bound, k_bound);
             }
             sched_barrier();
             hip_s_setprio<1>();
-            // sched_barrier();
 #pragma unroll
             for (uint32_t mi = 0; mi < M_HALF_STEPS; ++mi) {
 #pragma unroll
@@ -543,7 +538,6 @@ struct BlockTile {
             }
             sched_barrier();
             hip_s_setprio<0>();
-            // sched_barrier();
         }
     }
 
@@ -800,7 +794,7 @@ LAUNCH_CONFIG __global__ void hgemm_kernel(
         }
         block_tile.template store_matrix<true, true>(c, smem.cs, mi, ni, m, n);
     } else {
-        block_tile.template store_matrix<false, false>(c, smem.cs, mi, ni, m, n);
+        block_tile.template store_matrix<true, false>(c, smem.cs, mi, ni, m, n);
     }
 }
 
