@@ -25,16 +25,16 @@ bash build_rocm.sh test/cpp/test_gemm_half.cpp ; ./a.out
 ```
 
 ```txt
-m:4, n:4096, k:8192, dtype=__half, maxdiff:0.1875, ms:0.04272, gbps:1573.2, tflops:6.2836
-m:2048, n:2048, k:2048, dtype=__half, maxdiff:0.03125, ms:0.0734, gbps:342.859, tflops:234.058
-m:4096, n:4096, k:4096, dtype=__half, maxdiff:0.0625, ms:0.136161, gbps:739.296, tflops:1009.39
-m:8192, n:8192, k:8192, dtype=__half, maxdiff:0.125, ms:0.861289, gbps:467.501, tflops:1276.59
-m:16384, n:16384, k:16384, dtype=__half, maxdiff:0.125, ms:8.36466, gbps:192.55, tflops:1051.58
-m:4, n:4096, k:8192, dtype=__bfloat16, maxdiff:1, ms:0.04756, gbps:1413.1, tflops:5.64414
-m:2048, n:2048, k:2048, dtype=__bfloat16, maxdiff:0.25, ms:0.07592, gbps:331.478, tflops:226.289
-m:4096, n:4096, k:4096, dtype=__bfloat16, maxdiff:0.5, ms:0.136521, gbps:737.347, tflops:1006.72
-m:8192, n:8192, k:8192, dtype=__bfloat16, maxdiff:0.5, ms:0.830249, gbps:484.979, tflops:1324.32
-m:16384, n:16384, k:16384, dtype=__bfloat16, maxdiff:1, ms:7.98429, gbps:201.723, tflops:1101.67
+m:4, n:4096, k:8192, dtype=__half, maxdiff:0.125, ms:0.04416, gbps:1521.9, tflops:6.0787
+m:2048, n:2048, k:2048, dtype=__half, maxdiff:0.03125, ms:0.07368, gbps:341.556, tflops:233.169
+m:4096, n:4096, k:4096, dtype=__half, maxdiff:0.0625, ms:0.132921, gbps:757.317, tflops:1033.99
+m:8192, n:8192, k:8192, dtype=__half, maxdiff:0.125, ms:0.806728, gbps:499.119, tflops:1362.93
+m:16384, n:16384, k:16384, dtype=__half, maxdiff:0.125, ms:7.95713, gbps:202.411, tflops:1105.44
+m:4, n:4096, k:8192, dtype=__bfloat16, maxdiff:1, ms:0.04488, gbps:1497.49, tflops:5.98118
+m:2048, n:2048, k:2048, dtype=__bfloat16, maxdiff:0.25, ms:0.06856, gbps:367.063, tflops:250.582
+m:4096, n:4096, k:4096, dtype=__bfloat16, maxdiff:0.5, ms:0.128801, gbps:781.541, tflops:1067.06
+m:8192, n:8192, k:8192, dtype=__bfloat16, maxdiff:0.5, ms:0.776568, gbps:518.503, tflops:1415.86
+m:16384, n:16384, k:16384, dtype=__bfloat16, maxdiff:1, ms:7.53928, gbps:213.629, tflops:1166.7
 ```
 
 ### Python Test
