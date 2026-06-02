@@ -99,7 +99,7 @@ struct BlockTile {
     static_assert(BLOCK_K % WARP_GROUP_K == 0 && WARP_K_STEPS >= 1 && K_SLICE % WARP_ATOM_K == 0);
     using ldg_vec_t = aligned_array<scalar_t, LDG_VEC_SIZE>;
 
-    __device__ __forceinline__ BlockTile(uint32_t tid) :
+    __device__ __forceinline__ BlockTile(uint32_t tid, uint32_t a_stride, uint32_t b_stride) :
         tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK),
         ldg_a_vec_idx(tid % LDG_A_X_THREADS),
         ldg_b_vec_idx(tid % LDG_B_X_THREADS) {
@@ -113,6 +113,18 @@ struct BlockTile {
         }
         wid_mn = wid % BLOCK_MN_WARPS;
         wid_k = wid / BLOCK_MN_WARPS;
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_A_COUNT; ++i) {
+            uint32_t col = ldg_a_vec_idx * LDG_VEC_SIZE;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
+            swizzle_cache_a[i] = row * a_stride + wmma.swizzle(row, col);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_B_COUNT; ++i) {
+            uint32_t col = ldg_b_vec_idx * LDG_VEC_SIZE;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
+            swizzle_cache_b[i] = row * b_stride + wmma.swizzle(row, col);
+        }
     }
 
 #ifdef __CUDACC__
@@ -188,9 +200,7 @@ struct BlockTile {
     template <uint32_t i>
     __device__ __forceinline__ void ldg_copy_async_a(uint32_t as_offset, i32x4 &a_rsrc, uint32_t a_begin, uint32_t a_stride) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
-        uint32_t a_col = ldg_a_vec_idx * LDG_VEC_SIZE;
-        uint32_t row = (BLOCK_THREADS * i + tid) / LDG_A_X_THREADS;
-        uint32_t global_offset = a_begin + row * a_stride + wmma.swizzle(row, a_col);
+        uint32_t global_offset = a_begin + swizzle_cache_a[i];
         llvm_amdgcn_raw_buffer_load_lds(
             a_rsrc,
             (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
@@ -204,9 +214,7 @@ struct BlockTile {
     template <uint32_t i>
     __device__ __forceinline__ void ldg_copy_async_b(uint32_t bs_offset, i32x4 &b_rsrc, uint32_t b_begin, uint32_t b_stride) {
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
-        uint32_t b_col = ldg_b_vec_idx * LDG_VEC_SIZE;
-        uint32_t row = (BLOCK_THREADS * i + tid) / LDG_B_X_THREADS;
-        uint32_t global_offset = b_begin + row * b_stride + wmma.swizzle(row, b_col);
+        uint32_t global_offset = b_begin + swizzle_cache_b[i];
         llvm_amdgcn_raw_buffer_load_lds(
             b_rsrc,
             (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
@@ -549,6 +557,8 @@ private:
     uint32_t wid_k;
     WMMAT wmma;
     FragmentCT fo[WARP_M_STEPS][WARP_N_STEPS];
+    uint32_t swizzle_cache_a[LDG_REG_A_COUNT];
+    uint32_t swizzle_cache_b[LDG_REG_B_COUNT];
 #ifdef __HIPCC__
     uint32_t as_;
     uint32_t bs_;
@@ -676,7 +686,7 @@ LAUNCH_CONFIG __global__ void hgemm_kernel(
 
     __shared__ SharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_K_WARPS> smem;
 
-    BlockTileT block_tile(tid);
+    BlockTileT block_tile(tid, k, k);
     uint32_t current_stage = 0;
     uint32_t a_begin = m_offset * k + ks_begin;
     uint32_t b_begin = n_offset * k + ks_begin;
