@@ -825,7 +825,6 @@ template <
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS>
 struct BlockTilePeak {
-
     using FragmentAT = typename WMMAT::FragmentAT;
     using FragmentBT = typename WMMAT::FragmentBT;
     using FragmentCT = typename WMMAT::FragmentCT;
@@ -857,7 +856,7 @@ struct BlockTilePeak {
     static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
 
     __device__ __forceinline__ BlockTilePeak(uint32_t tid, uint32_t k) :
-        tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK), 
+        tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK),
         ldg_vec_idx(tid % LDG_X_THREADS), k(k) {
         wmma.init(w_tid);
 #pragma unroll
@@ -874,37 +873,17 @@ struct BlockTilePeak {
         for (uint32_t i = 0; i < LDG_REG_A_COUNT; ++i) {
             uint32_t col = ldg_vec_idx * LDG_VEC_SIZE;
             uint32_t row = (BLOCK_THREADS * i + tid) / LDG_X_THREADS;
-            swizzle_cache_a[0][0][i] = row * k + wmma.swizzle(row, col);
-            swizzle_cache_a[0][1][i] = row * k + wmma.swizzle(row, col + BLOCK_K);
-            swizzle_cache_a[1][0][i] = (row + HALF_BLOCK_M) * k + wmma.swizzle((row + HALF_BLOCK_M), col);
-            swizzle_cache_a[1][1][i] = (row + HALF_BLOCK_M) * k + wmma.swizzle((row + HALF_BLOCK_M), col + BLOCK_K);
+            swizzle_cache_a[i] = row * k + wmma.swizzle(row, col);
         }
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_B_COUNT; ++i) {
             uint32_t col = ldg_vec_idx * LDG_VEC_SIZE;
             uint32_t row = (BLOCK_THREADS * i + tid) / LDG_X_THREADS;
-            swizzle_cache_b[0][0][i] = row * k + wmma.swizzle(row, col);
-            swizzle_cache_b[0][1][i] = row * k + wmma.swizzle(row, col + BLOCK_K);
-            swizzle_cache_b[1][0][i] = (row + HALF_BLOCK_N) * k + wmma.swizzle((row + HALF_BLOCK_N), col);
-            swizzle_cache_b[1][1][i] = (row + HALF_BLOCK_N) * k + wmma.swizzle((row + HALF_BLOCK_N), col + BLOCK_K);
+            swizzle_cache_b[i] = row * k + wmma.swizzle(row, col);
         }
     }
 
-    __device__ __forceinline__ void compute() {
-#pragma unroll
-        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-#pragma unroll
-            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-#pragma unroll
-                for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
-                    wmma(fo[m_][n_][mi][ni], fa[ki][mi], fb[ki][ni], fo[m_][n_][mi][ni]);
-                }
-            }
-        }
-    }
-
-    template <uint32_t m_, uint32_t n_>
-    __device__ __forceinline__ void ldmatrix_a(scalar_t *as) {
+    __device__ __forceinline__ void ldmatrix_a_once(scalar_t *as) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
 #pragma unroll
         for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
@@ -918,8 +897,8 @@ struct BlockTilePeak {
         }
     }
 
-    template <uint32_t m_, uint32_t n_>
-    __device__ __forceinline__ void ldmatrix_b(scalar_t *bs) {
+    template <uint32_t b_buffer_id>
+    __device__ __forceinline__ void ldmatrix_b_double(scalar_t *bs) {
         uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
         for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
@@ -928,7 +907,21 @@ struct BlockTilePeak {
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_n;
                 uint32_t col = ki * WARP_ATOM_K;
-                wmma.load_matrix_b(fb[ki][ni], bs, row, col, BLOCK_K);
+                wmma.load_matrix_b(fb[b_buffer_id][ki][ni], bs, row, col, BLOCK_K);
+            }
+        }
+    }
+
+    template <uint32_t m_, uint32_t n_, uint32_t b_buffer_id>
+    __device__ __forceinline__ void consume() {
+#pragma unroll
+        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+#pragma unroll
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+#pragma unroll
+                for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+                    wmma(fo[m_][n_][mi][ni], fa[ki][mi], fb[b_buffer_id][ki][ni], fo[m_][n_][mi][ni]);
+                }
             }
         }
     }
@@ -945,7 +938,7 @@ struct BlockTilePeak {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_A_COUNT; ++i) {
-            uint32_t global_offset = a_begin + swizzle_cache_a[m_][n_][i];
+            uint32_t global_offset = a_begin + swizzle_cache_a[i];
             llvm_amdgcn_raw_buffer_load_lds(
                 a_rsrc,
                 (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
@@ -962,7 +955,7 @@ struct BlockTilePeak {
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
 #pragma unroll
         for (uint32_t i = 0; i < LDG_REG_B_COUNT; ++i) {
-            uint32_t global_offset = b_begin + swizzle_cache_b[m_][n_][i];
+            uint32_t global_offset = b_begin + swizzle_cache_b[i];
             llvm_amdgcn_raw_buffer_load_lds(
                 b_rsrc,
                 (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
@@ -976,6 +969,29 @@ struct BlockTilePeak {
 
 #endif
 
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+#pragma unroll
+        for (uint32_t m_ = 0; m_ < 2; ++m_) {
+#pragma unroll
+            for (uint32_t n_ = 0; n_ < 2; ++n_) {
+#pragma unroll
+                for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                    uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                    uint32_t m_global_idx = block_m_idx * BLOCK_M + m_ * HALF_BLOCK_M + warp_atom_offset_m;
+#pragma unroll
+                    for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                        uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                        uint32_t n_global_idx = block_n_idx * BLOCK_N + n_ * HALF_BLOCK_N + warp_atom_offset_n;
+                        auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                        wmma.store_matrix(dst_ptr, n, fo[m_][n_][mi][ni]);
+                    }
+                }
+            }
+        }
+    }
+
 private:
     uint32_t tid;
     uint32_t wid;
@@ -984,33 +1000,64 @@ private:
     uint32_t k;
     WMMAT wmma;
     FragmentAT fa[WARP_K_STEPS][WARP_M_STEPS];
-    FragmentBT fb[WARP_K_STEPS][WARP_N_STEPS];
+    FragmentBT fb[2][WARP_K_STEPS][WARP_N_STEPS];
     FragmentCT fo[2][2][WARP_M_STEPS][WARP_N_STEPS];
-    uint32_t swizzle_cache_a[2][2][LDG_REG_A_COUNT];
-    uint32_t swizzle_cache_b[2][2][LDG_REG_B_COUNT];
+    uint32_t swizzle_cache_a[LDG_REG_A_COUNT];
+    uint32_t swizzle_cache_b[LDG_REG_B_COUNT];
 #ifdef __HIPCC__
     uint32_t as_;
     uint32_t bs_;
 #endif
 };
 
-__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512))) __global__ void hgemm_peak_kernel(
+template <typename scalar_t, uint32_t HALF_BLOCK_M, uint32_t HALF_BLOCK_N, uint32_t BLOCK_K>
+union SharedPeakStorage {
+    struct {
+        scalar_t as[2][HALF_BLOCK_M][BLOCK_K];
+        scalar_t bs[2][HALF_BLOCK_N][BLOCK_K];
+    };
+};
+
+template <
+    typename scalar_t,
+    typename WMMAT,
+    uint32_t WARP_SIZE,
+    uint32_t BLOCK_K,
+    uint32_t BLOCK_M,
+    uint32_t BLOCK_N,
+    uint32_t BLOCK_M_WARPS,
+    uint32_t BLOCK_N_WARPS>
+__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512)))
+__global__ void
+hgemm_peak_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
     const uint32_t m,
     const uint32_t n,
     const uint32_t k) {
-    using FragmentAT = typename WMMAT::FragmentAT;
-    using FragmentBT = typename WMMAT::FragmentBT;
-    using FragmentCT = typename WMMAT::FragmentCT;
+    using BlockTileT = BlockTilePeak<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS>;
+    constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
+    constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
+    constexpr uint32_t HALF_BLOCK_M = BlockTileT::HALF_BLOCK_M;
+    constexpr uint32_t HALF_BLOCK_N = BlockTileT::HALF_BLOCK_N;
+    uint32_t tid = threadIdx.x;
+    uint32_t mi, ni;
+    get_tile_mn<BLOCK_M, BLOCK_N, false>(m, n, mi, ni);
+    uint32_t m_offset = mi * BLOCK_M;
+    uint32_t n_offset = ni * BLOCK_N;
 
-    constexpr uint32_t HALF_BLOCK_M = BLOCK_M / 2;
-    constexpr uint32_t HALF_BLOCK_N = BLOCK_N / 2;
+    __shared__ SharedPeakStorage<scalar_t, HALF_BLOCK_M, HALF_BLOCK_N, BLOCK_K> smem;
 
-    constexpr uint32_t WARP_ATOM_M = WMMAT::M;
-    constexpr uint32_t WARP_ATOM_N = WMMAT::N;
-    constexpr uint32_t WARP_ATOM_K = WMMAT::K;
+    BlockTileT block_tile(tid, k);
+    uint32_t current_stage = 0;
+    uint32_t a_begin = m_offset * k;
+    uint32_t b_begin = n_offset * k;
+    uint32_t a_end = a_begin + k;
+
+    auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
+    auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
+    block_tile.init_hip(&smem.as[0][0][0], &smem.bs[0][0][0]);
 }
 
 std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SPLIT_K) {
