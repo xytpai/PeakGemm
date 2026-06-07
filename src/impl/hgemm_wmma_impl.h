@@ -1063,9 +1063,9 @@ hgemm_peak_kernel(
 #define LDMAT_B(N_, K_) block_tile.template ldmatrix_b<N_>(&smem.bs[K_][N_][0][0])
 #define CONSUME(M_, N_)                        \
     {                                          \
-        __builtin_amdgcn_s_setprio(1);         \
+        hip_s_setprio<1>();                    \
         block_tile.template consume<M_, N_>(); \
-        __builtin_amdgcn_s_setprio(0);         \
+        hip_s_setprio<0>();                    \
     }
 
     LDG_ASYNC_B(0, 0, 0);
@@ -1091,11 +1091,12 @@ hgemm_peak_kernel(
         LDMAT_A(1, 0);
         LDG_ASYNC_A(0, 0, 2);
         CONSUME(1, 0);
+        __barrier<2 * LDG_REG_B_COUNT + 3 * LDG_REG_A_COUNT>();
+        LDMAT_B(0, 1);
         LDG_ASYNC_B(1, 0, 2);
         CONSUME(1, 1);
         // 1
         __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
-        LDMAT_B(0, 1);
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
         CONSUME(0, 0);
