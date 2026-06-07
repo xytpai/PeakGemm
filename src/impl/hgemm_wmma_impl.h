@@ -1075,36 +1075,32 @@ hgemm_peak_kernel(
     LDG_ASYNC_B(0, 1, 0);
     LDG_ASYNC_A(0, 1, 0);
     LDG_ASYNC_B(1, 1, 0);
+    // 4b3a
 
     for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
         // 0
-        __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
+        __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
         LDMAT_B(0, 0);
         LDMAT_A(0, 0);
         LDG_ASYNC_A(1, 1, 0);
         CONSUME(0, 0);
-        __barrier<2 * LDG_REG_B_COUNT + 3 * LDG_REG_A_COUNT>();
         LDMAT_B(1, 0);
         LDG_ASYNC_B(0, 0, 2);
         CONSUME(0, 1);
-        __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         LDMAT_A(1, 0);
         LDG_ASYNC_A(0, 0, 2);
         CONSUME(1, 0);
-        __barrier<2 * LDG_REG_B_COUNT + 3 * LDG_REG_A_COUNT>();
         LDMAT_B(0, 1);
         LDG_ASYNC_B(1, 0, 2);
         CONSUME(1, 1);
         // 1
-        __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
+        __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
         CONSUME(0, 0);
-        __barrier<2 * LDG_REG_B_COUNT + 3 * LDG_REG_A_COUNT>();
         LDMAT_B(1, 1);
         LDG_ASYNC_B(0, 1, 2);
         CONSUME(0, 1);
-        __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         LDMAT_A(1, 1);
         LDG_ASYNC_A(0, 1, 2);
         CONSUME(1, 0);
@@ -1113,24 +1109,21 @@ hgemm_peak_kernel(
     }
 
     // 0
-    __barrier<3 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
+    __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
     LDMAT_B(0, 0);
     LDMAT_A(0, 0);
     LDG_ASYNC_A(1, 1, 0);
     CONSUME(0, 0);
-    __barrier<2 * LDG_REG_B_COUNT + 3 * LDG_REG_A_COUNT>();
     LDMAT_B(1, 0);
     CONSUME(0, 1);
-    __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
     LDMAT_A(1, 0);
     CONSUME(1, 0);
     CONSUME(1, 1);
     // 1
-    __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
+    __barrier<0>();
     LDMAT_B(0, 1);
     LDMAT_A(0, 1);
     CONSUME(0, 0);
-    __barrier<0>();
     LDMAT_B(1, 1);
     CONSUME(0, 1);
     LDMAT_A(1, 1);
