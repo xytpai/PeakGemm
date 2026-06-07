@@ -883,7 +883,6 @@ struct BlockTilePeak {
         }
     }
 
-    template <uint32_t buffer_id>
     __device__ __forceinline__ void ldmatrix_a(scalar_t *as) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
 #pragma unroll
@@ -893,7 +892,7 @@ struct BlockTilePeak {
             for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
                 uint32_t row = warp_atom_offset_m;
                 uint32_t col = ki * WARP_ATOM_K;
-                wmma.load_matrix_a(fa[buffer_id][ki][mi], as, row, col, BLOCK_K);
+                wmma.load_matrix_a(fa[ki][mi], as, row, col, BLOCK_K);
             }
         }
     }
@@ -921,7 +920,7 @@ struct BlockTilePeak {
             for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
 #pragma unroll
                 for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
-                    wmma(fo[m_][n_][mi][ni], fa[m_][ki][mi], fb[n_][ki][ni], fo[m_][n_][mi][ni]);
+                    wmma(fo[m_][n_][mi][ni], fa[ki][mi], fb[n_][ki][ni], fo[m_][n_][mi][ni]);
                 }
             }
         }
@@ -998,7 +997,7 @@ private:
     uint32_t ldg_vec_idx;
     uint32_t k;
     WMMAT wmma;
-    FragmentAT fa[2][WARP_K_STEPS][WARP_M_STEPS];
+    FragmentAT fa[WARP_K_STEPS][WARP_M_STEPS];
     FragmentBT fb[2][WARP_K_STEPS][WARP_N_STEPS];
     FragmentCT fo[2][2][WARP_M_STEPS][WARP_N_STEPS];
     uint32_t swizzle_cache_a[LDG_REG_A_COUNT];
@@ -1059,7 +1058,7 @@ hgemm_peak_kernel(
 
 #define LDG_ASYNC_A(M_, K_, F_) block_tile.ldg_copy_async_a((K_ * 2 + M_) * HALF_BLOCK_M * BLOCK_K, a_rsrc, a_begin + M_ * HALF_BLOCK_M * k + (F_ + K_) * BLOCK_K)
 #define LDG_ASYNC_B(N_, K_, F_) block_tile.ldg_copy_async_b((K_ * 2 + N_) * HALF_BLOCK_N * BLOCK_K, b_rsrc, b_begin + N_ * HALF_BLOCK_N * k + (F_ + K_) * BLOCK_K)
-#define LDMAT_A(M_, K_) block_tile.template ldmatrix_a<M_>(&smem.as[K_][M_][0][0])
+#define LDMAT_A(M_, K_) block_tile.ldmatrix_a(&smem.as[K_][M_][0][0])
 #define LDMAT_B(N_, K_) block_tile.template ldmatrix_b<N_>(&smem.bs[K_][N_][0][0])
 #define CONSUME(M_, N_)                        \
     {                                          \
