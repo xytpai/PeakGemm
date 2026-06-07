@@ -1026,7 +1026,7 @@ template <
     uint32_t BLOCK_N,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS>
-__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512)))
+__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE)))
 __global__ void
 hgemm_peak_kernel(
     scalar_t *c,
