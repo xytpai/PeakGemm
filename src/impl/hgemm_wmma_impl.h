@@ -815,6 +815,204 @@ LAUNCH_CONFIG __global__ void hgemm_kernel(
     }
 }
 
+template <
+    typename scalar_t,
+    typename WMMAT,
+    uint32_t WARP_SIZE,
+    uint32_t BLOCK_K,
+    uint32_t BLOCK_M,
+    uint32_t BLOCK_N,
+    uint32_t BLOCK_M_WARPS,
+    uint32_t BLOCK_N_WARPS>
+struct BlockTilePeak {
+
+    using FragmentAT = typename WMMAT::FragmentAT;
+    using FragmentBT = typename WMMAT::FragmentBT;
+    using FragmentCT = typename WMMAT::FragmentCT;
+
+    enum {
+        WARP_MASK = WARP_SIZE - 1,
+        WARP_SHIFT = Log2<WARP_SIZE>::VALUE,
+        HALF_BLOCK_M = BLOCK_M / 2,
+        HALF_BLOCK_N = BLOCK_N / 2,
+        WARP_ATOM_M = WMMAT::M,
+        WARP_ATOM_N = WMMAT::N,
+        WARP_ATOM_K = WMMAT::K,
+        WARP_M_STEPS = HALF_BLOCK_M / BLOCK_M_WARPS / WARP_ATOM_M,
+        WARP_N_STEPS = HALF_BLOCK_N / BLOCK_N_WARPS / WARP_ATOM_N,
+        WARP_K_STEPS = BLOCK_K / WARP_ATOM_K,
+        WARP_M = WARP_M_STEPS * WARP_ATOM_M,
+        WARP_N = WARP_N_STEPS * WARP_ATOM_N,
+        HALF_BLOCK_MK_SIZE = HALF_BLOCK_M * BLOCK_K,
+        HALF_BLOCK_NK_SIZE = HALF_BLOCK_N * BLOCK_K,
+        LDG_VEC_SIZE = 16 / sizeof(scalar_t),
+        LDG_X_THREADS = BLOCK_K / LDG_VEC_SIZE,
+        BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE,
+        LDG_REG_A_COUNT = HALF_BLOCK_MK_SIZE / BLOCK_THREADS / LDG_VEC_SIZE,
+        LDG_REG_B_COUNT = HALF_BLOCK_NK_SIZE / BLOCK_THREADS / LDG_VEC_SIZE,
+        DMA_BYTES = 16,
+        BLOCK_DMA_STRIDE = BLOCK_THREADS * DMA_BYTES,
+    };
+
+    static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
+
+    __device__ __forceinline__ BlockTilePeak(uint32_t tid, uint32_t k) :
+        tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK), 
+        ldg_vec_idx(tid % LDG_X_THREADS), k(k) {
+        wmma.init(w_tid);
+#pragma unroll
+        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+#pragma unroll
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                wmma.reset_fragment_c(fo[0][0][mi][ni]);
+                wmma.reset_fragment_c(fo[0][1][mi][ni]);
+                wmma.reset_fragment_c(fo[1][0][mi][ni]);
+                wmma.reset_fragment_c(fo[1][1][mi][ni]);
+            }
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_A_COUNT; ++i) {
+            uint32_t col = ldg_vec_idx * LDG_VEC_SIZE;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_X_THREADS;
+            swizzle_cache_a[0][0][i] = row * k + wmma.swizzle(row, col);
+            swizzle_cache_a[0][1][i] = row * k + wmma.swizzle(row, col + BLOCK_K);
+            swizzle_cache_a[1][0][i] = (row + HALF_BLOCK_M) * k + wmma.swizzle((row + HALF_BLOCK_M), col);
+            swizzle_cache_a[1][1][i] = (row + HALF_BLOCK_M) * k + wmma.swizzle((row + HALF_BLOCK_M), col + BLOCK_K);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_B_COUNT; ++i) {
+            uint32_t col = ldg_vec_idx * LDG_VEC_SIZE;
+            uint32_t row = (BLOCK_THREADS * i + tid) / LDG_X_THREADS;
+            swizzle_cache_b[0][0][i] = row * k + wmma.swizzle(row, col);
+            swizzle_cache_b[0][1][i] = row * k + wmma.swizzle(row, col + BLOCK_K);
+            swizzle_cache_b[1][0][i] = (row + HALF_BLOCK_N) * k + wmma.swizzle((row + HALF_BLOCK_N), col);
+            swizzle_cache_b[1][1][i] = (row + HALF_BLOCK_N) * k + wmma.swizzle((row + HALF_BLOCK_N), col + BLOCK_K);
+        }
+    }
+
+    __device__ __forceinline__ void compute() {
+#pragma unroll
+        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+#pragma unroll
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+#pragma unroll
+                for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+                    wmma(fo[m_][n_][mi][ni], fa[ki][mi], fb[ki][ni], fo[m_][n_][mi][ni]);
+                }
+            }
+        }
+    }
+
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void ldmatrix_a(scalar_t *as) {
+        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
+#pragma unroll
+        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+            uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+#pragma unroll
+            for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+                uint32_t row = warp_atom_offset_m;
+                uint32_t col = ki * WARP_ATOM_K;
+                wmma.load_matrix_a(fa[ki][mi], as, row, col, BLOCK_K);
+            }
+        }
+    }
+
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void ldmatrix_b(scalar_t *bs) {
+        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+#pragma unroll
+        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+#pragma unroll
+            for (uint32_t ki = 0; ki < WARP_K_STEPS; ++ki) {
+                uint32_t row = warp_atom_offset_n;
+                uint32_t col = ki * WARP_ATOM_K;
+                wmma.load_matrix_b(fb[ki][ni], bs, row, col, BLOCK_K);
+            }
+        }
+    }
+
+#ifdef __HIPCC__
+
+    __device__ __forceinline__ void init_hip(scalar_t *as, scalar_t *bs) {
+        as_ = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(as) + (wid * WARP_SIZE * DMA_BYTES));
+        bs_ = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(bs) + (wid * WARP_SIZE * DMA_BYTES));
+    }
+
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void ldg_copy_async_a(uint32_t as_offset, i32x4 &a_rsrc, uint32_t a_begin) {
+        uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_A_COUNT; ++i) {
+            uint32_t global_offset = a_begin + swizzle_cache_a[m_][n_][i];
+            llvm_amdgcn_raw_buffer_load_lds(
+                a_rsrc,
+                (as3_uint32_ptr) static_cast<uintptr_t>(as_warp_ + i * BLOCK_DMA_STRIDE),
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                0);
+        }
+    }
+
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void ldg_copy_async_b(uint32_t bs_offset, i32x4 &b_rsrc, uint32_t b_begin) {
+        uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_B_COUNT; ++i) {
+            uint32_t global_offset = b_begin + swizzle_cache_b[m_][n_][i];
+            llvm_amdgcn_raw_buffer_load_lds(
+                b_rsrc,
+                (as3_uint32_ptr) static_cast<uintptr_t>(bs_warp_ + i * BLOCK_DMA_STRIDE),
+                DMA_BYTES,
+                global_offset * sizeof(scalar_t),
+                0,
+                0,
+                0);
+        }
+    }
+
+#endif
+
+private:
+    uint32_t tid;
+    uint32_t wid;
+    uint32_t w_tid;
+    uint32_t ldg_vec_idx;
+    uint32_t k;
+    WMMAT wmma;
+    FragmentAT fa[WARP_K_STEPS][WARP_M_STEPS];
+    FragmentBT fb[WARP_K_STEPS][WARP_N_STEPS];
+    FragmentCT fo[2][2][WARP_M_STEPS][WARP_N_STEPS];
+    uint32_t swizzle_cache_a[2][2][LDG_REG_A_COUNT];
+    uint32_t swizzle_cache_b[2][2][LDG_REG_B_COUNT];
+#ifdef __HIPCC__
+    uint32_t as_;
+    uint32_t bs_;
+#endif
+};
+
+__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(512, 512))) __global__ void hgemm_peak_kernel(
+    scalar_t *c,
+    const scalar_t *a,
+    const scalar_t *b,
+    const uint32_t m,
+    const uint32_t n,
+    const uint32_t k) {
+    using FragmentAT = typename WMMAT::FragmentAT;
+    using FragmentBT = typename WMMAT::FragmentBT;
+    using FragmentCT = typename WMMAT::FragmentCT;
+
+    constexpr uint32_t HALF_BLOCK_M = BLOCK_M / 2;
+    constexpr uint32_t HALF_BLOCK_N = BLOCK_N / 2;
+
+    constexpr uint32_t WARP_ATOM_M = WMMAT::M;
+    constexpr uint32_t WARP_ATOM_N = WMMAT::N;
+    constexpr uint32_t WARP_ATOM_K = WMMAT::K;
+}
+
 std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SPLIT_K) {
     uint32_t bm = (m + BLOCK_M - 1) / BLOCK_M;
     uint32_t bn = (n + BLOCK_N - 1) / BLOCK_N;
