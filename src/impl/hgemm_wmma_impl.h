@@ -933,7 +933,6 @@ struct BlockTilePeak {
         bs_ = __builtin_amdgcn_readfirstlane(reinterpret_cast<uintptr_t>(bs) + (wid * WARP_SIZE * DMA_BYTES));
     }
 
-    template <uint32_t m_, uint32_t n_>
     __device__ __forceinline__ void ldg_copy_async_a(uint32_t as_offset, i32x4 &a_rsrc, uint32_t a_begin) {
         uint32_t as_warp_ = as_ + as_offset * sizeof(scalar_t);
 #pragma unroll
@@ -950,7 +949,6 @@ struct BlockTilePeak {
         }
     }
 
-    template <uint32_t m_, uint32_t n_>
     __device__ __forceinline__ void ldg_copy_async_b(uint32_t bs_offset, i32x4 &b_rsrc, uint32_t b_begin) {
         uint32_t bs_warp_ = bs_ + bs_offset * sizeof(scalar_t);
 #pragma unroll
@@ -1037,10 +1035,10 @@ hgemm_peak_kernel(
     const uint32_t n,
     const uint32_t k) {
     using BlockTileT = BlockTilePeak<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS>;
-    constexpr uint32_t BLOCK_M = BlockTileT::BLOCK_M;
-    constexpr uint32_t BLOCK_N = BlockTileT::BLOCK_N;
     constexpr uint32_t HALF_BLOCK_M = BlockTileT::HALF_BLOCK_M;
     constexpr uint32_t HALF_BLOCK_N = BlockTileT::HALF_BLOCK_N;
+    constexpr uint32_t LDG_REG_A_COUNT = BlockTileT::LDG_REG_A_COUNT;
+    constexpr uint32_t LDG_REG_B_COUNT = BlockTileT::LDG_REG_B_COUNT;
     uint32_t tid = threadIdx.x;
     uint32_t mi, ni;
     get_tile_mn<BLOCK_M, BLOCK_N, false>(m, n, mi, ni);
@@ -1058,6 +1056,49 @@ hgemm_peak_kernel(
     auto a_rsrc = make_srsrc(a, /*range_bytes*/ 0xFFFFFFFFu);
     auto b_rsrc = make_srsrc(b, /*range_bytes*/ 0xFFFFFFFFu);
     block_tile.init_hip(&smem.as[0][0][0], &smem.bs[0][0][0]);
+
+#define LDG_ASYNC_A(M_, K_) block_tile.ldg_copy_async_a(K_ * BLOCK_M * BLOCK_K, a_rsrc, a_begin + M_ * HALF_BLOCK_M * k + K_ * BLOCK_K)
+#define LDG_ASYNC_B(N_, K_) block_tile.ldg_copy_async_b(K_ * BLOCK_N * BLOCK_K, b_rsrc, b_begin + N_ * HALF_BLOCK_N * k + K_ * BLOCK_K)
+#define LDMAT_A(M_, K_) block_tile.ldmatrix_a_once(&smem.as[K_][0][0])
+#define LDMAT_B(N_, K_) block_tile.ldmatrix_b_double<N_>(&smem.bs[K_][0][0])
+#define CONSUME(M_, N_)                    \
+    {                                      \
+        __builtin_amdgcn_s_barrier();      \
+        __builtin_amdgcn_s_setprio(1);     \
+        block_tile.consume<M_, N_, N_>();  \
+        __builtin_amdgcn_s_setprio(0);     \
+        __builtin_amdgcn_s_barrier();      \
+        __builtin_amdgcn_sched_barrier(0); \
+    }
+
+    LDG_ASYNC_B(0, 0);
+    LDG_ASYNC_A(0, 0);
+    LDG_ASYNC_B(0, 1);
+    LDG_ASYNC_A(0, 1);
+    LDG_ASYNC_B(1, 0);
+    LDG_ASYNC_A(1, 0);
+    LDG_ASYNC_B(1, 1);
+    __barrier<3 * (LDG_REG_A_COUNT + LDG_REG_B_COUNT)>();
+
+    for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
+        LDG_ASYNC_A(1, 1);
+        LDMAT_B(0, 0);
+        LDMAT_A(0, 0);
+        CONSUME(0, 0);
+        LDG_ASYNC_B(0, 0);
+        LDMAT_B(0, 1);
+        CONSUME(0, 1);
+        LDG_ASYNC_A(0, 0);
+        LDMAT_A(1, 0);
+        CONSUME(1, 0);
+        LDG_ASYNC_B(0, 1);
+    }
+
+#undef LDG_ASYNC_A
+#undef LDG_ASYNC_B
+#undef LDMAT_A
+#undef LDMAT_B
+#undef CONSUME
 }
 
 std::tuple<dim3, uint32_t> get_grid(uint32_t m, uint32_t n, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t SPLIT_K) {
