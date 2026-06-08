@@ -824,7 +824,7 @@ template <
     uint32_t BLOCK_N,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS>
-struct BlockTilePeak {
+struct BlockTileHT {
     using FragmentAT = typename WMMAT::FragmentAT;
     using FragmentBT = typename WMMAT::FragmentBT;
     using FragmentCT = typename WMMAT::FragmentCT;
@@ -852,10 +852,10 @@ struct BlockTilePeak {
         DMA_BYTES = 16,
         BLOCK_DMA_STRIDE = BLOCK_THREADS * DMA_BYTES,
     };
-
+    using ldg_vec_t = aligned_array<scalar_t, LDG_VEC_SIZE>;
     static_assert(LDG_REG_A_COUNT >= 1 && LDG_REG_B_COUNT >= 1);
 
-    __device__ __forceinline__ BlockTilePeak(uint32_t tid, uint32_t k) :
+    __device__ __forceinline__ BlockTileHT(uint32_t tid, uint32_t k) :
         tid(tid), wid(tid >> WARP_SHIFT), w_tid(tid & WARP_MASK),
         ldg_vec_idx(tid % LDG_X_THREADS), k(k) {
         wmma.init(w_tid);
@@ -967,24 +967,60 @@ struct BlockTilePeak {
 
 #endif
 
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+    template <bool C_SHUFFLE = false>
+    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+        if constexpr (C_SHUFFLE) {
+            __syncthreads();
+        }
 #pragma unroll
         for (uint32_t m_ = 0; m_ < 2; ++m_) {
 #pragma unroll
             for (uint32_t n_ = 0; n_ < 2; ++n_) {
+                if constexpr (!C_SHUFFLE) {
 #pragma unroll
-                for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-                    uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-                    uint32_t m_global_idx = block_m_idx * BLOCK_M + m_ * HALF_BLOCK_M + warp_atom_offset_m;
+                    for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                        uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+                        uint32_t m_global_idx = block_m_idx * BLOCK_M + m_ * HALF_BLOCK_M + warp_atom_offset_m;
 #pragma unroll
-                    for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-                        uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                        uint32_t n_global_idx = block_n_idx * BLOCK_N + n_ * HALF_BLOCK_N + warp_atom_offset_n;
-                        auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
-                        wmma.store_matrix(dst_ptr, n, fo[m_][n_][mi][ni]);
+                        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_ * HALF_BLOCK_N + warp_atom_offset_n;
+                            auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                            wmma.store_matrix(dst_ptr, n, fo[m_][n_][mi][ni]);
+                        }
                     }
+                } else {
+#pragma unroll
+                    for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+                        uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
+#pragma unroll
+                        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                            auto ptr_ = &cs[m_ * HALF_BLOCK_M + warp_atom_offset_m][n_ * HALF_BLOCK_N + warp_atom_offset_n];
+                            wmma.store_matrix(ptr_, BLOCK_N, fo[m_][n_][mi][ni]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if constexpr (C_SHUFFLE) {
+            __syncthreads();
+            constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+            constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
+#pragma unroll
+            for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+                uint32_t global_tid = BLOCK_THREADS * i + tid;
+                uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
+                uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+                uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
+                uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
+                if (m_global_idx < m && n_global_idx < n) {
+                    auto src = *reinterpret_cast<ldg_vec_t *>(&cs[m_local_idx][n_local_idx]);
+                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                    *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
                 }
             }
         }
@@ -1009,11 +1045,12 @@ private:
 };
 
 template <typename scalar_t, uint32_t HALF_BLOCK_M, uint32_t HALF_BLOCK_N, uint32_t BLOCK_K>
-union SharedPeakStorage {
+union SharedHTStorage {
     struct {
         scalar_t as[2][2][HALF_BLOCK_M][BLOCK_K];
         scalar_t bs[2][2][HALF_BLOCK_N][BLOCK_K];
     };
+    scalar_t cs[2 * HALF_BLOCK_M][2 * HALF_BLOCK_N];
 };
 
 template <
@@ -1027,14 +1064,14 @@ template <
     uint32_t BLOCK_N_WARPS>
 __attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE)))
 __global__ void
-hgemm_peak_kernel(
+hgemm_ht_kernel(
     scalar_t *c,
     const scalar_t *a,
     const scalar_t *b,
     const uint32_t m,
     const uint32_t n,
     const uint32_t k) {
-    using BlockTileT = BlockTilePeak<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS>;
+    using BlockTileT = BlockTileHT<scalar_t, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS>;
     constexpr uint32_t HALF_BLOCK_M = BlockTileT::HALF_BLOCK_M;
     constexpr uint32_t HALF_BLOCK_N = BlockTileT::HALF_BLOCK_N;
     constexpr uint32_t LDG_REG_A_COUNT = BlockTileT::LDG_REG_A_COUNT;
@@ -1045,7 +1082,7 @@ hgemm_peak_kernel(
     uint32_t m_offset = mi * BLOCK_M;
     uint32_t n_offset = ni * BLOCK_N;
 
-    __shared__ SharedPeakStorage<scalar_t, HALF_BLOCK_M, HALF_BLOCK_N, BLOCK_K> smem;
+    __shared__ SharedHTStorage<scalar_t, HALF_BLOCK_M, HALF_BLOCK_N, BLOCK_K> smem;
 
     BlockTileT block_tile(tid, k);
     uint32_t a_begin = m_offset * k;
@@ -1078,7 +1115,9 @@ hgemm_peak_kernel(
 
     for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
         // 0
+        sched_barrier();
         __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
+        sched_barrier();
         LDMAT_B(0, 0);
         LDMAT_A(0, 0);
         LDG_ASYNC_A(1, 1, 0);
@@ -1093,7 +1132,9 @@ hgemm_peak_kernel(
         LDG_ASYNC_B(1, 0, 2);
         CONSUME(1, 1);
         // 1
+        sched_barrier();
         __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
+        sched_barrier();
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
         CONSUME(0, 0);
@@ -1129,7 +1170,7 @@ hgemm_peak_kernel(
     CONSUME(1, 0);
     CONSUME(1, 1);
 
-    block_tile.store_matrix(c, mi, ni, m, n);
+    block_tile.template store_matrix<true>(c, smem.cs, mi, ni, m, n);
 
 #undef LDG_ASYNC_A
 #undef LDG_ASYNC_B
@@ -1275,11 +1316,11 @@ void hgemm_peak(
         if (is_bf16 == false) {
             using T = __half;
             using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;
-            hgemm_peak_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);
+            hgemm_ht_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);
         } else {
             using T = __bfloat16;
             using WMMAT = WMMA_M16N16K32<T, float, true, BLOCK_K * 2 / 16>;
-            hgemm_peak_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);
+            hgemm_ht_kernel<T, WMMAT, WARP_SIZE, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS><<<grid, block, 0, stream>>>((T *)c, (T *)a, (T *)b, m, n, k);
         }
     }
 }
