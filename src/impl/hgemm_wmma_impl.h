@@ -1102,6 +1102,7 @@ hgemm_ht_kernel(
         hip_s_setprio<1>();                    \
         block_tile.template consume<M_, N_>(); \
         hip_s_setprio<0>();                    \
+        sched_barrier();                       \
     }
 
     LDG_ASYNC_B(0, 0, 0);
@@ -1123,6 +1124,7 @@ hgemm_ht_kernel(
         LDG_ASYNC_A(1, 1, 0);
         CONSUME(0, 0);
         LDMAT_B(1, 0);
+        hip_s_barrier();
         LDG_ASYNC_B(0, 0, 2);
         CONSUME(0, 1);
         LDMAT_A(1, 0);
@@ -1142,6 +1144,7 @@ hgemm_ht_kernel(
         LDG_ASYNC_B(0, 1, 2);
         CONSUME(0, 1);
         LDMAT_A(1, 1);
+        hip_s_barrier();
         LDG_ASYNC_A(0, 1, 2);
         CONSUME(1, 0);
         LDG_ASYNC_B(1, 1, 2);
