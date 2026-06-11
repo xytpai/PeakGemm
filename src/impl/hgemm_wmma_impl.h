@@ -1099,8 +1099,11 @@ hgemm_ht_kernel(
 #define LDMAT_B(N_, K_) block_tile.template ldmatrix_b<N_>(&smem.bs[K_][N_][0][0])
 #define CONSUME(M_, N_)                        \
     {                                          \
+        sched_barrier();                       \
         hip_s_setprio<1>();                    \
+        sched_barrier();                       \
         block_tile.template consume<M_, N_>(); \
+        sched_barrier();                       \
         hip_s_setprio<0>();                    \
         sched_barrier();                       \
     }
@@ -1113,18 +1116,15 @@ hgemm_ht_kernel(
     LDG_ASYNC_A(0, 1, 0);
     LDG_ASYNC_B(1, 1, 0);
     // 4b3a
-
+    __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
     for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
         // 0
-        sched_barrier();
-        __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
-        sched_barrier();
         LDMAT_B(0, 0);
         LDMAT_A(0, 0);
         LDG_ASYNC_A(1, 1, 0);
         CONSUME(0, 0);
         LDMAT_B(1, 0);
-        hip_s_barrier();
+        __barrier<1 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         LDG_ASYNC_B(0, 0, 2);
         CONSUME(0, 1);
         LDMAT_A(1, 0);
@@ -1132,11 +1132,9 @@ hgemm_ht_kernel(
         CONSUME(1, 0);
         LDMAT_B(0, 1);
         LDG_ASYNC_B(1, 0, 2);
+        __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
         CONSUME(1, 1);
         // 1
-        sched_barrier();
-        __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
-        sched_barrier();
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
         CONSUME(0, 0);
@@ -1148,11 +1146,11 @@ hgemm_ht_kernel(
         LDG_ASYNC_A(0, 1, 2);
         CONSUME(1, 0);
         LDG_ASYNC_B(1, 1, 2);
+        __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         CONSUME(1, 1);
     }
-
     // 0
-    __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
+    __barrier<0>();
     LDMAT_B(0, 0);
     LDMAT_A(0, 0);
     LDG_ASYNC_A(1, 1, 0);
@@ -1161,10 +1159,10 @@ hgemm_ht_kernel(
     CONSUME(0, 1);
     LDMAT_A(1, 0);
     CONSUME(1, 0);
+    LDMAT_B(0, 1);
     CONSUME(1, 1);
     // 1
     __barrier<0>();
-    LDMAT_B(0, 1);
     LDMAT_A(0, 1);
     CONSUME(0, 0);
     LDMAT_B(1, 1);
