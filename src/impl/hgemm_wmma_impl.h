@@ -1219,13 +1219,13 @@ hgemm_ht_kernel(
     __barrier<0>();
     LDMAT_A(0, 1);
     hip_s_barrier();
-    CONSUME(0, 0, true);
+    CONSUME(0, 0, false);
     LDMAT_B(1, 1);
     hip_s_barrier();
     CONSUME(0, 1, false);
     LDMAT_A(1, 1);
     hip_s_barrier();
-    CONSUME(1, 0, true);
+    CONSUME(1, 0, false);
 #pragma unroll
     for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
         block_tile.template store_matrix_to_lds_mi<0, 0>(smem.cs, mi_step);
