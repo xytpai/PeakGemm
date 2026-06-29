@@ -842,6 +842,10 @@ struct BlockTileHT {
         WARP_K_STEPS = BLOCK_K / WARP_ATOM_K,
         WARP_M = WARP_M_STEPS * WARP_ATOM_M,
         WARP_N = WARP_N_STEPS * WARP_ATOM_N,
+        A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS,
+        B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS,
+        A_FRAG_VALUES = sizeof(FragmentAT) / sizeof(scalar_t),
+        B_FRAG_VALUES = sizeof(FragmentBT) / sizeof(scalar_t),
         HALF_BLOCK_MK_SIZE = HALF_BLOCK_M * BLOCK_K,
         HALF_BLOCK_NK_SIZE = HALF_BLOCK_N * BLOCK_K,
         LDG_VEC_SIZE = 16 / sizeof(scalar_t),
@@ -971,9 +975,6 @@ struct BlockTileHT {
     __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
-        if constexpr (C_SHUFFLE) {
-            __syncthreads();
-        }
 #pragma unroll
         for (uint32_t m_ = 0; m_ < 2; ++m_) {
 #pragma unroll
@@ -1022,6 +1023,50 @@ struct BlockTileHT {
                     auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
                     *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
                 }
+            }
+        }
+    }
+
+    template <uint32_t MPart, uint32_t NPart>
+    __device__ __forceinline__ void store_matrix_to_lds_mi(scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t mi_step) {
+        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
+        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
+        uint32_t warp_atom_offset_m = warp_m_begin + mi_step * WARP_ATOM_M;
+#pragma unroll
+        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+            auto ptr_ = &cs[MPart * HALF_BLOCK_M + warp_atom_offset_m][NPart * HALF_BLOCK_N + warp_atom_offset_n];
+            wmma.store_matrix(ptr_, BLOCK_N, fo[MPart][NPart][mi_step][ni]);
+        }
+    }
+
+    template <uint32_t MPart, uint32_t NPart>
+    __device__ __forceinline__ void store_matrix_from_lds_mi(
+        scalar_t *ptr,
+        scalar_t (&cs)[BLOCK_M][BLOCK_N],
+        uint32_t block_m_idx,
+        uint32_t block_n_idx,
+        uint32_t m,
+        uint32_t n,
+        uint32_t mi_step) {
+        constexpr uint32_t LDG_REG_C_COUNT =
+            BLOCK_M_WARPS * WARP_ATOM_M * HALF_BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+        constexpr uint32_t LDG_C_X_THREADS = HALF_BLOCK_N / LDG_VEC_SIZE;
+#pragma unroll
+        for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+            uint32_t global_tid = BLOCK_THREADS * i + tid;
+            uint32_t m_band_idx = global_tid / LDG_C_X_THREADS;
+            uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
+            uint32_t warp_m_band = m_band_idx / WARP_ATOM_M;
+            uint32_t atom_m_idx = m_band_idx % WARP_ATOM_M;
+            uint32_t m_local_idx = MPart * HALF_BLOCK_M + warp_m_band * WARP_M + mi_step * WARP_ATOM_M + atom_m_idx;
+            uint32_t n_local_idx_full = NPart * HALF_BLOCK_N + n_local_idx;
+            uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
+            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx_full;
+            if (m_global_idx < m && n_global_idx < n) {
+                auto src = *reinterpret_cast<ldg_vec_t *>(&cs[m_local_idx][n_local_idx_full]);
+                auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
+                *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
             }
         }
     }
@@ -1077,8 +1122,9 @@ hgemm_ht_kernel(
     constexpr uint32_t LDG_REG_A_COUNT = BlockTileT::LDG_REG_A_COUNT;
     constexpr uint32_t LDG_REG_B_COUNT = BlockTileT::LDG_REG_B_COUNT;
     uint32_t tid = threadIdx.x;
+    uint32_t wid = tid / WARP_SIZE;
     uint32_t mi, ni;
-    get_tile_mn<BLOCK_M, BLOCK_N, false>(m, n, mi, ni);
+    get_tile_mn<BLOCK_M, BLOCK_N, true>(m, n, mi, ni);
     uint32_t m_offset = mi * BLOCK_M;
     uint32_t n_offset = ni * BLOCK_N;
 
@@ -1097,81 +1143,124 @@ hgemm_ht_kernel(
 #define LDG_ASYNC_B(N_, K_, F_) block_tile.ldg_copy_async_b((K_ * 2 + N_) * HALF_BLOCK_N * BLOCK_K, b_rsrc, b_begin + N_ * HALF_BLOCK_N * k + (F_ + K_) * BLOCK_K)
 #define LDMAT_A(M_, K_) block_tile.ldmatrix_a(&smem.as[K_][M_][0][0])
 #define LDMAT_B(N_, K_) block_tile.template ldmatrix_b<N_>(&smem.bs[K_][N_][0][0])
-#define CONSUME(M_, N_)                        \
-    {                                          \
-        sched_barrier();                       \
-        hip_s_setprio<1>();                    \
-        sched_barrier();                       \
-        block_tile.template consume<M_, N_>(); \
-        sched_barrier();                       \
-        hip_s_setprio<0>();                    \
-        sched_barrier();                       \
+#define CONSUME(M_, N_, EMIT_SB)                \
+    {                                           \
+        block_tile.template consume<M_, N_>();  \
+        hip_s_barrier();                        \
+        if constexpr (EMIT_SB) sched_barrier(); \
     }
 
     LDG_ASYNC_B(0, 0, 0);
     LDG_ASYNC_A(0, 0, 0);
     LDG_ASYNC_B(1, 0, 0);
     LDG_ASYNC_A(1, 0, 0);
+
+    if (wid / 4 == 1)
+        hip_s_barrier();
+    hip_s_barrier();
+
     LDG_ASYNC_B(0, 1, 0);
     LDG_ASYNC_A(0, 1, 0);
     LDG_ASYNC_B(1, 1, 0);
     // 4b3a
-    __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
+    __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
     for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
         // 0
         LDMAT_B(0, 0);
         LDMAT_A(0, 0);
         LDG_ASYNC_A(1, 1, 0);
-        CONSUME(0, 0);
+        hip_s_barrier();
+        CONSUME(0, 0, true);
         LDMAT_B(1, 0);
-        __barrier<1 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         LDG_ASYNC_B(0, 0, 2);
-        CONSUME(0, 1);
+        hip_s_barrier();
+        CONSUME(0, 1, false);
         LDMAT_A(1, 0);
         LDG_ASYNC_A(0, 0, 2);
-        CONSUME(1, 0);
+        hip_s_barrier();
+        CONSUME(1, 0, true);
         LDMAT_B(0, 1);
         LDG_ASYNC_B(1, 0, 2);
         __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
-        CONSUME(1, 1);
+        CONSUME(1, 1, false);
         // 1
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
-        CONSUME(0, 0);
+        hip_s_barrier();
+        CONSUME(0, 0, true);
         LDMAT_B(1, 1);
         LDG_ASYNC_B(0, 1, 2);
-        CONSUME(0, 1);
-        LDMAT_A(1, 1);
         hip_s_barrier();
+        CONSUME(0, 1, false);
+        LDMAT_A(1, 1);
         LDG_ASYNC_A(0, 1, 2);
-        CONSUME(1, 0);
+        hip_s_barrier();
+        CONSUME(1, 0, true);
         LDG_ASYNC_B(1, 1, 2);
-        __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
-        CONSUME(1, 1);
+        __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
+        CONSUME(1, 1, false);
     }
     // 0
-    __barrier<0>();
     LDMAT_B(0, 0);
     LDMAT_A(0, 0);
     LDG_ASYNC_A(1, 1, 0);
-    CONSUME(0, 0);
+    hip_s_barrier();
+    CONSUME(0, 0, true);
     LDMAT_B(1, 0);
-    CONSUME(0, 1);
+    hip_s_barrier();
+    CONSUME(0, 1, false);
     LDMAT_A(1, 0);
-    CONSUME(1, 0);
+    hip_s_barrier();
+    CONSUME(1, 0, true);
     LDMAT_B(0, 1);
-    CONSUME(1, 1);
+    hip_s_barrier();
+    CONSUME(1, 1, false);
     // 1
     __barrier<0>();
     LDMAT_A(0, 1);
-    CONSUME(0, 0);
+    hip_s_barrier();
+    CONSUME(0, 0, false);
     LDMAT_B(1, 1);
-    CONSUME(0, 1);
+    hip_s_barrier();
+    CONSUME(0, 1, false);
     LDMAT_A(1, 1);
-    CONSUME(1, 0);
-    CONSUME(1, 1);
-
-    block_tile.template store_matrix<true>(c, smem.cs, mi, ni, m, n);
+    hip_s_barrier();
+    CONSUME(1, 0, false);
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_to_lds_mi<0, 0>(smem.cs, mi_step);
+    }
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_to_lds_mi<0, 1>(smem.cs, mi_step);
+    }
+    hip_s_barrier();
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_from_lds_mi<0, 0>(c, smem.cs, mi, ni, m, n, mi_step);
+    }
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_from_lds_mi<0, 1>(c, smem.cs, mi, ni, m, n, mi_step);
+    }
+    CONSUME(1, 1, false);
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_to_lds_mi<1, 0>(smem.cs, mi_step);
+    }
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_to_lds_mi<1, 1>(smem.cs, mi_step);
+    }
+    hip_s_barrier();
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_from_lds_mi<1, 0>(c, smem.cs, mi, ni, m, n, mi_step);
+    }
+#pragma unroll
+    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
+        block_tile.template store_matrix_from_lds_mi<1, 1>(c, smem.cs, mi, ni, m, n, mi_step);
+    }
 
 #undef LDG_ASYNC_A
 #undef LDG_ASYNC_B
