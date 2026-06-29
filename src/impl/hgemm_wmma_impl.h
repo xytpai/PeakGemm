@@ -971,9 +971,6 @@ struct BlockTileHT {
     __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
-        if constexpr (C_SHUFFLE) {
-            __syncthreads();
-        }
 #pragma unroll
         for (uint32_t m_ = 0; m_ < 2; ++m_) {
 #pragma unroll
@@ -1097,21 +1094,17 @@ hgemm_ht_kernel(
 #define LDG_ASYNC_B(N_, K_, F_) block_tile.ldg_copy_async_b((K_ * 2 + N_) * HALF_BLOCK_N * BLOCK_K, b_rsrc, b_begin + N_ * HALF_BLOCK_N * k + (F_ + K_) * BLOCK_K)
 #define LDMAT_A(M_, K_) block_tile.ldmatrix_a(&smem.as[K_][M_][0][0])
 #define LDMAT_B(N_, K_) block_tile.template ldmatrix_b<N_>(&smem.bs[K_][N_][0][0])
-#define CONSUME(M_, N_)                        \
-    {                                          \
-        sched_barrier();                       \
-        hip_s_setprio<1>();                    \
-        sched_barrier();                       \
-        block_tile.template consume<M_, N_>(); \
-        sched_barrier();                       \
-        hip_s_setprio<0>();                    \
-        sched_barrier();                       \
+#define CONSUME(M_, N_, EMIT_SB)                \
+    {                                           \
+        block_tile.template consume<M_, N_>();  \
+        if constexpr (EMIT_SB) sched_barrier(); \
     }
 
     LDG_ASYNC_B(0, 0, 0);
     LDG_ASYNC_A(0, 0, 0);
     LDG_ASYNC_B(1, 0, 0);
     LDG_ASYNC_A(1, 0, 0);
+    hip_s_barrier();
     LDG_ASYNC_B(0, 1, 0);
     LDG_ASYNC_A(0, 1, 0);
     LDG_ASYNC_B(1, 1, 0);
@@ -1122,54 +1115,54 @@ hgemm_ht_kernel(
         LDMAT_B(0, 0);
         LDMAT_A(0, 0);
         LDG_ASYNC_A(1, 1, 0);
-        CONSUME(0, 0);
+        CONSUME(0, 0, true);
         LDMAT_B(1, 0);
         __barrier<1 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
         LDG_ASYNC_B(0, 0, 2);
-        CONSUME(0, 1);
+        CONSUME(0, 1, false);
         LDMAT_A(1, 0);
         LDG_ASYNC_A(0, 0, 2);
-        CONSUME(1, 0);
+        CONSUME(1, 0, true);
         LDMAT_B(0, 1);
         LDG_ASYNC_B(1, 0, 2);
         __barrier<2 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
-        CONSUME(1, 1);
+        CONSUME(1, 1, false);
         // 1
         LDMAT_A(0, 1);
         LDG_ASYNC_A(1, 0, 2);
-        CONSUME(0, 0);
+        CONSUME(0, 0, true);
         LDMAT_B(1, 1);
         LDG_ASYNC_B(0, 1, 2);
-        CONSUME(0, 1);
+        CONSUME(0, 1, false);
         LDMAT_A(1, 1);
         hip_s_barrier();
         LDG_ASYNC_A(0, 1, 2);
-        CONSUME(1, 0);
+        CONSUME(1, 0, true);
         LDG_ASYNC_B(1, 1, 2);
         __barrier<2 * LDG_REG_B_COUNT + 2 * LDG_REG_A_COUNT>();
-        CONSUME(1, 1);
+        CONSUME(1, 1, false);
     }
     // 0
-    __barrier<0>();
+    __barrier<1 * LDG_REG_B_COUNT + 1 * LDG_REG_A_COUNT>();
     LDMAT_B(0, 0);
     LDMAT_A(0, 0);
     LDG_ASYNC_A(1, 1, 0);
-    CONSUME(0, 0);
+    CONSUME(0, 0, true);
     LDMAT_B(1, 0);
-    CONSUME(0, 1);
+    CONSUME(0, 1, false);
     LDMAT_A(1, 0);
-    CONSUME(1, 0);
+    CONSUME(1, 0, true);
     LDMAT_B(0, 1);
-    CONSUME(1, 1);
+    CONSUME(1, 1, false);
     // 1
     __barrier<0>();
     LDMAT_A(0, 1);
-    CONSUME(0, 0);
+    CONSUME(0, 0, true);
     LDMAT_B(1, 1);
-    CONSUME(0, 1);
+    CONSUME(0, 1, false);
     LDMAT_A(1, 1);
-    CONSUME(1, 0);
-    CONSUME(1, 1);
+    CONSUME(1, 0, true);
+    CONSUME(1, 1, false);
 
     block_tile.template store_matrix<true>(c, smem.cs, mi, ni, m, n);
 
