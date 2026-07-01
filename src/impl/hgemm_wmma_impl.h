@@ -1095,9 +1095,12 @@ hgemm_ht_kernel(
     LDG_ASYNC_B(1, 0, 0);
     LDG_ASYNC_A(1, 0, 0);
 
+    sched_barrier();
     if (wid / 4 == 1)
         hip_s_barrier();
+    sched_barrier();
     hip_s_barrier();
+    sched_barrier();
 
     LDG_ASYNC_B(0, 1, 0);
     LDG_ASYNC_A(0, 1, 0);
@@ -1165,13 +1168,15 @@ hgemm_ht_kernel(
     CONSUME(0, 1, false);
     LDMAT_A(1, 1);
     hip_s_barrier();
-    CONSUME(1, 0, false);
+    block_tile.template consume<1, 0>();
+    hip_s_barrier();
     block_tile.template store_matrix_to_lds<0, 0>(smem.cs);
     block_tile.template store_matrix_to_lds<0, 1>(smem.cs);
     hip_s_barrier();
     block_tile.template store_matrix_from_lds<0, 0>(c, smem.cs, mi, ni, m, n);
     block_tile.template store_matrix_from_lds<0, 1>(c, smem.cs, mi, ni, m, n);
-    CONSUME(1, 1, false);
+    block_tile.template consume<1, 1>();
+    hip_s_barrier();
     block_tile.template store_matrix_to_lds<1, 0>(smem.cs);
     block_tile.template store_matrix_to_lds<1, 1>(smem.cs);
     hip_s_barrier();
