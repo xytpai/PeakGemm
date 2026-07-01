@@ -568,12 +568,11 @@ private:
 template <uint32_t CNT = 0, bool BARRIER = true>
 __device__ __forceinline__ void __barrier() {
 #ifdef __HIPCC__
-    __builtin_amdgcn_sched_barrier(0);
-    asm volatile("s_waitcnt vmcnt(%0)" ::"n"(CNT));
     if constexpr (BARRIER) {
-        __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt vmcnt(%0)\n\ts_barrier" ::"n"(CNT));
+    } else {
+        asm volatile("s_waitcnt vmcnt(%0)" ::"n"(CNT));
     }
-    __builtin_amdgcn_sched_barrier(0);
 #else
     __syncthreads();
 #endif
@@ -971,100 +970,41 @@ struct BlockTileHT {
 
 #endif
 
-    template <bool C_SHUFFLE = false>
-    __device__ __forceinline__ void store_matrix(scalar_t *ptr, scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m, uint32_t n) {
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void store_matrix_to_lds(scalar_t (&cs)[BLOCK_M][BLOCK_N]) {
         uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
         uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
-        for (uint32_t m_ = 0; m_ < 2; ++m_) {
+        for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
+            uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
 #pragma unroll
-            for (uint32_t n_ = 0; n_ < 2; ++n_) {
-                if constexpr (!C_SHUFFLE) {
-#pragma unroll
-                    for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-                        uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-                        uint32_t m_global_idx = block_m_idx * BLOCK_M + m_ * HALF_BLOCK_M + warp_atom_offset_m;
-#pragma unroll
-                        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-                            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_ * HALF_BLOCK_N + warp_atom_offset_n;
-                            auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
-                            wmma.store_matrix(dst_ptr, n, fo[m_][n_][mi][ni]);
-                        }
-                    }
-                } else {
-#pragma unroll
-                    for (uint32_t mi = 0; mi < WARP_M_STEPS; ++mi) {
-                        uint32_t warp_atom_offset_m = warp_m_begin + mi * WARP_ATOM_M;
-#pragma unroll
-                        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-                            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-                            auto ptr_ = &cs[m_ * HALF_BLOCK_M + warp_atom_offset_m][n_ * HALF_BLOCK_N + warp_atom_offset_n];
-                            wmma.store_matrix(ptr_, BLOCK_N, fo[m_][n_][mi][ni]);
-                        }
-                    }
-                }
-            }
-        }
-
-        if constexpr (C_SHUFFLE) {
-            __syncthreads();
-            constexpr uint32_t LDG_REG_C_COUNT = BLOCK_M * BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
-            constexpr uint32_t LDG_C_X_THREADS = BLOCK_N / LDG_VEC_SIZE;
-#pragma unroll
-            for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
-                uint32_t global_tid = BLOCK_THREADS * i + tid;
-                uint32_t m_local_idx = global_tid / LDG_C_X_THREADS;
-                uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
-                uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
-                uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
-                if (m_global_idx < m && n_global_idx < n) {
-                    auto src = *reinterpret_cast<ldg_vec_t *>(&cs[m_local_idx][n_local_idx]);
-                    auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
-                    *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
-                }
+            for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
+                uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
+                auto ptr_ = &cs[m_ * HALF_BLOCK_M + warp_atom_offset_m][n_ * HALF_BLOCK_N + warp_atom_offset_n];
+                wmma.store_matrix(ptr_, BLOCK_N, fo[m_][n_][mi][ni]);
             }
         }
     }
 
-    template <uint32_t MPart, uint32_t NPart>
-    __device__ __forceinline__ void store_matrix_to_lds_mi(scalar_t (&cs)[BLOCK_M][BLOCK_N], uint32_t mi_step) {
-        uint32_t warp_m_begin = wid / BLOCK_N_WARPS * WARP_M;
-        uint32_t warp_n_begin = wid % BLOCK_N_WARPS * WARP_N;
-        uint32_t warp_atom_offset_m = warp_m_begin + mi_step * WARP_ATOM_M;
-#pragma unroll
-        for (uint32_t ni = 0; ni < WARP_N_STEPS; ++ni) {
-            uint32_t warp_atom_offset_n = warp_n_begin + ni * WARP_ATOM_N;
-            auto ptr_ = &cs[MPart * HALF_BLOCK_M + warp_atom_offset_m][NPart * HALF_BLOCK_N + warp_atom_offset_n];
-            wmma.store_matrix(ptr_, BLOCK_N, fo[MPart][NPart][mi_step][ni]);
-        }
-    }
-
-    template <uint32_t MPart, uint32_t NPart>
-    __device__ __forceinline__ void store_matrix_from_lds_mi(
+    template <uint32_t m_, uint32_t n_>
+    __device__ __forceinline__ void store_matrix_from_lds(
         scalar_t *ptr,
         scalar_t (&cs)[BLOCK_M][BLOCK_N],
         uint32_t block_m_idx,
         uint32_t block_n_idx,
         uint32_t m,
-        uint32_t n,
-        uint32_t mi_step) {
-        constexpr uint32_t LDG_REG_C_COUNT =
-            BLOCK_M_WARPS * WARP_ATOM_M * HALF_BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
-        constexpr uint32_t LDG_C_X_THREADS = HALF_BLOCK_N / LDG_VEC_SIZE;
+        uint32_t n) {
+        constexpr uint32_t STG_ITERS = HALF_BLOCK_M * HALF_BLOCK_N / (BLOCK_THREADS * LDG_VEC_SIZE);
+        constexpr uint32_t STG_C_X_THREADS = HALF_BLOCK_N / LDG_VEC_SIZE;
 #pragma unroll
-        for (uint32_t i = 0; i < LDG_REG_C_COUNT; ++i) {
+        for (uint32_t i = 0; i < STG_ITERS; ++i) {
             uint32_t global_tid = BLOCK_THREADS * i + tid;
-            uint32_t m_band_idx = global_tid / LDG_C_X_THREADS;
-            uint32_t n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE;
-            uint32_t warp_m_band = m_band_idx / WARP_ATOM_M;
-            uint32_t atom_m_idx = m_band_idx % WARP_ATOM_M;
-            uint32_t m_local_idx = MPart * HALF_BLOCK_M + warp_m_band * WARP_M + mi_step * WARP_ATOM_M + atom_m_idx;
-            uint32_t n_local_idx_full = NPart * HALF_BLOCK_N + n_local_idx;
+            uint32_t m_local_idx = m_ * HALF_BLOCK_M + global_tid / STG_C_X_THREADS;
+            uint32_t n_local_idx = n_ * HALF_BLOCK_N + global_tid % STG_C_X_THREADS * LDG_VEC_SIZE;
             uint32_t m_global_idx = block_m_idx * BLOCK_M + m_local_idx;
-            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx_full;
+            uint32_t n_global_idx = block_n_idx * BLOCK_N + n_local_idx;
             if (m_global_idx < m && n_global_idx < n) {
-                auto src = *reinterpret_cast<ldg_vec_t *>(&cs[m_local_idx][n_local_idx_full]);
+                auto src = *reinterpret_cast<ldg_vec_t *>(&cs[m_local_idx][n_local_idx]);
                 auto dst_ptr = ptr + m_global_idx * n + n_global_idx;
                 *reinterpret_cast<ldg_vec_t *>(dst_ptr) = src;
             }
@@ -1226,41 +1166,17 @@ hgemm_ht_kernel(
     LDMAT_A(1, 1);
     hip_s_barrier();
     CONSUME(1, 0, false);
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_to_lds_mi<0, 0>(smem.cs, mi_step);
-    }
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_to_lds_mi<0, 1>(smem.cs, mi_step);
-    }
+    block_tile.template store_matrix_to_lds<0, 0>(smem.cs);
+    block_tile.template store_matrix_to_lds<0, 1>(smem.cs);
     hip_s_barrier();
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_from_lds_mi<0, 0>(c, smem.cs, mi, ni, m, n, mi_step);
-    }
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_from_lds_mi<0, 1>(c, smem.cs, mi, ni, m, n, mi_step);
-    }
+    block_tile.template store_matrix_from_lds<0, 0>(c, smem.cs, mi, ni, m, n);
+    block_tile.template store_matrix_from_lds<0, 1>(c, smem.cs, mi, ni, m, n);
     CONSUME(1, 1, false);
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_to_lds_mi<1, 0>(smem.cs, mi_step);
-    }
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_to_lds_mi<1, 1>(smem.cs, mi_step);
-    }
+    block_tile.template store_matrix_to_lds<1, 0>(smem.cs);
+    block_tile.template store_matrix_to_lds<1, 1>(smem.cs);
     hip_s_barrier();
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_from_lds_mi<1, 0>(c, smem.cs, mi, ni, m, n, mi_step);
-    }
-#pragma unroll
-    for (uint32_t mi_step = 0; mi_step < BlockTileT::WARP_M_STEPS; ++mi_step) {
-        block_tile.template store_matrix_from_lds_mi<1, 1>(c, smem.cs, mi, ni, m, n, mi_step);
-    }
+    block_tile.template store_matrix_from_lds<1, 0>(c, smem.cs, mi, ni, m, n);
+    block_tile.template store_matrix_from_lds<1, 1>(c, smem.cs, mi, ni, m, n);
 
 #undef LDG_ASYNC_A
 #undef LDG_ASYNC_B
