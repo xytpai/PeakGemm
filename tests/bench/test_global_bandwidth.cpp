@@ -1,4 +1,4 @@
-#include "device_common.h"
+#include "peak_gemm/peak_gemm.hpp"
 
 template <typename T, int vec_size, int loops>
 __global__ void threads_copy_kernel(const T *in, T *out, const size_t n) {
@@ -12,7 +12,7 @@ __global__ void threads_copy_kernel(const T *in, T *out, const size_t n) {
                 out[i] = in[i];
             }
         } else {
-            using vec_t = kernel_utils::vec_t<T, vec_size>;
+            using vec_t = peak_gemm::core::Vector<T, vec_size>;
             auto in_vec = reinterpret_cast<vec_t *>(const_cast<T *>(&in[index]));
             auto out_vec = reinterpret_cast<vec_t *>(&out[index]);
             *out_vec = *in_vec;

@@ -1,4 +1,4 @@
-#include "device_common.h"
+#include "peak_gemm/peak_gemm.hpp"
 
 template <int LOOP>
 __global__ void fmad_loop_kernel(float *x) {
