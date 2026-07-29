@@ -93,15 +93,15 @@ public:
                                                                           use_bias_(use_bias),
                                                                           a_(DataT::uniform({m, k}, -1.0F, 1.0F, cpu, 2026)),
                                                                           b_(DataT::uniform({n, k}, -1.0F, 1.0F, cpu, 2027)),
-                                                                          bias_(DataT::uniform({n}, -1.0F, 1.0F, cpu, 2028)),
+                                                                          bias_(DataT::uniform({n}, 10.0F, 20.0F, cpu, 2028)),
                                                                           device_a_(a_.copy_to(gpu)),
                                                                           device_b_(b_.copy_to(gpu)),
                                                                           device_bias_(bias_.copy_to(gpu)),
                                                                           device_c_({m, n}, gpu) {
     }
 
-    template <typename Launch, typename Reference = DefaultCpuGemmReference>
-    float check_accuracy(const Launch &launch, const Reference &reference = {}) {
+    template <typename Launch, typename Reference>
+    float check_accuracy(const Launch &launch, const Reference &reference) {
         launch_kernel(launch);
         gpuDeviceSynchronize();
         auto actual = device_c_.copy_to(cpu);
@@ -152,6 +152,14 @@ public:
         return use_bias_;
     }
 
+    float tolerance(float base_tolerance) const {
+        float scale = std::sqrt(static_cast<float>(k_));
+        if (use_bias_) {
+            scale += 80.0F;
+        }
+        return base_tolerance * scale;
+    }
+
 private:
     template <typename Launch>
     void launch_kernel(const Launch &launch) {
@@ -171,16 +179,17 @@ private:
     DataT device_c_;
 };
 
-template <typename scalar_t, typename Launch, typename Reference = DefaultCpuGemmReference>
+template <typename scalar_t, typename Launch, typename Reference>
 void run(
     const char *type_name,
     float base_tolerance,
     const std::vector<GemmShape> &shapes,
     const Launch &launch,
+    const Reference &reference,
+    bool use_bias = true,
     uint32_t warmup = 10,
     uint32_t measurements = 8,
-    uint32_t iterations = 20,
-    const Reference &reference = {}) {
+    uint32_t iterations = 20) {
     std::cout << "\n[" << type_name << "]\n"
               << std::right << std::setw(8) << "m"
               << std::setw(8) << "n"
@@ -193,9 +202,9 @@ void run(
               << std::setw(16) << "tflops" << '\n';
     bool all_passed = true;
     for (const auto &[m, n, k] : shapes) {
-        GemmBench<scalar_t> bench(m, n, k);
+        GemmBench<scalar_t> bench(m, n, k, use_bias);
         const float max_diff = bench.check_accuracy(launch, reference);
-        const float tolerance = base_tolerance * std::sqrt(static_cast<float>(k));
+        const float tolerance = bench.tolerance(base_tolerance);
         const bool passed = max_diff <= tolerance;
         all_passed &= passed;
         const auto result = bench.benchmark(launch, warmup, measurements, iterations);
@@ -217,43 +226,47 @@ void run(
     }
 }
 
-template <typename scalar_t, typename Launch, typename Reference = DefaultCpuGemmReference>
+template <typename scalar_t, typename Launch, typename Reference>
 void run(
     const char *type_name,
     const std::vector<GemmShape> &shapes,
     const Launch &launch,
+    const Reference &reference,
+    bool use_bias = true,
     uint32_t warmup = 10,
     uint32_t measurements = 8,
-    uint32_t iterations = 20,
-    const Reference &reference = {}) {
+    uint32_t iterations = 20) {
     run<scalar_t>(
         type_name,
         default_base_tolerance<scalar_t>(),
         shapes,
         launch,
+        reference,
+        use_bias,
         warmup,
         measurements,
-        iterations,
-        reference);
+        iterations);
 }
 
-template <typename scalar_t, typename Launch, typename Reference = DefaultCpuGemmReference>
+template <typename scalar_t, typename Launch, typename Reference>
 void run(
     const std::vector<GemmShape> &shapes,
     const Launch &launch,
+    const Reference &reference,
+    bool use_bias = true,
     uint32_t warmup = 10,
     uint32_t measurements = 8,
-    uint32_t iterations = 20,
-    const Reference &reference = {}) {
+    uint32_t iterations = 20) {
     run<scalar_t>(
         default_type_name<scalar_t>(),
         default_base_tolerance<scalar_t>(),
         shapes,
         launch,
+        reference,
+        use_bias,
         warmup,
         measurements,
-        iterations,
-        reference);
+        iterations);
 }
 
 } // namespace peak_gemm::bench

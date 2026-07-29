@@ -22,9 +22,13 @@ int main() {
         {1024, 1024, 1024},
         {512, 1024, 2048},
     };
-    peak_gemm::bench::run<float>(mnks, GemmNaiveLaunch<float>{});
-    peak_gemm::bench::run<__half>(mnks, GemmNaiveLaunch<__half>{});
-    peak_gemm::bench::run<__bfloat16>(mnks, GemmNaiveLaunch<__bfloat16>{});
+    const peak_gemm::bench::DefaultCpuGemmReference reference;
+    peak_gemm::bench::run<float>(mnks, GemmNaiveLaunch<float>{}, reference, false);
+    peak_gemm::bench::run<float>(mnks, GemmNaiveLaunch<float>{}, reference, true);
+    peak_gemm::bench::run<__half>(mnks, GemmNaiveLaunch<__half>{}, reference, false);
+    peak_gemm::bench::run<__half>(mnks, GemmNaiveLaunch<__half>{}, reference, true);
+    peak_gemm::bench::run<__bfloat16>(mnks, GemmNaiveLaunch<__bfloat16>{}, reference, false);
+    peak_gemm::bench::run<__bfloat16>(mnks, GemmNaiveLaunch<__bfloat16>{}, reference, true);
     std::cout << "ok\n";
     return 0;
 }
