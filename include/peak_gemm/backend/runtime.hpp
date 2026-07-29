@@ -7,8 +7,15 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
+#include "peak_gemm/backend/hip/group.hpp"
+
+namespace peak_gemm::backend {
+using Warp = hip::Wave;
+}
+
 #define gpuSuccess hipSuccess
 #define gpuGetLastError hipGetLastError
+#define gpuGetErrorString hipGetErrorString
 #define gpuMemcpy hipMemcpy
 #define gpuMemcpyAsync hipMemcpyAsync
 #define gpuMemset hipMemset
@@ -68,8 +75,15 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
+#include "peak_gemm/backend/cuda/group.hpp"
+
+namespace peak_gemm::backend {
+using Warp = cuda::Warp;
+}
+
 #define gpuSuccess cudaSuccess
 #define gpuGetLastError cudaGetLastError
+#define gpuGetErrorString cudaGetErrorString
 #define gpuMemcpy cudaMemcpy
 #define gpuMemcpyAsync cudaMemcpyAsync
 #define gpuMemset cudaMemset

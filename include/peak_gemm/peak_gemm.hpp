@@ -23,3 +23,4 @@
 #include "peak_gemm/core/vector.hpp"
 
 #include "peak_gemm/backend/runtime.hpp"
+#include "peak_gemm/data.hpp"
