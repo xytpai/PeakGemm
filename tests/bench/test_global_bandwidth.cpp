@@ -111,4 +111,6 @@ int main() {
     test_threads_copy<4, __half, loops>((1024 * 1024 * 256 + 2) * 2);
     std::cout << "half8: ";
     test_threads_copy<8, __half, loops>((1024 * 1024 * 256 + 2) * 2);
+    std::cout << "ok\n";
+    return 0;
 }

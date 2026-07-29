@@ -3,21 +3,40 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "peak_gemm/backend/runtime.hpp"
 #include "peak_gemm/core/config.hpp"
 #include "peak_gemm/core/vector.hpp"
 
-namespace peak_gemm::backend::cuda {
+namespace peak_gemm::backend {
+
+struct AsyncCopy {
+    template <typename T>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void copy(T *destination, const T *source) {
+        constexpr int bytes = sizeof(T);
+        const auto shared_destination =
+            static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
+        const auto global_source = reinterpret_cast<std::uint64_t>(source);
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], %2;\n" ::
+                "r"(shared_destination),
+            "l"(global_source), "n"(bytes));
+    }
+
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void commit() {
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+
+    template <int PendingGroups>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void wait() {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(PendingGroups));
+    }
+};
 
 template <typename Scalar, typename Accumulator, bool UseSwizzle = true>
 struct MmaM16N8K16 {
-    static constexpr std::uint32_t m = 16;
-    static constexpr std::uint32_t n = 8;
-    static constexpr std::uint32_t k = 16;
+    static constexpr std::uint32_t m = 16, n = 8, k = 16;
     enum : std::uint32_t { M = m,
                            N = n,
                            K = k };
-
     using FragmentAT = core::Vector<Scalar, 8>;
     using FragmentBT = core::Vector<Scalar, 4>;
     using FragmentCT = core::Vector<Accumulator, 4>;
@@ -56,23 +75,19 @@ struct MmaM16N8K16 {
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void reset_fragment_c(
-        FragmentCT &fragment,
-        Accumulator value = 0) const {
+        FragmentCT &fragment, Accumulator value = 0) const {
         fragment.fill(value);
     }
 
     template <std::uint32_t VectorBits = 3>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE std::uint32_t swizzle(
         std::uint32_t address) const {
-        constexpr std::uint32_t column_bits = 3;
-        constexpr std::uint32_t column_mask =
-            ((1U << column_bits) - 1U) << VectorBits;
+        constexpr std::uint32_t column_mask = 7U << VectorBits;
         return ((address >> VectorBits) & column_mask) ^ address;
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE std::uint32_t swizzle(
-        std::uint32_t,
-        std::uint32_t column) const {
+        std::uint32_t, std::uint32_t column) const {
         return swizzle(column);
     }
 
@@ -83,10 +98,8 @@ struct MmaM16N8K16 {
         std::uint32_t column,
         std::uint32_t stride) const {
         auto *registers = reinterpret_cast<std::uint32_t *>(&fragment);
-        auto offset = (row + (lane_ % 16)) * stride + column + (lane_ / 16) * 8;
-        if constexpr (UseSwizzle) {
-            offset = swizzle(offset);
-        }
+        auto offset = (row + lane_ % 16) * stride + column + lane_ / 16 * 8;
+        if constexpr (UseSwizzle) offset = swizzle(offset);
         const auto address =
             static_cast<std::uint32_t>(__cvta_generic_to_shared(base + offset));
         asm volatile(
@@ -117,18 +130,12 @@ struct MmaM16N8K16 {
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer,
-        std::uint32_t stride,
-        const FragmentCT &fragment) const {
+        Scalar *pointer, std::uint32_t stride, const FragmentCT &fragment) const {
         const auto y = lane_ / 4;
         const auto x = lane_ % 4 * 2;
         using Pair = core::Vector<Scalar, 2>;
-        Pair row0;
-        Pair row1;
-        row0.values[0] = static_cast<Scalar>(fragment.values[0]);
-        row0.values[1] = static_cast<Scalar>(fragment.values[1]);
-        row1.values[0] = static_cast<Scalar>(fragment.values[2]);
-        row1.values[1] = static_cast<Scalar>(fragment.values[3]);
+        const Pair row0{{static_cast<Scalar>(fragment[0]), static_cast<Scalar>(fragment[1])}};
+        const Pair row1{{static_cast<Scalar>(fragment[2]), static_cast<Scalar>(fragment[3])}};
         *reinterpret_cast<Pair *>(&pointer[y * stride + x]) = row0;
         *reinterpret_cast<Pair *>(&pointer[(y + 8) * stride + x]) = row1;
     }
@@ -137,4 +144,7 @@ private:
     std::uint32_t lane_ = 0;
 };
 
-} // namespace peak_gemm::backend::cuda
+template <typename Scalar, typename Accumulator, bool UseSwizzle = true>
+using WmmaDefault = MmaM16N8K16<Scalar, Accumulator, UseSwizzle>;
+
+} // namespace peak_gemm::backend

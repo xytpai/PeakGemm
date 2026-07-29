@@ -54,5 +54,6 @@ int main() {
         std::cout << "arithmetic_intensity: " << arithmetic_intensity << " FLOP/Byte.  |  COMPUTE:";
         std::cout << tflops << " TFLOPS" << std::endl;
     }
+    std::cout << "ok\n";
     return 0;
 }

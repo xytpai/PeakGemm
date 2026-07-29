@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "peak_gemm/core/config.hpp"
+
 #if defined(__HIPCC__)
 
 #include <hip/hip_bf16.h>
@@ -9,28 +11,26 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
-#include "peak_gemm/backend/hip/group.hpp"
-
-namespace peak_gemm::backend::hip {
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle,
-    std::uint32_t KBlocks16>
-struct MfmaM16N16K32;
-}
-
-#include "peak_gemm/backend/hip/mfma_gfx950.hpp"
-
 namespace peak_gemm::backend {
-using Warp = hip::Wave;
 
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle = true>
-using Wmma =
-    hip::MfmaM16N16K32<Scalar, Accumulator, UseSwizzle, 0>;
+struct Warp {
+    static constexpr std::uint32_t size = 64;
+
+    template <typename T>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {
+        return __shfl(value, source_lane, size);
+    }
+
+    template <typename T>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle_xor(T value, int lane_mask) {
+        return __shfl_xor(value, lane_mask, size);
+    }
+
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void barrier() {
+        __builtin_amdgcn_wave_barrier();
+    }
+};
+
 } // namespace peak_gemm::backend
 
 #define gpuSuccess hipSuccess
@@ -95,27 +95,26 @@ using Wmma =
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
-#include "peak_gemm/backend/cuda/group.hpp"
-
-namespace peak_gemm::backend::cuda {
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle>
-struct MmaM16N8K16;
-}
-
-#include "peak_gemm/backend/cuda/mma_sm80.hpp"
-
 namespace peak_gemm::backend {
-using Warp = cuda::Warp;
 
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle = true>
-using Wmma =
-    cuda::MmaM16N8K16<Scalar, Accumulator, UseSwizzle>;
+struct Warp {
+    static constexpr std::uint32_t size = 32;
+
+    template <typename T>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {
+        return __shfl_sync(0xffffffffU, value, source_lane, size);
+    }
+
+    template <typename T>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle_xor(T value, int lane_mask) {
+        return __shfl_xor_sync(0xffffffffU, value, lane_mask, size);
+    }
+
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void barrier() {
+        __syncwarp();
+    }
+};
+
 } // namespace peak_gemm::backend
 
 #define gpuSuccess cudaSuccess

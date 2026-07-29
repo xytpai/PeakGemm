@@ -1,5 +1,11 @@
 #include "peak_gemm/peak_gemm.hpp"
 
+#if defined(__CUDACC__)
+#include "peak_gemm/backend/arch_sm80.hpp"
+#elif defined(__HIPCC__)
+#include "peak_gemm/backend/arch_gfx950.hpp"
+#endif
+
 template <typename scalar_t>
 __global__ void wmma_kernel(
     const scalar_t *a,
@@ -8,7 +14,7 @@ __global__ void wmma_kernel(
     uint32_t m_size,
     uint32_t n_size,
     uint32_t k_size) {
-    using WmmaT = peak_gemm::backend::Wmma<scalar_t, float, false>;
+    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float, false>;
     __shared__ scalar_t tile_a[WmmaT::M * WmmaT::K];
     __shared__ scalar_t tile_b[WmmaT::N * WmmaT::K];
     __shared__ scalar_t tile_c[WmmaT::M * WmmaT::N];
@@ -57,7 +63,7 @@ void wmma_gpu(
     uint32_t n_size,
     uint32_t k_size,
     gpuStream_t stream = nullptr) {
-    using WmmaT = peak_gemm::backend::Wmma<scalar_t, float, false>;
+    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float, false>;
     using Warp = peak_gemm::backend::Warp;
     dim3 grid(
         (n_size + WmmaT::N - 1) / WmmaT::N,
