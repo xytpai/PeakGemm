@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #if defined(__HIPCC__)
 
 #include <hip/hip_bf16.h>
@@ -9,9 +11,27 @@
 
 #include "peak_gemm/backend/hip/group.hpp"
 
+namespace peak_gemm::backend::hip {
+template <
+    typename Scalar,
+    typename Accumulator,
+    bool UseSwizzle,
+    std::uint32_t KBlocks16>
+struct MfmaM16N16K32;
+}
+
+#include "peak_gemm/backend/hip/mfma_gfx950.hpp"
+
 namespace peak_gemm::backend {
 using Warp = hip::Wave;
-}
+
+template <
+    typename Scalar,
+    typename Accumulator,
+    bool UseSwizzle = true>
+using Wmma =
+    hip::MfmaM16N16K32<Scalar, Accumulator, UseSwizzle, 0>;
+} // namespace peak_gemm::backend
 
 #define gpuSuccess hipSuccess
 #define gpuGetLastError hipGetLastError
@@ -77,9 +97,26 @@ using Warp = hip::Wave;
 
 #include "peak_gemm/backend/cuda/group.hpp"
 
+namespace peak_gemm::backend::cuda {
+template <
+    typename Scalar,
+    typename Accumulator,
+    bool UseSwizzle>
+struct MmaM16N8K16;
+}
+
+#include "peak_gemm/backend/cuda/mma_sm80.hpp"
+
 namespace peak_gemm::backend {
 using Warp = cuda::Warp;
-}
+
+template <
+    typename Scalar,
+    typename Accumulator,
+    bool UseSwizzle = true>
+using Wmma =
+    cuda::MmaM16N8K16<Scalar, Accumulator, UseSwizzle>;
+} // namespace peak_gemm::backend
 
 #define gpuSuccess cudaSuccess
 #define gpuGetLastError cudaGetLastError

@@ -80,5 +80,6 @@ int main() {
         std::cout << "batch=" << batch_size << ", reduce_size=" << reduce_size
                   << ", max_diff=" << max_diff << '\n';
     }
+    std::cout << "ok\n";
     return 0;
 }
