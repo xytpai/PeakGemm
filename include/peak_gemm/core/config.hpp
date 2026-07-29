@@ -2,11 +2,16 @@
 
 #include <cstdint>
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__)
 #define PEAKGEMM_HOST_DEVICE __host__ __device__
 #define PEAKGEMM_DEVICE __device__
 #define PEAKGEMM_HOST __host__
 #define PEAKGEMM_FORCEINLINE __forceinline__
+#elif defined(__HIPCC__)
+#define PEAKGEMM_HOST_DEVICE __host__ __device__
+#define PEAKGEMM_DEVICE __device__
+#define PEAKGEMM_HOST __host__
+#define PEAKGEMM_FORCEINLINE inline __attribute__((always_inline))
 #else
 #define PEAKGEMM_HOST_DEVICE
 #define PEAKGEMM_DEVICE

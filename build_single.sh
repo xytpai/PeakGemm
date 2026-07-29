@@ -38,7 +38,7 @@ case "$backend" in
             exit 1
         }
         # echo "Using ROCm (hipcc)"
-        hipcc -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude -Rpass-analysis=kernel-resource-usage "$source_file" -o a.out
+        hipcc -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
         ;;
     *)
         echo "unsupported BACKEND: $backend" >&2
