@@ -8,7 +8,7 @@ if [[ "${1:-}" =~ ^(cuda|rocm|hip)$ ]]; then
     shift
 fi
 
-tests=(tests/core/*.cpp tests/bench/*.cpp)
+tests=(tests/core/*.cpp tests/arch_bench/*.cpp tests/gemm/*.cpp)
 
 for test_source in "${tests[@]}"; do
     echo "==> $test_source"
