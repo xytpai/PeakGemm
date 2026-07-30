@@ -227,16 +227,24 @@ void test_gpu_data() {
         peer.to(gpu, 0);
         assert(peer.device_index() == 0);
         expect_values(peer.copy_to(cpu), {1, 2, 3, 4, 5, 6});
+        std::cout << "[pass] multi gpu copy, devices=" << device_count << '\n';
+    } else {
+        std::cout << "[skip] multi gpu copy, devices=" << device_count << '\n';
     }
     assert(gpuSetDevice(original_device) == gpuSuccess);
 }
 
 int main() {
     test_cpu_data();
+    std::cout << "[pass] cpu data\n";
     test_move_semantics();
+    std::cout << "[pass] move semantics\n";
     test_random_data();
+    std::cout << "[pass] random data\n";
     test_validation();
+    std::cout << "[pass] validation\n";
     test_gpu_data();
+    std::cout << "[pass] gpu data\n";
     std::cout << "ok\n";
     return 0;
 }
