@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "peak_gemm/backend/runtime.hpp"
+#include "peak_gemm/core/block_swizzle.hpp"
 #include "peak_gemm/core/math.hpp"
 #include "peak_gemm/core/vector.hpp"
 
@@ -186,7 +187,7 @@ union HgemmSharedStorage {
 };
 
 template <typename scalar_t, typename Wmma, uint32_t BlockK, uint32_t BlockMWarps, uint32_t BlockNWarps, uint32_t BlockKWarps,
-          uint32_t WarpMSteps, uint32_t WarpNSteps, uint32_t Stages, uint32_t SplitK>
+          uint32_t WarpMSteps, uint32_t WarpNSteps, uint32_t Stages, uint32_t SplitK, uint32_t SwizzleM>
 __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
                              2) void hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size,
                                                   uint32_t k_size, uint32_t *semaphore, uint32_t *signal, const scalar_t *bias) {
@@ -194,9 +195,11 @@ __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
     constexpr uint32_t BlockM = BlockTile::BlockM;
     constexpr uint32_t BlockN = BlockTile::BlockN;
     constexpr bool IsSplitK = SplitK > 1;
+    const uint32_t blocks_m = core::ceil_div(m_size, BlockM);
     const uint32_t blocks_n = core::ceil_div(n_size, BlockN);
-    const uint32_t block_m = blockIdx.x / blocks_n;
-    const uint32_t block_n = blockIdx.x % blocks_n;
+    const auto block = core::block_swizzle<SwizzleM>(blockIdx.x, blocks_m, blocks_n);
+    const uint32_t block_m = block.m;
+    const uint32_t block_n = block.n;
     const uint32_t thread = threadIdx.x;
     const uint32_t partition_k = k_size / SplitK;
     const uint32_t partition = blockIdx.y;
@@ -279,7 +282,7 @@ __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
 }
 
 template <typename scalar_t, uint32_t BlockM, uint32_t BlockN, uint32_t BlockK, uint32_t BlockMWarps, uint32_t BlockNWarps,
-          uint32_t BlockKWarps, uint32_t Stages, uint32_t SplitK>
+          uint32_t BlockKWarps, uint32_t Stages, uint32_t SplitK, uint32_t SwizzleM = 8>
 void launch_hgemm(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t *semaphore,
                   uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     using Wmma = backend::WmmaDefault<scalar_t, float, true>;
@@ -308,7 +311,7 @@ void launch_hgemm(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m,
         }
     }
     const dim3 grid(blocks_m * blocks_n, SplitK);
-    hgemm_kernel<scalar_t, Wmma, BlockK, BlockMWarps, BlockNWarps, BlockKWarps, WarpMSteps, WarpNSteps, Stages, SplitK>
+    hgemm_kernel<scalar_t, Wmma, BlockK, BlockMWarps, BlockNWarps, BlockKWarps, WarpMSteps, WarpNSteps, Stages, SplitK, SwizzleM>
         <<<grid, BlockThreads, 0, stream>>>(c, a, b, m, n, k, semaphore, signal, bias);
 }
 

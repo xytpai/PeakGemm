@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "peak_gemm/core/block_swizzle.hpp"
 #include "peak_gemm/core/config.hpp"
 #include "peak_gemm/core/layout.hpp"
 #include "peak_gemm/core/math.hpp"
