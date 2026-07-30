@@ -12,21 +12,6 @@ namespace peak_gemm::kernel {
 
 inline constexpr uint32_t kSemaphoreCount = 256;
 
-template <typename scalar_t>
-PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(scalar_t *destination, scalar_t *source);
-
-template <>
-PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__half *destination, __half *source) {
-    atomicAdd(&destination[0], source[0]);
-    atomicAdd(&destination[1], source[1]);
-}
-
-template <>
-PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__bfloat16 *destination, __bfloat16 *source) {
-    atomicAdd(&destination[0], source[0]);
-    atomicAdd(&destination[1], source[1]);
-}
-
 template <typename scalar_t, typename Wmma, uint32_t BlockK, uint32_t BlockMWarps, uint32_t BlockNWarps, uint32_t BlockKWarps,
           uint32_t WarpMSteps, uint32_t WarpNSteps>
 class HgemmBlockTile {
@@ -131,7 +116,7 @@ public:
 
     template <bool UseAtomic>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store(scalar_t *c, scalar_t (&shared_c)[BlockKWarps][BlockM * BlockN], uint32_t block_m,
-                                                    uint32_t block_n, uint32_t m_size, uint32_t n_size) {
+                                                    uint32_t block_n, uint32_t m_size, uint32_t n_size, const scalar_t *bias) {
         const uint32_t warp_m = warp_mn_ / BlockNWarps * WarpM;
         const uint32_t warp_n = warp_mn_ % BlockNWarps * WarpN;
         __syncthreads();
@@ -160,11 +145,18 @@ public:
             for (uint32_t k = 1; k < BlockKWarps; ++k) {
                 value += *reinterpret_cast<Vector *>(&shared_c[k][local_m * BlockN + local_n]);
             }
+            if constexpr (!UseAtomic) {
+                if (bias != nullptr) {
+                    Vector bias_value;
+                    bias_value.load(bias + global_n);
+                    value += bias_value;
+                }
+            }
             auto *destination = c + global_m * n_size + global_n;
             if constexpr (UseAtomic) {
 #pragma unroll
                 for (uint32_t element = 0; element < VectorSize; element += 2) {
-                    atomic_pair_add(destination + element, &value[element]);
+                    backend::atomic_pair_add(destination + element, &value[element]);
                 }
             } else {
                 value.store(destination);
@@ -197,7 +189,7 @@ template <typename scalar_t, typename Wmma, uint32_t BlockK, uint32_t BlockMWarp
           uint32_t WarpMSteps, uint32_t WarpNSteps, uint32_t Stages, uint32_t SplitK>
 __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
                              2) void hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size,
-                                                  uint32_t k_size, uint32_t *semaphore, uint32_t *signal) {
+                                                  uint32_t k_size, uint32_t *semaphore, uint32_t *signal, const scalar_t *bias) {
     using BlockTile = HgemmBlockTile<scalar_t, Wmma, BlockK, BlockMWarps, BlockNWarps, BlockKWarps, WarpMSteps, WarpNSteps>;
     constexpr uint32_t BlockM = BlockTile::BlockM;
     constexpr uint32_t BlockN = BlockTile::BlockN;
@@ -220,8 +212,7 @@ __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
             constexpr uint32_t VectorSize = BlockTile::VectorSize;
             constexpr uint32_t StoreRegisters = BlockM * BlockN / (BlockTile::BlockThreads * VectorSize);
             constexpr uint32_t StoreXThreads = BlockN / VectorSize;
-            core::Vector<scalar_t, VectorSize> zeros;
-            zeros.fill(static_cast<scalar_t>(0));
+            core::Vector<scalar_t, VectorSize> initial;
 #pragma unroll
             for (uint32_t i = 0; i < StoreRegisters; ++i) {
                 const uint32_t global_thread = BlockTile::BlockThreads * i + thread;
@@ -230,13 +221,18 @@ __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
                 const uint32_t global_m = block_m * BlockM + local_m;
                 const uint32_t global_n = block_n * BlockN + local_n;
                 if (global_m < m_size && global_n < n_size) {
-                    zeros.store(c + global_m * n_size + global_n);
+                    if (bias != nullptr) {
+                        initial.load(bias + global_n);
+                    } else {
+                        initial.fill(static_cast<scalar_t>(0));
+                    }
+                    initial.store(c + global_m * n_size + global_n);
                 }
             }
             __threadfence();
             __syncthreads();
             if (thread == 0) {
-                atomicExch(&signal[blockIdx.x], 1U);
+                backend::atomic_exchange(&signal[blockIdx.x], 1U);
             }
             __syncthreads();
         }
@@ -264,27 +260,28 @@ __global__ __launch_bounds__(BlockMWarps * BlockNWarps * BlockKWarps * 32,
 
     if constexpr (IsSplitK) {
         if (thread == 0) {
-            while (atomicAdd(&signal[blockIdx.x], 0U) == 0) {
+            while (backend::atomic_add(&signal[blockIdx.x], 0U) == 0) {
             }
         }
         __syncthreads();
         if (thread == 0) {
-            const uint32_t arrival = atomicAdd(&semaphore[blockIdx.x], 1U);
+            const uint32_t arrival =
+                backend::atomic_add(&semaphore[blockIdx.x], 1U);
             if (arrival == SplitK - 1) {
                 semaphore[blockIdx.x] = 0;
                 signal[blockIdx.x] = 0;
             }
         }
-        block_tile.template store<true>(c, shared.c, block_m, block_n, m_size, n_size);
+        block_tile.template store<true>(c, shared.c, block_m, block_n, m_size, n_size, bias);
     } else {
-        block_tile.template store<false>(c, shared.c, block_m, block_n, m_size, n_size);
+        block_tile.template store<false>(c, shared.c, block_m, block_n, m_size, n_size, bias);
     }
 }
 
 template <typename scalar_t, uint32_t BlockM, uint32_t BlockN, uint32_t BlockK, uint32_t BlockMWarps, uint32_t BlockNWarps,
           uint32_t BlockKWarps, uint32_t Stages, uint32_t SplitK>
 void launch_hgemm(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t *semaphore,
-                  uint32_t *signal, gpuStream_t stream = nullptr) {
+                  uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     using Wmma = backend::WmmaDefault<scalar_t, float, true>;
     constexpr uint32_t WarpMSteps = BlockM / BlockMWarps / Wmma::M;
     constexpr uint32_t WarpNSteps = BlockN / BlockNWarps / Wmma::N;
@@ -312,16 +309,16 @@ void launch_hgemm(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m,
     }
     const dim3 grid(blocks_m * blocks_n, SplitK);
     hgemm_kernel<scalar_t, Wmma, BlockK, BlockMWarps, BlockNWarps, BlockKWarps, WarpMSteps, WarpNSteps, Stages, SplitK>
-        <<<grid, BlockThreads, 0, stream>>>(c, a, b, m, n, k, semaphore, signal);
+        <<<grid, BlockThreads, 0, stream>>>(c, a, b, m, n, k, semaphore, signal, bias);
 }
 
 template <typename scalar_t>
 void hgemm_gpu(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t *semaphore,
-               uint32_t *signal, gpuStream_t stream = nullptr) {
+               uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     if (m <= 256) {
-        launch_hgemm<scalar_t, 16, 64, 64, 1, 1, 2, 2, 4>(a, b, c, m, n, k, semaphore, signal, stream);
+        launch_hgemm<scalar_t, 16, 64, 64, 1, 1, 2, 2, 4>(a, b, c, m, n, k, semaphore, signal, bias, stream);
     } else {
-        launch_hgemm<scalar_t, 128, 128, 16, 2, 4, 1, 4, 1>(a, b, c, m, n, k, semaphore, signal, stream);
+        launch_hgemm<scalar_t, 128, 128, 16, 2, 4, 1, 4, 1>(a, b, c, m, n, k, semaphore, signal, bias, stream);
     }
 }
 

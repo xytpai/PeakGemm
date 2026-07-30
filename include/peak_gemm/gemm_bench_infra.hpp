@@ -12,6 +12,7 @@
 
 #include "peak_gemm/backend/runtime.hpp"
 #include "peak_gemm/data.hpp"
+#include "peak_gemm/kernel/gemm_naive.hpp"
 
 namespace peak_gemm::bench {
 
@@ -43,6 +44,33 @@ struct DefaultCpuGemmReference {
                 c[m * n_size + n] = static_cast<scalar_t>(value);
             }
         }
+    }
+};
+
+struct GpuNaiveGemmReference {
+    template <typename scalar_t>
+    void operator()(
+        const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m,
+        uint32_t n, uint32_t k, const scalar_t *bias) const {
+        using DataT = Data<scalar_t>;
+        DataT host_a({m, k}), host_b({n, k}), host_bias({n});
+        std::copy_n(a, host_a.size(), host_a.data());
+        std::copy_n(b, host_b.size(), host_b.data());
+        if (bias != nullptr) {
+            std::copy_n(bias, host_bias.size(), host_bias.data());
+        } else {
+            host_bias.fill(static_cast<scalar_t>(0));
+        }
+        auto device_a = host_a.copy_to(gpu);
+        auto device_b = host_b.copy_to(gpu);
+        auto device_bias = host_bias.copy_to(gpu);
+        DataT device_c({m, n}, gpu);
+        peak_gemm::kernel::gemm_naive_gpu(
+            device_a.data(), device_b.data(), device_c.data(), m, n, k,
+            device_bias.data());
+        gpuDeviceSynchronize();
+        const auto result = device_c.copy_to(cpu);
+        std::copy_n(result.data(), result.size(), c);
     }
 };
 
