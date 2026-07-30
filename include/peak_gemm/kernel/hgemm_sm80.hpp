@@ -321,7 +321,7 @@ void hgemm_gpu(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, ui
     if (m <= 256) {
         launch_hgemm<scalar_t, 16, 64, 64, 1, 1, 2, 2, 4>(a, b, c, m, n, k, semaphore, signal, bias, stream);
     } else {
-        launch_hgemm<scalar_t, 128, 128, 16, 2, 4, 1, 4, 1>(a, b, c, m, n, k, semaphore, signal, bias, stream);
+        launch_hgemm<scalar_t, 128, 128, 32, 2, 4, 1, 3, 1>(a, b, c, m, n, k, semaphore, signal, bias, stream);
     }
 }
 
