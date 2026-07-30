@@ -31,6 +31,36 @@ struct Warp {
     }
 };
 
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE scalar_t atomic_add(scalar_t *destination, scalar_t value) {
+    return atomicAdd(destination, value);
+}
+
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE scalar_t atomic_exchange(scalar_t *destination, scalar_t value) {
+    return atomicExch(destination, value);
+}
+
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(scalar_t *destination, const scalar_t *source);
+
+using AtomicFp16x2 = __fp16 __attribute__((__vector_size__(4)));
+using AtomicBf16x2 = __bf16 __attribute__((__vector_size__(4)));
+
+template <>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__half *destination, const __half *source) {
+    auto *packed_destination = reinterpret_cast<AtomicFp16x2 *>(destination);
+    const auto packed_source = *reinterpret_cast<const AtomicFp16x2 *>(source);
+    __builtin_amdgcn_global_atomic_fadd_v2f16(packed_destination, packed_source);
+}
+
+template <>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__hip_bfloat16 *destination, const __hip_bfloat16 *source) {
+    auto *packed_destination = reinterpret_cast<AtomicBf16x2 *>(destination);
+    const auto packed_source = *reinterpret_cast<const AtomicBf16x2 *>(source);
+    __builtin_amdgcn_global_atomic_fadd_v2bf16(packed_destination, packed_source);
+}
+
 } // namespace peak_gemm::backend
 
 #define gpuSuccess hipSuccess
@@ -114,6 +144,31 @@ struct Warp {
         __syncwarp();
     }
 };
+
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE scalar_t atomic_add(scalar_t *destination, scalar_t value) {
+    return atomicAdd(destination, value);
+}
+
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE scalar_t atomic_exchange(scalar_t *destination, scalar_t value) {
+    return atomicExch(destination, value);
+}
+
+template <typename scalar_t>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(scalar_t *destination, const scalar_t *source);
+
+template <>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__half *destination, const __half *source) {
+    atomicAdd(&destination[0], source[0]);
+    atomicAdd(&destination[1], source[1]);
+}
+
+template <>
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__nv_bfloat16 *destination, const __nv_bfloat16 *source) {
+    atomicAdd(&destination[0], source[0]);
+    atomicAdd(&destination[1], source[1]);
+}
 
 } // namespace peak_gemm::backend
 
