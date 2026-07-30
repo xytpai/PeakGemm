@@ -3,7 +3,6 @@
 import os
 import sys
 import torch
-import pybind11
 import sysconfig
 from packaging.version import Version
 from pathlib import Path
@@ -12,6 +11,24 @@ from typing import Any, cast
 
 
 BUILD_DIR = 'build'
+
+
+def cuda_arch_list() -> str:
+    requested = os.environ.get("PEAKGEMM_CUDA_ARCH_LIST")
+    if requested:
+        return requested
+    if torch.cuda.is_available():
+        capabilities = {
+            torch.cuda.get_device_capability(device)
+            for device in range(torch.cuda.device_count())
+        }
+        if min(major for major, _ in capabilities) < 8:
+            raise RuntimeError("PeakGemm requires SM80 or newer")
+        return " ".join(
+            f"{major}.{minor}"
+            for major, minor in sorted(capabilities)
+        )
+    return "8.0+PTX"
 
 
 def _mkdir_p(d: str) -> None:
@@ -39,6 +56,8 @@ class CMake:
         self._cmake_command = CMake._get_cmake_command()
         self.build_dir = build_dir
         self.parallel_build = parallel_build
+        self.env = os.environ.copy()
+        self.env["TORCH_CUDA_ARCH_LIST"] = cuda_arch_list()
 
     @property
     def _cmake_cache_file(self) -> str:
@@ -94,22 +113,22 @@ class CMake:
     def generate(self, rerun: bool, output_dir: str):
         if rerun and os.path.isfile(self._cmake_cache_file):
             os.remove(self._cmake_cache_file)
-        args = ['..']
+        source_dir = Path(__file__).resolve().parent / "bindings" / "torch"
+        args = [str(source_dir)]
         _mkdir_p(self.build_dir)
-        pybind11_dir = pybind11.__path__[0]
         torch_dir = torch.__path__[0]
         CMake.defines(args, 
-                      pybind11_DIR=os.path.join(pybind11_dir, 'share/cmake/pybind11'),
                       Torch_DIR=os.path.join(torch_dir, 'share/cmake/Torch'),
+                      TORCH_CUDA_ARCH_LIST=self.env["TORCH_CUDA_ARCH_LIST"],
                       PYTHON_INCLUDE_DIR=sysconfig.get_paths()['include'],
                       CMAKE_LIBRARY_OUTPUT_DIRECTORY=output_dir)
-        self.run(args, os.environ)
+        self.run(args, self.env)
     
     def build(self):
         if not self.parallel_build:
-            self.run(['--build', '.'], os.environ)
+            self.run(['--build', '.'], self.env)
         elif isinstance(self.parallel_build, int):
             nworkers = str(self.parallel_build)
-            self.run(['--build', '.', '-j', nworkers], os.environ)
+            self.run(['--build', '.', '-j', nworkers], self.env)
         else:
-            self.run(['--build', '.', '--parallel'], os.environ)
+            self.run(['--build', '.', '--parallel'], self.env)
