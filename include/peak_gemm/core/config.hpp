@@ -19,6 +19,8 @@
 #define PEAKGEMM_FORCEINLINE inline __attribute__((always_inline))
 #endif
 
+#define PEAKGEMM_DEVICE_INLINE PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE
+
 namespace peak_gemm {
 
 enum class Backend : std::uint8_t {

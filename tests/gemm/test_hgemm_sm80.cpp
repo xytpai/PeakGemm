@@ -14,7 +14,8 @@ struct HgemmSm80Launch {
     mutable Data<uint32_t> semaphore;
     mutable Data<uint32_t> signal;
 
-    HgemmSm80Launch() : semaphore({kernel::kSemaphoreCount}, gpu), signal({kernel::kSemaphoreCount}, gpu) {
+    HgemmSm80Launch() :
+        semaphore({kernel::kSemaphoreCount}, gpu), signal({kernel::kSemaphoreCount}, gpu) {
         semaphore.fill(0U);
         signal.fill(0U);
     }
@@ -44,6 +45,8 @@ int main() {
     std::cout << "sm80 hgemm\n";
     bench::run<__half>(mnks, launch, reference, true);
     bench::run<__bfloat16>(mnks, launch, reference, true);
+    bench::run<__half>(mnks, launch, reference, false);
+    bench::run<__bfloat16>(mnks, launch, reference, false);
     std::cout << "ok\n";
     return 0;
 }

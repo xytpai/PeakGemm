@@ -115,17 +115,18 @@ class GemmBench {
 public:
     using DataT = Data<scalar_t>;
 
-    GemmBench(uint32_t m, uint32_t n, uint32_t k, bool use_bias = true) : m_(m),
-                                                                          n_(n),
-                                                                          k_(k),
-                                                                          use_bias_(use_bias),
-                                                                          a_(DataT::uniform({m, k}, -1.0F, 1.0F, cpu, 2026)),
-                                                                          b_(DataT::uniform({n, k}, -1.0F, 1.0F, cpu, 2027)),
-                                                                          bias_(DataT::uniform({n}, 10.0F, 20.0F, cpu, 2028)),
-                                                                          device_a_(a_.copy_to(gpu)),
-                                                                          device_b_(b_.copy_to(gpu)),
-                                                                          device_bias_(bias_.copy_to(gpu)),
-                                                                          device_c_({m, n}, gpu) {
+    GemmBench(uint32_t m, uint32_t n, uint32_t k, bool use_bias = true) :
+        m_(m),
+        n_(n),
+        k_(k),
+        use_bias_(use_bias),
+        a_(DataT::uniform({m, k}, -1.0F, 1.0F, cpu, 2026)),
+        b_(DataT::uniform({n, k}, -1.0F, 1.0F, cpu, 2027)),
+        bias_(DataT::uniform({n}, 10.0F, 20.0F, cpu, 2028)),
+        device_a_(a_.copy_to(gpu)),
+        device_b_(b_.copy_to(gpu)),
+        device_bias_(bias_.copy_to(gpu)),
+        device_c_({m, n}, gpu) {
     }
 
     template <typename Launch, typename Reference>

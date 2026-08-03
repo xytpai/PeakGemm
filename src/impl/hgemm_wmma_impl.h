@@ -13,7 +13,7 @@ __device__ __forceinline__ void atomic_pack_add_scalar(T *pk_dst, T *pk_src) {
 }
 
 #ifdef __CUDACC__
-#define LAUNCH_CONFIG __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE, 2)
+#define LAUNCH_CONFIG __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *BLOCK_K_WARPS *WARP_SIZE, 2)
 template <>
 __device__ __forceinline__ void atomic_pack_add_scalar<__bfloat16>(__bfloat16 *pk_dst, __bfloat16 *pk_src) {
     atomicAdd(&pk_dst[0], pk_src[0]);
@@ -1047,7 +1047,7 @@ template <
     uint32_t BLOCK_N,
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS>
-__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE)))
+__attribute__((amdgpu_waves_per_eu(2, 2), amdgpu_flat_work_group_size(BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE, BLOCK_M_WARPS *BLOCK_N_WARPS *WARP_SIZE)))
 __global__ void
 hgemm_ht_kernel(
     scalar_t *c,
