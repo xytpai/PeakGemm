@@ -1,4 +1,5 @@
 import argparse
+import functools
 import math
 
 import torch
@@ -16,6 +17,19 @@ BASE_TOLERANCE = {
     torch.float16: 2.0e-3,
     torch.bfloat16: 2.0e-2,
 }
+SMALL_CONFIG = PeakGemm.HgemmConfig(
+    16, 64, 64, 1, 2, 2, split_k=4)
+LARGE_CONFIG = PeakGemm.HgemmConfig(
+    128, 128, 32, 2, 4, 3, split_k=1)
+
+
+@functools.lru_cache(maxsize=None)
+def get_hgemm(config):
+    return PeakGemm.compile_hgemm(config)
+
+
+def get_hgemm_for_shape(m):
+    return get_hgemm(SMALL_CONFIG if m <= 256 else LARGE_CONFIG)
 
 
 def make_inputs(m, n, k, dtype, device):
@@ -32,7 +46,7 @@ def check_accuracy(device):
         for m, n, k in ACCURACY_SHAPES:
             a, b = make_inputs(m, n, k, dtype, device)
             actual = torch.empty((m, n), dtype=dtype, device=device)
-            PeakGemm.gemm_peak(actual, a, b)
+            get_hgemm_for_shape(m)(actual, a, b)
             torch.cuda.synchronize(device)
             expected = torch.mm(a, b.T)
             torch.cuda.synchronize(device)
@@ -60,9 +74,10 @@ def profile_performance(m, n, k, dtype, device, warmup, iterations, trace):
     a, b = make_inputs(m, n, k, dtype, device)
     peak_output = torch.empty((m, n), dtype=dtype, device=device)
     native_output = torch.empty_like(peak_output)
+    hgemm = get_hgemm_for_shape(m)
 
     def peak_gemm():
-        PeakGemm.gemm_peak(peak_output, a, b)
+        hgemm(peak_output, a, b)
 
     def native_gemm():
         torch.mm(a, b.T, out=native_output)

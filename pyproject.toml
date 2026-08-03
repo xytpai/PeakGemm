@@ -1,8 +1,5 @@
 [build-system]
 requires = [
     "setuptools",
-    "wheel",
-    "packaging",
-    "ninja",
-    "torch"
+    "wheel"
 ]

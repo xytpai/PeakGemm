@@ -7,13 +7,12 @@ The current optimized path is an SM80-style Tensor Core HGEMM kernel for
 NVIDIA GPUs. It supports FP16 and BF16 inputs, FP32 accumulation, optional
 kernel-side bias, asynchronous global-to-shared copies, split-K for small M,
 and grouped block swizzling for L2 reuse. The PyTorch API currently launches
-the kernel without bias.
+the kernel through a JIT-compiled extension without bias.
 
 ## Requirements
 
 - Linux
 - Python 3.10+
-- CMake 3.18+
 - A CUDA-enabled PyTorch installation
 - CUDA Toolkit with `nvcc`
 - NVIDIA GPU with SM80 or newer Tensor Core instructions
@@ -24,58 +23,93 @@ point is not implemented yet.
 
 ## Install
 
-Build the PyTorch extension from the repository root:
+Install the Python package from the repository root:
 
 ```bash
-rm -rf build libPeakGemm.so libPeakGemm_device.so
 python3 -m pip install -v -e . --no-build-isolation
 ```
 
-The build detects every visible GPU capability. For cross-compilation, set
+No CUDA extension is built during installation. `compile_hgemm` invokes
+PyTorch's JIT extension builder for the requested config. For
+cross-compilation, set
 `PEAKGEMM_CUDA_ARCH_LIST` explicitly, for example `8.9+PTX` for an RTX 4090
 binary with a forward-compatible PTX fallback.
 
-The build is defined entirely under `bindings/torch/`; the Python package
-loads the resulting `libPeakGemm.so`.
-
 ## PyTorch API
 
-`gemm_peak` computes:
+The callable returned by `compile_hgemm` computes:
 
 ```text
 C[M, N] = A[M, K] @ B[N, K].T
 ```
 
-Inputs and output must be contiguous CUDA tensors with the same FP16 or BF16
-dtype. The output tensor is supplied by the caller and updated in place.
+Inputs and output must be contiguous, 16-byte-aligned CUDA tensors with the
+same FP16 or BF16 dtype. Flattened A, B, and C element counts must each fit in
+`uint32`. The output tensor is supplied by the caller and updated in place.
 
 ```python
 import torch
 import PeakGemm
+
+config = PeakGemm.HgemmConfig(
+    block_m=128,
+    block_n=128,
+    block_k=32,
+    block_m_warps=2,
+    block_n_warps=4,
+    stages=3,
+)
+gemm = PeakGemm.compile_hgemm(
+    config, cache_dir="./.cache/peak_gemm")
 
 m = n = k = 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
 
-PeakGemm.gemm_peak(c, a, b)
+gemm(c, a, b)
 torch.cuda.synchronize()
 
 reference = a @ b.T
 torch.testing.assert_close(c, reference, atol=1.0, rtol=1e-2)
 ```
 
-The wrapper keeps split-K semaphore storage per CUDA device and stream.
+The callable keeps split-K workspace per CUDA device and stream. Each call to
+`compile_hgemm` compiles one config into one hash-named extension. Configs can
+also be enumerated and compiled one at a time:
+
+```python
+configs = list(PeakGemm.enumerate_hgemm_configs(
+    block_m=(64, 128),
+    block_n=(128,),
+    block_k=(32,),
+    block_m_warps=(2,),
+    block_n_warps=(4,),
+    stages=(2, 3),
+    swizzle_m=(8,),
+    split_k=(1,),
+))
+
+m, n, k = 256, 256, 1024
+a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+b = torch.randn((n, k), device="cuda", dtype=torch.float16)
+for config in configs:
+    gemm = PeakGemm.compile_hgemm(
+        config, cache_dir="./.cache/peak_gemm", verbose=True)
+    c = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    gemm(c, a, b)
+    # Benchmark this config here before compiling the next one.
+```
+
+Each config is stored under `<cache_dir>/<config-hash>`. PyTorch reuses it
+when the same config is requested again.
 
 ## Shape constraints
 
-The current dispatcher uses two kernel configurations:
-
-- `M <= 256`: M must be divisible by 16, N by 64, and K by 256.
-- `M > 256`: M and N must be divisible by 128; K must be at least 48 and
-  divisible by 16.
-
-Unsupported shapes raise an exception instead of silently using a fallback.
+For a selected config, M and N must be divisible by `block_m` and `block_n`.
+K must be divisible by `split_k * block_k`, and each split must contain enough
+K tiles to fill the configured pipeline. Unsupported shapes raise an
+exception instead of silently selecting another config.
 
 ## Python accuracy and performance test
 
@@ -131,8 +165,7 @@ include/peak_gemm/
   backend/          CUDA/HIP runtime and architecture primitives
   core/             vectors, layouts, shapes, math, and block swizzling
   kernel/           naive GEMM and architecture-specific HGEMM kernels
-bindings/torch/     PyTorch operator and standalone CMake build
-PeakGemm/           Python API
+PeakGemm/           Python JIT API
 tests/              core, bandwidth, compute, and GEMM tests
 ```
 

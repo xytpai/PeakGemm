@@ -22,7 +22,21 @@ struct HgemmSm80Launch {
 
     template <typename scalar_t>
     void operator()(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, const scalar_t *bias) const {
-        kernel::hgemm_gpu(a, b, c, m, n, k, semaphore.data(), signal.data(), bias);
+        if (m <= 256) {
+            if (bias == nullptr) {
+                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 2, 2, 8, false, true>(
+                    a, b, c, m, n, k, 4, semaphore.data(), signal.data(), bias);
+            } else {
+                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 2, 2, 8, true, true>(
+                    a, b, c, m, n, k, 4, semaphore.data(), signal.data(), bias);
+            }
+        } else if (bias == nullptr) {
+            kernel::hgemm_template<scalar_t, 128, 128, 32, 2, 4, 3, 8, false, false>(
+                a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+        } else {
+            kernel::hgemm_template<scalar_t, 128, 128, 32, 2, 4, 3, 8, true, false>(
+                a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+        }
     }
 };
 
