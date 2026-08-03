@@ -24,8 +24,8 @@ template <
     uint32_t BLOCK_N_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
-    uint32_t SPLIT_K,
-    bool HAS_BIAS>
+    bool HAS_BIAS,
+    bool IS_SPLIT_K>
 class HgemmBlockTile {
 public:
     using FragmentAT = typename wmma_t::FragmentAT;
@@ -51,7 +51,6 @@ public:
         NUM_B_LOADS = BLOCK_N * BLOCK_K / BLOCK_THREADS / VEC_SIZE,
         STG_X_THREADS = BLOCK_N / VEC_SIZE,
         STG_ITERS = BLOCK_M * BLOCK_N / (BLOCK_THREADS * VEC_SIZE),
-        IS_SPLIT_K = SPLIT_K > 1
     };
 
     using vec_t = core::Vector<scalar_t, VEC_SIZE>;
@@ -163,7 +162,8 @@ public:
         uint32_t block_m_idx,
         uint32_t block_n_idx,
         uint32_t m_size,
-        uint32_t n_size) {
+        uint32_t n_size,
+        uint32_t split_k) {
         const uint32_t warp_m = warp_ / BLOCK_N_WARPS * WARP_M;
         const uint32_t warp_n = warp_ % BLOCK_N_WARPS * WARP_N;
         __syncthreads();
@@ -185,7 +185,7 @@ public:
             if (thread_ == 0) {
                 const uint32_t arrival =
                     backend::atomic_add(&semaphore_[blockIdx.x], 1U);
-                if (arrival == SPLIT_K - 1) {
+                if (arrival == split_k - 1) {
                     semaphore_[blockIdx.x] = 0;
                     signal_[blockIdx.x] = 0;
                 }
@@ -260,13 +260,13 @@ template <
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
     uint32_t STAGES,
-    uint32_t SPLIT_K,
     uint32_t SWIZZLE_M,
-    bool HAS_BIAS>
+    bool HAS_BIAS,
+    bool IS_SPLIT_K>
 __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void hgemm_kernel(
-    scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size,
+    scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size, uint32_t split_k,
     uint32_t *semaphore, uint32_t *signal, const scalar_t *bias) {
-    using BlockTile = HgemmBlockTile<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, SPLIT_K, HAS_BIAS>;
+    using BlockTile = HgemmBlockTile<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, HAS_BIAS, IS_SPLIT_K>;
     constexpr uint32_t BLOCK_M = BlockTile::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTile::BLOCK_N;
     const uint32_t m_blocks = core::ceil_div(m_size, BLOCK_M);
@@ -275,7 +275,7 @@ __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void h
     const uint32_t block_m_idx = block_idx.m;
     const uint32_t block_n_idx = block_idx.n;
     const uint32_t thread = threadIdx.x;
-    const uint32_t partition_k = k_size / SPLIT_K;
+    const uint32_t partition_k = k_size / split_k;
     const uint32_t partition = blockIdx.y;
     const uint32_t begin_k = partition * partition_k;
     uint32_t a_begin = block_m_idx * BLOCK_M * k_size + begin_k;
@@ -306,7 +306,7 @@ __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void h
         current_stage = (current_stage + 1) % STAGES;
     }
 
-    block_tile.store(shared.c, block_m_idx, block_n_idx, m_size, n_size);
+    block_tile.store(shared.c, block_m_idx, block_n_idx, m_size, n_size, split_k);
 }
 
 template <
@@ -317,7 +317,6 @@ template <
     uint32_t BLOCK_M_WARPS,
     uint32_t BLOCK_N_WARPS,
     uint32_t STAGES,
-    uint32_t SPLIT_K,
     uint32_t SWIZZLE_M = 8>
 void launch_hgemm(
     const scalar_t *a,
@@ -326,6 +325,7 @@ void launch_hgemm(
     uint32_t m,
     uint32_t n,
     uint32_t k,
+    uint32_t split_k,
     uint32_t *semaphore,
     uint32_t *signal,
     const scalar_t *bias = nullptr,
@@ -346,10 +346,10 @@ void launch_hgemm(
     if (m % BLOCK_M != 0 || n % BLOCK_N != 0) {
         throw std::invalid_argument("CUDA HGEMM M and N must be block-tile aligned");
     }
-    if (k % (SPLIT_K * BLOCK_K) != 0 || k / SPLIT_K < (STAGES - 1) * BLOCK_K) {
+    if (k % (split_k * BLOCK_K) != 0 || k / split_k < (STAGES - 1) * BLOCK_K) {
         throw std::invalid_argument("CUDA HGEMM K does not satisfy pipeline alignment");
     }
-    if constexpr (SPLIT_K > 1) {
+    if (split_k > 1) {
         if (m_blocks * n_blocks > kSemaphoreCount) {
             throw std::invalid_argument("CUDA HGEMM split-K workspace is too small");
         }
@@ -357,13 +357,23 @@ void launch_hgemm(
             throw std::invalid_argument("CUDA HGEMM split-K requires workspace");
         }
     }
-    const dim3 grid(m_blocks * n_blocks, SPLIT_K);
-    if (bias == nullptr) {
-        hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SPLIT_K, SWIZZLE_M, false>
-            <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, semaphore, signal, bias);
+    const dim3 grid(m_blocks * n_blocks, split_k);
+    if (split_k > 1) {
+        if (bias == nullptr) {
+            hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, false, true>
+                <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, split_k, semaphore, signal, bias);
+        } else {
+            hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, true, true>
+                <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, split_k, semaphore, signal, bias);
+        }
     } else {
-        hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SPLIT_K, SWIZZLE_M, true>
-            <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, semaphore, signal, bias);
+        if (bias == nullptr) {
+            hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, false, false>
+                <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, split_k, semaphore, signal, bias);
+        } else {
+            hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, true, false>
+                <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, split_k, semaphore, signal, bias);
+        }
     }
 }
 
@@ -371,9 +381,9 @@ template <typename scalar_t>
 void hgemm_gpu(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t *semaphore,
                uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     if (m <= 256) {
-        launch_hgemm<scalar_t, 16, 64, 64, 1, 2, 2, 4>(a, b, c, m, n, k, semaphore, signal, bias, stream);
+        launch_hgemm<scalar_t, 16, 64, 64, 1, 2, 2>(a, b, c, m, n, k, 4, semaphore, signal, bias, stream);
     } else {
-        launch_hgemm<scalar_t, 128, 128, 32, 2, 4, 3, 1>(a, b, c, m, n, k, semaphore, signal, bias, stream);
+        launch_hgemm<scalar_t, 128, 128, 32, 2, 4, 3>(a, b, c, m, n, k, 1, semaphore, signal, bias, stream);
     }
 }
 
