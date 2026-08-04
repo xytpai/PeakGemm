@@ -13,7 +13,7 @@ struct AsyncCopy {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void copy(T *destination, const T *source) {
         constexpr int bytes = sizeof(T);
         const auto shared_destination =
-            static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
+            static_cast<uint32_t>(__cvta_generic_to_shared(destination));
         const auto global_source = reinterpret_cast<std::uint64_t>(source);
         asm volatile(
             "cp.async.cg.shared.global [%0], [%1], %2;\n" ::
@@ -33,16 +33,14 @@ struct AsyncCopy {
 
 template <typename Scalar, typename Accumulator, bool UseSwizzle = true>
 struct MmaM16N8K16 {
-    static constexpr std::uint32_t m = 16, n = 8, k = 16;
-    enum : std::uint32_t { M = m,
-                           N = n,
-                           K = k };
+    static constexpr uint32_t m = 16, n = 8, k = 16;
+    enum : uint32_t { M = m, N = n, K = k };
     using FragmentAT = core::Vector<Scalar, 8>;
     using FragmentBT = core::Vector<Scalar, 4>;
     using FragmentCT = core::Vector<Accumulator, 4>;
     using ComputeT = Scalar;
 
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(std::uint32_t lane) {
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(uint32_t lane) {
         lane_ = lane;
     }
 
@@ -51,8 +49,8 @@ struct MmaM16N8K16 {
         const FragmentAT &lhs,
         const FragmentBT &rhs,
         const FragmentCT &accumulator) const {
-        const auto *a = reinterpret_cast<const std::uint32_t *>(&lhs);
-        const auto *b = reinterpret_cast<const std::uint32_t *>(&rhs);
+        const auto *a = reinterpret_cast<const uint32_t *>(&lhs);
+        const auto *b = reinterpret_cast<const uint32_t *>(&rhs);
         const auto *c = reinterpret_cast<const Accumulator *>(&accumulator);
         auto *d = reinterpret_cast<Accumulator *>(&destination);
         if constexpr (std::is_same_v<Scalar, __half>) {
@@ -79,29 +77,29 @@ struct MmaM16N8K16 {
         fragment.fill(value);
     }
 
-    template <std::uint32_t VectorBits = 3>
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE std::uint32_t swizzle(
-        std::uint32_t address) const {
-        constexpr std::uint32_t column_mask = 7U << VectorBits;
+    template <uint32_t VectorBits = 3>
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t swizzle(
+        uint32_t address) const {
+        constexpr uint32_t column_mask = 7U << VectorBits;
         return ((address >> VectorBits) & column_mask) ^ address;
     }
 
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE std::uint32_t swizzle(
-        std::uint32_t, std::uint32_t column) const {
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t swizzle(
+        uint32_t, uint32_t column) const {
         return swizzle(column);
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
         FragmentAT &fragment,
         Scalar *base,
-        std::uint32_t row,
-        std::uint32_t column,
-        std::uint32_t stride) const {
-        auto *registers = reinterpret_cast<std::uint32_t *>(&fragment);
+        uint32_t row,
+        uint32_t column,
+        uint32_t stride) const {
+        auto *registers = reinterpret_cast<uint32_t *>(&fragment);
         auto offset = (row + lane_ % 16) * stride + column + lane_ / 16 * 8;
         if constexpr (UseSwizzle) offset = swizzle(offset);
         const auto address =
-            static_cast<std::uint32_t>(__cvta_generic_to_shared(base + offset));
+            static_cast<uint32_t>(__cvta_generic_to_shared(base + offset));
         asm volatile(
             "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
             : "=r"(registers[0]), "=r"(registers[1]),
@@ -112,9 +110,9 @@ struct MmaM16N8K16 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
         FragmentBT &fragment,
         Scalar *base,
-        std::uint32_t row,
-        std::uint32_t column,
-        std::uint32_t stride) const {
+        uint32_t row,
+        uint32_t column,
+        uint32_t stride) const {
         const auto y = column + lane_ % 4 * 2;
         const auto x = row + lane_ / 4;
         auto offset0 = x * stride + y;
@@ -130,7 +128,7 @@ struct MmaM16N8K16 {
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer, std::uint32_t stride, const FragmentCT &fragment) const {
+        Scalar *pointer, uint32_t stride, const FragmentCT &fragment) const {
         const auto y = lane_ / 4;
         const auto x = lane_ % 4 * 2;
         using Pair = core::Vector<Scalar, 2>;
@@ -141,7 +139,7 @@ struct MmaM16N8K16 {
     }
 
 private:
-    std::uint32_t lane_ = 0;
+    uint32_t lane_ = 0;
 };
 
 template <typename Scalar, typename Accumulator, bool UseSwizzle = true>
