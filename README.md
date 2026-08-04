@@ -98,24 +98,21 @@ exception instead of silently selecting another config.
 
 ## Python accuracy and performance test
 
-Run the accuracy suite and compare PeakGemm directly with `torch.mm` using
-`torch.profiler` CUDA activity:
+Run the parameterized accuracy suite:
 
 ```bash
-python3 tests/torch/test_hgemm_sm80.py
+pytest -s tests/torch/test_hgemm_sm80.py -k acc
 ```
 
-Select a shape, dtype, or export a Chrome trace:
+Run the interleaved PeakGemm/PyTorch benchmark:
 
 ```bash
-python3 tests/torch/test_hgemm_sm80.py \
-    --m 8192 --n 8192 --k 8192 --dtype bf16 \
-    --iterations 20 --trace hgemm_trace.json
+pytest -s tests/torch/test_hgemm_sm80.py -k benchmark
 ```
 
-The profile alternates PeakGemm and native PyTorch launches in one profiler
-session, then reports average CUDA latency, TFLOPS, and their performance
-ratio.
+The benchmark rotates through approximately 8 GiB of inputs, alternates
+PeakGemm and native PyTorch launches, and prints CUDA activity collected by
+`torch.profiler`.
 
 ## C++ tests and benchmarks
 

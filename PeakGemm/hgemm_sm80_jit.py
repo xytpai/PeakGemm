@@ -40,6 +40,45 @@ class Compiler:
             raise TypeError("params must be ConstexprParams")
         self.constexpr_params = params
 
+    def get_valid(self) -> bool:
+        p = self.constexpr_params
+        values = (
+            p.block_m,
+            p.block_n,
+            p.block_k,
+            p.block_m_warps,
+            p.block_n_warps,
+            p.stages,
+            p.swizzle_m,
+        )
+        if any(value <= 0 or value > 0xFFFFFFFF for value in values) or p.stages < 2:
+            return False
+        block_threads = p.block_m_warps * p.block_n_warps * 32
+        warp_m = p.block_m_warps * 16
+        warp_n = p.block_n_warps * 8
+        if p.block_m % warp_m != 0 or p.block_n % warp_n != 0:
+            return False
+        vector_threads = block_threads * 8
+        shared_bytes = 2 * max(
+            p.stages * (p.block_m + p.block_n) * p.block_k,
+            p.block_m * p.block_n,
+        )
+        return (
+            block_threads <= 1024
+            and 1 <= p.block_m // warp_m <= 4
+            and 1 <= p.block_n // warp_n <= 4
+            and p.block_k % 16 == 0
+            and all(
+                elements >= vector_threads and elements % vector_threads == 0
+                for elements in (
+                    p.block_m * p.block_k,
+                    p.block_n * p.block_k,
+                    p.block_m * p.block_n,
+                )
+            )
+            and shared_bytes <= 48 * 1024
+        )
+
     def get_ext_name(self, cache_dir: Path) -> str:
         key = (
             _SOURCE_VERSION,
@@ -146,6 +185,8 @@ TORCH_LIBRARY({ext_name}, module) {{
         cache_dir: str,
         verbose: bool = False,
     ) -> Callable:
+        if not self.get_valid():
+            raise ValueError(f"invalid constexpr params: {self.constexpr_params}")
         cache_path = Path(cache_dir).expanduser().resolve()
         ext_name = self.get_ext_name(cache_path)
         cached = _RUNNERS.get(ext_name)

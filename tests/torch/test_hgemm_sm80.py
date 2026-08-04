@@ -1,25 +1,33 @@
-import argparse
 import functools
 import math
+from dataclasses import dataclass
 
+import pytest
 import torch
-from torch.profiler import ProfilerActivity, profile, record_function
+from torch.profiler import ProfilerActivity, profile
 
 import PeakGemm
 
 
-ACCURACY_SHAPES = (
-    (16, 64, 256),
-    (256, 256, 1024),
-    (512, 512, 2048),
-)
-BASE_TOLERANCE = {
-    torch.float16: 2.0e-3,
-    torch.bfloat16: 2.0e-2,
-}
-SMALL_PARAMS = PeakGemm.ConstexprParams(16, 64, 64, 1, 2, 2, 8)
-LARGE_PARAMS = PeakGemm.ConstexprParams(128, 128, 32, 2, 4, 3, 8)
+ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 CACHE_DIR = "temp"
+
+
+@dataclass
+class _TestArgs:
+    dtype: torch.dtype
+    m: int
+    n: int
+    k: int
+    BLOCK_M: int
+    BLOCK_N: int
+    BLOCK_K: int
+    BLOCK_M_WARPS: int
+    BLOCK_N_WARPS: int
+    STAGES: int
+    SWIZZLE_M: int
+    SPLIT_K: int
+    HAS_BIAS: bool
 
 
 @functools.lru_cache(maxsize=None)
@@ -27,155 +35,222 @@ def get_hgemm(params):
     return PeakGemm.compile_hgemm(params, CACHE_DIR)
 
 
-def get_hgemm_for_shape(m):
-    return (
-        (get_hgemm(SMALL_PARAMS), 4)
-        if m <= 256
-        else (get_hgemm(LARGE_PARAMS), 1)
+def get_params(args: _TestArgs):
+    return PeakGemm.ConstexprParams(
+        args.BLOCK_M,
+        args.BLOCK_N,
+        args.BLOCK_K,
+        args.BLOCK_M_WARPS,
+        args.BLOCK_N_WARPS,
+        args.STAGES,
+        args.SWIZZLE_M,
     )
 
 
-def make_inputs(m, n, k, dtype, device):
-    a = torch.empty((m, k), dtype=dtype, device=device).uniform_(-1.0, 1.0)
-    b = torch.empty((n, k), dtype=dtype, device=device).uniform_(-1.0, 1.0)
-    return a, b
+def create_inputs(args: _TestArgs):
+    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+    a.uniform_(-1, 1)
+    b.uniform_(-1, 1)
+    if args.HAS_BIAS:
+        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+        bias.uniform_(10, 20)
+    else:
+        bias = None
+    return a, b, bias
+
+
+def create_outputs(args: _TestArgs):
+    return (torch.randn((args.m, args.n), dtype=args.dtype, device="cuda"),)
+
+
+def ref_func(a, b, bias, c):
+    if bias is None:
+        torch.mm(a, b.t(), out=c)
+    else:
+        torch.addmm(bias, a, b.t(), out=c)
+
+
+def func(a, b, bias, c, args: _TestArgs):
+    get_hgemm(get_params(args))(c, a, b, args.SPLIT_K, bias)
+
+
+def tensor_nbytes(tensors):
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+
+def get_rotary_inputs(sample_inputs, sample_outputs):
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    return max(1, ROTARY_INPUTS_TARGET_BYTES // slot_bytes)
 
 
 @torch.inference_mode()
-def check_accuracy(device):
-    torch.manual_seed(2026)
-    print("accuracy")
-    for dtype in (torch.float16, torch.bfloat16):
-        for m, n, k in ACCURACY_SHAPES:
-            a, b = make_inputs(m, n, k, dtype, device)
-            hgemm, split_k = get_hgemm_for_shape(m)
-            for has_bias in (False, True):
-                bias = (
-                    torch.randn((n,), dtype=dtype, device=device)
-                    if has_bias
-                    else None
-                )
-                actual = torch.empty((m, n), dtype=dtype, device=device)
-                hgemm(
-                    actual, a, b, split_k=split_k, bias=bias)
-                torch.cuda.synchronize(device)
-                expected = torch.mm(a, b.T)
-                if bias is not None:
-                    expected += bias
-                torch.cuda.synchronize(device)
-                max_diff = (
-                    actual.float() - expected.float()
-                ).abs().max().item()
-                tolerance = BASE_TOLERANCE[dtype] * math.sqrt(k)
-                if max_diff > tolerance:
-                    raise AssertionError(
-                        f"{dtype} {m}x{n}x{k} bias={has_bias}: "
-                        f"max_diff={max_diff:.6g}, "
-                        f"tolerance={tolerance:.6g}")
-                print(
-                    f"  {str(dtype).removeprefix('torch.'):8s} "
-                    f"{m:5d} {n:5d} {k:5d}  bias={has_bias}  "
-                    f"max_diff={max_diff:.6g}  "
-                    f"tolerance={tolerance:.6g}")
+def check_acc(args: _TestArgs):
+    inputs = create_inputs(args)
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+    maxdiff_out = []
+    tolerance = {
+        torch.float16: 2e-3,
+        torch.bfloat16: 2e-2,
+    }[args.dtype] * math.sqrt(args.k)
 
-
-def device_time_us(event):
-    value = getattr(event, "device_time_total", 0.0)
-    if value == 0.0:
-        value = getattr(event, "cuda_time_total", 0.0)
-    return float(value)
-
-
-@torch.inference_mode()
-def profile_performance(m, n, k, dtype, device, warmup, iterations, trace):
-    a, b = make_inputs(m, n, k, dtype, device)
-    peak_output = torch.empty((m, n), dtype=dtype, device=device)
-    native_output = torch.empty_like(peak_output)
-    hgemm, split_k = get_hgemm_for_shape(m)
-
-    def peak_gemm():
-        hgemm(peak_output, a, b, split_k=split_k)
-
-    def native_gemm():
-        torch.mm(a, b.T, out=native_output)
-
-    for _ in range(warmup):
-        peak_gemm()
-        native_gemm()
-    torch.cuda.synchronize(device)
-
-    with profile(
-        activities=(ProfilerActivity.CPU, ProfilerActivity.CUDA),
-        record_shapes=False,
-        profile_memory=False,
-    ) as profiler:
-        for iteration in range(iterations):
-            calls = (
-                (("peak_gemm", peak_gemm), ("torch_native", native_gemm))
-                if iteration % 2 == 0
-                else (("torch_native", native_gemm), ("peak_gemm", peak_gemm))
+    for _ in range(5):
+        func(*(inputs + outputs + (args,)))
+        ref_func(*(inputs + ref_outputs))
+        for output, ref_output in zip(outputs, ref_outputs):
+            maxdiff = (output.float() - ref_output.float()).abs().max().item()
+            maxdiff_out.append(maxdiff)
+            print(maxdiff, flush=True)
+            torch.testing.assert_close(
+                output,
+                ref_output,
+                atol=tolerance,
+                rtol=tolerance,
+                check_dtype=True,
             )
-            for label, operation in calls:
-                with record_function(label):
-                    operation()
-        torch.cuda.synchronize(device)
-
-    events = {event.key: event for event in profiler.key_averages()}
-    peak_us = device_time_us(events["peak_gemm"]) / iterations
-    native_us = device_time_us(events["torch_native"]) / iterations
-    if peak_us <= 0.0 or native_us <= 0.0:
-        raise RuntimeError("torch.profiler did not record CUDA time")
-
-    operations = 2.0 * m * n * k
-    peak_tflops = operations / (peak_us * 1.0e6)
-    native_tflops = operations / (native_us * 1.0e6)
-    print("\nperformance (torch.profiler CUDA time)")
-    print(f"  shape:  {m} x {n} x {k}")
-    print(f"  dtype:  {str(dtype).removeprefix('torch.')}")
-    print(f"  peak:   {peak_us / 1000.0:.6f} ms  {peak_tflops:.3f} TFLOPS")
-    print(f"  native: {native_us / 1000.0:.6f} ms  {native_tflops:.3f} TFLOPS")
-    print(f"  ratio:  {native_us / peak_us:.4f}x")
-
-    if trace:
-        profiler.export_chrome_trace(trace)
-        print(f"  trace:  {trace}")
+    print(f"\n{args}\nmaxdiff_out:{maxdiff_out}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Check PeakGemm accuracy and profile it against torch.mm")
-    parser.add_argument("--m", type=int, default=8192)
-    parser.add_argument("--n", type=int, default=8192)
-    parser.add_argument("--k", type=int, default=8192)
-    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="bf16")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--trace", help="optional Chrome trace output path")
-    parser.add_argument("--skip-accuracy", action="store_true")
-    parser.add_argument("--skip-profile", action="store_true")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device(args.device)
-    major, minor = torch.cuda.get_device_capability(device)
-    if major < 8:
-        raise RuntimeError("SM80 or newer GPU is required")
+@torch.inference_mode()
+def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
+    sample_inputs = create_inputs(args)
+    sample_outputs = create_outputs(args)
+    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs)
+    inputs = [sample_inputs] + [create_inputs(args) for _ in range(rotary_inputs - 1)]
+    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    outputs = [sample_outputs] + [
+        create_outputs(args) for _ in range(rotary_inputs - 1)
+    ]
+    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
     print(
-        f"device: {torch.cuda.get_device_name(device)} "
-        f"(sm{major}{minor})")
-    dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
-    if not args.skip_accuracy:
-        check_accuracy(device)
-    if not args.skip_profile:
-        profile_performance(
-            args.m, args.n, args.k, dtype, device,
-            args.warmup, args.iterations, args.trace)
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
+    )
+
+    def run_ref(idx):
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+
+    def run_peak_gemm(idx):
+        func(*(inputs[idx] + outputs[idx] + (args,)))
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        idx = i % rotary_inputs
+        if i % 2 == 0:
+            run_ref(idx)
+            run_peak_gemm(idx)
+        else:
+            run_peak_gemm(idx)
+            run_ref(idx)
+        torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for i in range(warmup, niters):
+            idx = i % rotary_inputs
+            if i % 2 == 0:
+                run_ref(idx)
+                run_peak_gemm(idx)
+            else:
+                run_peak_gemm(idx)
+                run_ref(idx)
+            torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "m, n, k, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, STAGES, SWIZZLE_M, SPLIT_K, HAS_BIAS",
+    [
+        (16, 64, 256, 16, 64, 64, 1, 2, 2, 8, 1, False),
+        (16, 64, 256, 16, 64, 64, 1, 2, 2, 8, 1, True),
+        (16, 64, 256, 16, 64, 64, 1, 2, 2, 8, 4, False),
+        (16, 64, 256, 16, 64, 64, 1, 2, 2, 8, 4, True),
+        (256, 256, 1024, 16, 64, 64, 1, 2, 2, 8, 4, False),
+        (256, 256, 1024, 16, 64, 64, 1, 2, 2, 8, 4, True),
+        (512, 512, 2048, 128, 128, 32, 2, 4, 3, 8, 1, False),
+        (512, 512, 2048, 128, 128, 32, 2, 4, 3, 8, 1, True),
+        (128, 256, 1024, 32, 64, 32, 1, 2, 2, 4, 1, False),
+        (256, 256, 1024, 64, 64, 32, 2, 2, 3, 2, 4, True),
+        (256, 512, 1024, 64, 128, 32, 2, 4, 3, 4, 1, True),
+        (512, 256, 1024, 128, 64, 32, 4, 2, 3, 4, 4, False),
+        (512, 512, 1024, 128, 128, 16, 2, 4, 4, 1, 1, False),
+        (64, 512, 1024, 16, 128, 64, 1, 4, 2, 8, 4, True),
+    ],
+)
+def test_hgemm_acc(
+    dtype,
+    m,
+    n,
+    k,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    BLOCK_M_WARPS,
+    BLOCK_N_WARPS,
+    STAGES,
+    SWIZZLE_M,
+    SPLIT_K,
+    HAS_BIAS,
+):
+    check_acc(
+        _TestArgs(
+            dtype,
+            m,
+            n,
+            k,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            BLOCK_M_WARPS,
+            BLOCK_N_WARPS,
+            STAGES,
+            SWIZZLE_M,
+            SPLIT_K,
+            HAS_BIAS,
+        )
+    )
+
+
+# =========================================== benchmark ===========================================
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "m, n, k, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, STAGES, SWIZZLE_M, SPLIT_K, HAS_BIAS",
+    [
+        (8192, 8192, 8192, 128, 128, 32, 2, 4, 3, 8, 1, True),
+    ],
+)
+def test_hgemm_benchmark(
+    dtype,
+    m,
+    n,
+    k,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    BLOCK_M_WARPS,
+    BLOCK_N_WARPS,
+    STAGES,
+    SWIZZLE_M,
+    SPLIT_K,
+    HAS_BIAS,
+):
+    benchmark(
+        _TestArgs(
+            dtype,
+            m,
+            n,
+            k,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            BLOCK_M_WARPS,
+            BLOCK_N_WARPS,
+            STAGES,
+            SWIZZLE_M,
+            SPLIT_K,
+            HAS_BIAS,
+        )
+    )
