@@ -17,19 +17,21 @@ BASE_TOLERANCE = {
     torch.float16: 2.0e-3,
     torch.bfloat16: 2.0e-2,
 }
-SMALL_CONFIG = PeakGemm.HgemmConfig(
-    16, 64, 64, 1, 2, 2, split_k=4)
-LARGE_CONFIG = PeakGemm.HgemmConfig(
-    128, 128, 32, 2, 4, 3, split_k=1)
+SMALL_PARAMS = PeakGemm.ConstexprParams(16, 64, 64, 1, 2, 2)
+LARGE_PARAMS = PeakGemm.ConstexprParams(128, 128, 32, 2, 4, 3)
 
 
 @functools.lru_cache(maxsize=None)
-def get_hgemm(config):
-    return PeakGemm.compile_hgemm(config)
+def get_hgemm(params):
+    return PeakGemm.compile_hgemm(params)
 
 
 def get_hgemm_for_shape(m):
-    return get_hgemm(SMALL_CONFIG if m <= 256 else LARGE_CONFIG)
+    return (
+        (get_hgemm(SMALL_PARAMS), 4)
+        if m <= 256
+        else (get_hgemm(LARGE_PARAMS), 1)
+    )
 
 
 def make_inputs(m, n, k, dtype, device):
@@ -45,21 +47,35 @@ def check_accuracy(device):
     for dtype in (torch.float16, torch.bfloat16):
         for m, n, k in ACCURACY_SHAPES:
             a, b = make_inputs(m, n, k, dtype, device)
-            actual = torch.empty((m, n), dtype=dtype, device=device)
-            get_hgemm_for_shape(m)(actual, a, b)
-            torch.cuda.synchronize(device)
-            expected = torch.mm(a, b.T)
-            torch.cuda.synchronize(device)
-            max_diff = (actual.float() - expected.float()).abs().max().item()
-            tolerance = BASE_TOLERANCE[dtype] * math.sqrt(k)
-            if max_diff > tolerance:
-                raise AssertionError(
-                    f"{dtype} {m}x{n}x{k}: max_diff={max_diff:.6g}, "
+            hgemm, split_k = get_hgemm_for_shape(m)
+            for has_bias in (False, True):
+                bias = (
+                    torch.randn((n,), dtype=dtype, device=device)
+                    if has_bias
+                    else None
+                )
+                actual = torch.empty((m, n), dtype=dtype, device=device)
+                hgemm(
+                    actual, a, b, split_k=split_k, bias=bias)
+                torch.cuda.synchronize(device)
+                expected = torch.mm(a, b.T)
+                if bias is not None:
+                    expected += bias
+                torch.cuda.synchronize(device)
+                max_diff = (
+                    actual.float() - expected.float()
+                ).abs().max().item()
+                tolerance = BASE_TOLERANCE[dtype] * math.sqrt(k)
+                if max_diff > tolerance:
+                    raise AssertionError(
+                        f"{dtype} {m}x{n}x{k} bias={has_bias}: "
+                        f"max_diff={max_diff:.6g}, "
+                        f"tolerance={tolerance:.6g}")
+                print(
+                    f"  {str(dtype).removeprefix('torch.'):8s} "
+                    f"{m:5d} {n:5d} {k:5d}  bias={has_bias}  "
+                    f"max_diff={max_diff:.6g}  "
                     f"tolerance={tolerance:.6g}")
-            print(
-                f"  {str(dtype).removeprefix('torch.'):8s} "
-                f"{m:5d} {n:5d} {k:5d}  "
-                f"max_diff={max_diff:.6g}  tolerance={tolerance:.6g}")
 
 
 def device_time_us(event):
@@ -74,10 +90,10 @@ def profile_performance(m, n, k, dtype, device, warmup, iterations, trace):
     a, b = make_inputs(m, n, k, dtype, device)
     peak_output = torch.empty((m, n), dtype=dtype, device=device)
     native_output = torch.empty_like(peak_output)
-    hgemm = get_hgemm_for_shape(m)
+    hgemm, split_k = get_hgemm_for_shape(m)
 
     def peak_gemm():
-        hgemm(peak_output, a, b)
+        hgemm(peak_output, a, b, split_k=split_k)
 
     def native_gemm():
         torch.mm(a, b.T, out=native_output)

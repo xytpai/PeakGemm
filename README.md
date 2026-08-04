@@ -52,7 +52,7 @@ same FP16 or BF16 dtype. Flattened A, B, and C element counts must each fit in
 import torch
 import PeakGemm
 
-config = PeakGemm.HgemmConfig(
+params = PeakGemm.ConstexprParams(
     block_m=128,
     block_n=128,
     block_k=32,
@@ -60,54 +60,37 @@ config = PeakGemm.HgemmConfig(
     block_n_warps=4,
     stages=3,
 )
-gemm = PeakGemm.compile_hgemm(
-    config, cache_dir="./.cache/peak_gemm")
+gemm = PeakGemm.compile_hgemm(params)
 
 m = n = k = 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
 
-gemm(c, a, b)
+gemm(c, a, b, split_k=1)
 torch.cuda.synchronize()
 
 reference = a @ b.T
 torch.testing.assert_close(c, reference, atol=1.0, rtol=1e-2)
 ```
 
-The callable keeps split-K workspace per CUDA device and stream. Each call to
-`compile_hgemm` compiles one config into one hash-named extension. Configs can
-also be enumerated and compiled one at a time:
+The callable keeps split-K workspace per CUDA device and stream. One extension
+embeds all four `bias/no-bias × split/non-split` kernel variants. Therefore
+`ConstexprParams` contains only tile parameters; `split_k` and optional `bias`
+are runtime arguments:
 
 ```python
-configs = list(PeakGemm.enumerate_hgemm_configs(
-    block_m=(64, 128),
-    block_n=(128,),
-    block_k=(32,),
-    block_m_warps=(2,),
-    block_n_warps=(4,),
-    stages=(2, 3),
-    swizzle_m=(8,),
-    split_k=(1,),
-))
-
-m, n, k = 256, 256, 1024
-a = torch.randn((m, k), device="cuda", dtype=torch.float16)
-b = torch.randn((n, k), device="cuda", dtype=torch.float16)
-for config in configs:
-    gemm = PeakGemm.compile_hgemm(
-        config, cache_dir="./.cache/peak_gemm", verbose=True)
-    c = torch.empty((m, n), device="cuda", dtype=torch.float16)
-    gemm(c, a, b)
-    # Benchmark this config here before compiling the next one.
+bias = torch.randn((n,), device="cuda", dtype=a.dtype)
+gemm(c, a, b, split_k=4, bias=bias)
 ```
 
-Each config is stored under `<cache_dir>/<config-hash>`. PyTorch reuses it
-when the same config is requested again.
+By default each constexpr parameter set is stored under
+`<current-directory>/temp/<constexpr-hash>`. Pass `cache_dir=...` to override
+the root directory. PyTorch reuses it when requested again.
 
 ## Shape constraints
 
-For a selected config, M and N must be divisible by `block_m` and `block_n`.
+For selected constexpr parameters, M and N must be divisible by `block_m` and `block_n`.
 K must be divisible by `split_k * block_k`, and each split must contain enough
 K tiles to fill the configured pipeline. Unsupported shapes raise an
 exception instead of silently selecting another config.

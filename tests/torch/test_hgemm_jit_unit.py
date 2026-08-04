@@ -17,9 +17,9 @@ except ModuleNotFoundError:
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
     / "PeakGemm"
-    / "hgemm_jit.py"
+    / "hgemm_sm80_jit.py"
 )
-SPEC = importlib.util.spec_from_file_location("peakgemm_jit_test", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location("hgemm_sm80_jit_test", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 JIT = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = JIT
@@ -27,57 +27,52 @@ SPEC.loader.exec_module(JIT)
 
 
 class HgemmJitTest(unittest.TestCase):
-    def test_enumerates_the_cartesian_product(self):
-        configs = list(
-            JIT.enumerate_hgemm_configs(
-                block_m=(16, 32),
-                block_n=(64,),
-                block_k=(32,),
-                block_m_warps=(1,),
-                block_n_warps=(2,),
-                stages=(2,),
-                split_k=(1, 4),
-            )
-        )
+    def test_constexpr_params_only_contains_tile_parameters(self):
+        params = JIT.ConstexprParams(16, 64, 32, 1, 2, 2)
 
-        self.assertEqual(len(configs), 4)
+        self.assertNotIn("has_bias", params.__dict__)
+        self.assertNotIn("is_split_k", params.__dict__)
 
-    def test_rejects_invalid_scalar_values(self):
+    def test_rejects_invalid_constexpr_values(self):
         with self.assertRaises(ValueError):
-            JIT.HgemmConfig(16, 64, 32, 1, 2, 1)
-        with self.assertRaises(ValueError):
-            JIT.HgemmConfig(16, 64, 32, 1, 2, 2, split_k=65536)
+            JIT.ConstexprParams(16, 64, 32, 1, 2, 1)
 
-    def test_each_config_has_a_distinct_extension(self):
-        first = JIT.HgemmConfig(16, 64, 32, 1, 2, 2, split_k=1)
-        second = JIT.HgemmConfig(16, 64, 32, 1, 2, 2, split_k=4)
+    def test_source_embeds_all_bias_and_split_variants(self):
+        source = JIT.Compiler(
+            JIT.ConstexprParams(16, 64, 32, 1, 2, 2)
+        ).get_source("test_extension")
 
-        self.assertNotEqual(
-            JIT._extension_name(first),
-            JIT._extension_name(second),
-        )
-
-    def test_cache_directories_have_distinct_extensions(self):
-        config = JIT.HgemmConfig(16, 64, 32, 1, 2, 2)
-
-        self.assertNotEqual(
-            JIT._extension_name(config, Path("cache-a")),
-            JIT._extension_name(config, Path("cache-b")),
-        )
-
-    def test_source_contains_only_one_config(self):
-        config = JIT.HgemmConfig(16, 64, 32, 1, 2, 2, split_k=4)
-
-        source = JIT._cuda_source("test_extension", config)
-
-        self.assertIn(
-            "scalar_t, 16, 64, 32, 1, 2, 2, 8, false, true",
-            source,
-        )
-        self.assertIn("peak_gemm::kernel::hgemm_template<", source)
-        self.assertIn("4U", source)
+        for arguments in (
+            "launch<scalar_t, true, true>",
+            "launch<scalar_t, false, true>",
+            "launch<scalar_t, true, false>",
+            "launch<scalar_t, false, false>",
+        ):
+            self.assertIn(arguments, source)
+        self.assertIn("int split_k", source)
+        self.assertIn("Tensor? bias", source)
         self.assertIn("TORCH_LIBRARY(test_extension, module)", source)
-        self.assertNotIn("config_id", source)
+
+    def test_extension_name_depends_on_constexpr_params(self):
+        first = JIT.Compiler(JIT.ConstexprParams(16, 64, 32, 1, 2, 2))
+        second = JIT.Compiler(JIT.ConstexprParams(32, 64, 32, 1, 2, 2))
+
+        self.assertNotEqual(first.get_ext_name(), second.get_ext_name())
+
+    def test_cuda_half_support_is_reenabled(self):
+        for macro in (
+            "__CUDA_NO_HALF_OPERATORS__",
+            "__CUDA_NO_HALF_CONVERSIONS__",
+            "__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "__CUDA_NO_HALF2_OPERATORS__",
+        ):
+            self.assertIn(f"-U{macro}", JIT._EXTRA_CUDA_CFLAGS)
+
+    def test_default_cache_is_current_directory_temp(self):
+        self.assertEqual(
+            JIT._resolve_cache_dir(None),
+            (Path.cwd() / "temp").resolve(),
+        )
 
 
 if __name__ == "__main__":
