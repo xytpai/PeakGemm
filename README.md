@@ -59,8 +59,9 @@ params = PeakGemm.ConstexprParams(
     block_m_warps=2,
     block_n_warps=4,
     stages=3,
+    swizzle_m=8,
 )
-gemm = PeakGemm.compile_hgemm(params)
+gemm = PeakGemm.compile_hgemm(params, cache_dir="./temp")
 
 m = n = k = 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -84,9 +85,9 @@ bias = torch.randn((n,), device="cuda", dtype=a.dtype)
 gemm(c, a, b, split_k=4, bias=bias)
 ```
 
-By default each constexpr parameter set is stored under
-`<current-directory>/temp/<constexpr-hash>`. Pass `cache_dir=...` to override
-the root directory. PyTorch reuses it when requested again.
+`cache_dir` is required and must be supplied by the caller. Each compiled
+extension is stored under `<cache_dir>/<extension-hash>` and reused by PyTorch
+when requested again.
 
 ## Shape constraints
 

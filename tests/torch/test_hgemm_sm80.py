@@ -17,13 +17,14 @@ BASE_TOLERANCE = {
     torch.float16: 2.0e-3,
     torch.bfloat16: 2.0e-2,
 }
-SMALL_PARAMS = PeakGemm.ConstexprParams(16, 64, 64, 1, 2, 2)
-LARGE_PARAMS = PeakGemm.ConstexprParams(128, 128, 32, 2, 4, 3)
+SMALL_PARAMS = PeakGemm.ConstexprParams(16, 64, 64, 1, 2, 2, 8)
+LARGE_PARAMS = PeakGemm.ConstexprParams(128, 128, 32, 2, 4, 3, 8)
+CACHE_DIR = "temp"
 
 
 @functools.lru_cache(maxsize=None)
 def get_hgemm(params):
-    return PeakGemm.compile_hgemm(params)
+    return PeakGemm.compile_hgemm(params, CACHE_DIR)
 
 
 def get_hgemm_for_shape(m):
