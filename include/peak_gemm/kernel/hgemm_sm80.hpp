@@ -346,17 +346,13 @@ void hgemm_template(
         throw std::invalid_argument("CUDA HGEMM dimensions must be positive");
     }
     constexpr uint64_t MAX_FLAT_INDEX = std::numeric_limits<uint32_t>::max();
-    if (static_cast<uint64_t>(m) * k > MAX_FLAT_INDEX ||
-        static_cast<uint64_t>(n) * k > MAX_FLAT_INDEX ||
-        static_cast<uint64_t>(m) * n > MAX_FLAT_INDEX) {
+    if (static_cast<uint64_t>(m) * k > MAX_FLAT_INDEX || static_cast<uint64_t>(n) * k > MAX_FLAT_INDEX || static_cast<uint64_t>(m) * n > MAX_FLAT_INDEX) {
         throw std::invalid_argument("CUDA HGEMM flattened tensor indices exceed uint32");
     }
     if (a == nullptr || b == nullptr || c == nullptr) {
         throw std::invalid_argument("CUDA HGEMM tensor pointers must not be null");
     }
-    if (reinterpret_cast<uintptr_t>(a) % 16U != 0U ||
-        reinterpret_cast<uintptr_t>(b) % 16U != 0U ||
-        reinterpret_cast<uintptr_t>(c) % 16U != 0U) {
+    if (reinterpret_cast<uintptr_t>(a) % 16U != 0U || reinterpret_cast<uintptr_t>(b) % 16U != 0U || reinterpret_cast<uintptr_t>(c) % 16U != 0U) {
         throw std::invalid_argument("CUDA HGEMM tensors must be 16-byte aligned");
     }
     if (split_k == 0 || split_k > 65535U) {

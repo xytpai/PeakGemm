@@ -27,6 +27,7 @@ Install the Python package from the repository root:
 
 ```bash
 python3 -m pip install -v -e . --no-build-isolation
+# -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 No CUDA extension is built during installation. `compile_hgemm` invokes
