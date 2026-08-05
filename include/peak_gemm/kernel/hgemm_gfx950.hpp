@@ -73,6 +73,7 @@ public:
         LDG_X_THREADS = BLOCK_K / VEC_SIZE,
         NUM_A_LOADS = BLOCK_M * BLOCK_K / BLOCK_THREADS / VEC_SIZE,
         NUM_B_LOADS = BLOCK_N * BLOCK_K / BLOCK_THREADS / VEC_SIZE,
+        SWIZZLE_CACHE_SIZE = NUM_A_LOADS > NUM_B_LOADS ? NUM_A_LOADS : NUM_B_LOADS,
         COPY_INSTRUCTIONS = NUM_A_LOADS + NUM_B_LOADS,
         BLOCK_DMA_STRIDE = BLOCK_THREADS * 16,
         STG_X_THREADS = BLOCK_N / VEC_SIZE,
@@ -100,6 +101,13 @@ public:
         const uint32_t shared_b_address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&shared_b_[0][0]));
         shared_a_address_ = __builtin_amdgcn_readfirstlane(shared_a_address + warp_ * WARP_SIZE * 16);
         shared_b_address_ = __builtin_amdgcn_readfirstlane(shared_b_address + warp_ * WARP_SIZE * 16);
+#pragma unroll
+        for (uint32_t i = 0; i < SWIZZLE_CACHE_SIZE; ++i) {
+            const uint32_t global_thread = BLOCK_THREADS * i + thread_;
+            const uint32_t row = global_thread / LDG_X_THREADS;
+            const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
+            swizzle_cache_[i] = swizzle_(row, column);
+        }
     }
 
     PEAKGEMM_DEVICE_INLINE void init(uint32_t partition, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m_size, uint32_t n_size) {
@@ -147,8 +155,7 @@ public:
         for (uint32_t i = 0; i < NUM_A_LOADS; ++i) {
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
             const uint32_t row = global_thread / LDG_X_THREADS;
-            const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
-            const uint32_t source_offset = a_begin + row * a_stride + swizzle_(row, column);
+            const uint32_t source_offset = a_begin + row * a_stride + swizzle_cache_[i];
             raw_buffer_load_lds(a_resource, (SharedPointer) static_cast<uintptr_t>(shared_a_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
@@ -156,8 +163,7 @@ public:
         for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
             const uint32_t row = global_thread / LDG_X_THREADS;
-            const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
-            const uint32_t source_offset = b_begin + row * b_stride + swizzle_(row, column);
+            const uint32_t source_offset = b_begin + row * b_stride + swizzle_cache_[i];
             raw_buffer_load_lds(b_resource, (SharedPointer) static_cast<uintptr_t>(shared_b_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
@@ -274,6 +280,7 @@ private:
     uint32_t shared_a_address_;
     uint32_t shared_b_address_;
     const swizzle_t &swizzle_;
+    uint32_t swizzle_cache_[SWIZZLE_CACHE_SIZE];
     uint32_t *semaphore_;
     uint32_t *signal_;
     scalar_t *c_;

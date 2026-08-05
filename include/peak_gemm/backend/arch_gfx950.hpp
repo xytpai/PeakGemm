@@ -12,15 +12,6 @@ using floatx4_t = float __attribute__((__vector_size__(4 * sizeof(float))));
 using fp16x8_t = __fp16 __attribute__((__vector_size__(8 * sizeof(__fp16))));
 using bf16x8_t = __bf16 __attribute__((__vector_size__(8 * sizeof(__bf16))));
 
-PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE floatx4_t mfma_bf16_m16n16k32(
-    bf16x8_t &lhs, bf16x8_t &rhs, floatx4_t &accumulator) {
-    asm volatile(
-        "v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0"
-        : "+a"(accumulator)
-        : "v"(lhs), "v"(rhs));
-    return accumulator;
-}
-
 template <typename Scalar, uint32_t KBlocks16>
 struct Gfx950Swizzle {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t row, uint32_t column) const {
@@ -65,11 +56,11 @@ struct MfmaM16N16K32 {
                     *reinterpret_cast<const fp16x8_t *>(b),
                     *reinterpret_cast<const floatx4_t *>(c), 0, 0, 0);
         } else {
-            auto lhs_vector = *reinterpret_cast<const bf16x8_t *>(a);
-            auto rhs_vector = *reinterpret_cast<const bf16x8_t *>(b);
-            auto accumulator_vector = *reinterpret_cast<const floatx4_t *>(c);
             *reinterpret_cast<floatx4_t *>(d) =
-                mfma_bf16_m16n16k32(lhs_vector, rhs_vector, accumulator_vector);
+                __builtin_amdgcn_mfma_f32_16x16x32_bf16(
+                    *reinterpret_cast<const bf16x8_t *>(a),
+                    *reinterpret_cast<const bf16x8_t *>(b),
+                    *reinterpret_cast<const floatx4_t *>(c), 0, 0, 0);
         }
     }
 
