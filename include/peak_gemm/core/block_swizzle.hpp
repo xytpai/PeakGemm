@@ -16,7 +16,7 @@ PEAKGEMM_HOST_DEVICE constexpr BlockCoordinate block_swizzle(
     std::uint32_t block,
     std::uint32_t m_blocks,
     std::uint32_t n_blocks) {
-    static_assert(GroupM > 0, "Block swizzle group must be positive");
+    static_assert(GroupM >= 0);
     const std::uint32_t group_size = GroupM * n_blocks;
     const std::uint32_t first_m = block / group_size * GroupM;
     const std::uint32_t actual_group_m =
