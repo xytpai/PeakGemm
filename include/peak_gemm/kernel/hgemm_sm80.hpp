@@ -280,7 +280,7 @@ template <
     uint32_t SWIZZLE_M,
     bool HAS_BIAS,
     bool IS_SPLIT_K>
-__global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void hgemm_kernel(
+__global__ __launch_bounds__(BLOCK_M_WARPS * BLOCK_N_WARPS * Warp::size, 2) void hgemm_kernel(
     scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size, uint32_t split_k,
     uint32_t *semaphore, uint32_t *signal, const scalar_t *bias) {
     using BlockTile =

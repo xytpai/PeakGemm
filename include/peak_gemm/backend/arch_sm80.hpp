@@ -56,7 +56,9 @@ struct IdentitySwizzle {
 template <typename Scalar, typename Accumulator>
 struct MmaM16N8K16 {
     static constexpr uint32_t m = 16, n = 8, k = 16;
-    enum : uint32_t { M = m, N = n, K = k };
+    enum : uint32_t { M = m,
+                      N = n,
+                      K = k };
     using FragmentAT = core::Vector<Scalar, 8>;
     using FragmentBT = core::Vector<Scalar, 4>;
     using FragmentCT = core::Vector<Accumulator, 4>;
