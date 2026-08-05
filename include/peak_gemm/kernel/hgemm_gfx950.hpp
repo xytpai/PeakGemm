@@ -52,8 +52,8 @@ PEAKGEMM_DEVICE_INLINE void wait_and_barrier() {
 
 } // namespace gfx950_detail
 
-template <typename scalar_t, typename wmma_t, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS, uint32_t WARP_N_STEPS,
-          bool HAS_BIAS, bool IS_SPLIT_K>
+template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS,
+          uint32_t WARP_N_STEPS, bool HAS_BIAS, bool IS_SPLIT_K>
 class HgemmBlockTile {
 public:
     using FragmentAT = typename wmma_t::FragmentAT;
@@ -94,8 +94,9 @@ public:
     static_assert(STG_X_THREADS >= 1 && BLOCK_N % VEC_SIZE == 0);
     static_assert(STG_ITERS >= 1 && BLOCK_M * BLOCK_N % (BLOCK_THREADS * VEC_SIZE) == 0);
 
-    PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(uint32_t thread, uint32_t *semaphore, uint32_t *signal, scalar_t *c, const scalar_t *bias) :
-        thread_(thread), warp_(thread >> WARP_SHIFT), lane_(thread & WARP_MASK), semaphore_(semaphore), signal_(signal), c_(c), bias_(bias) {
+    PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(
+        uint32_t thread, const swizzle_t &swizzle, uint32_t *semaphore, uint32_t *signal, scalar_t *c, const scalar_t *bias) :
+        thread_(thread), warp_(thread >> WARP_SHIFT), lane_(thread & WARP_MASK), swizzle_(swizzle), semaphore_(semaphore), signal_(signal), c_(c), bias_(bias) {
     }
 
     PEAKGEMM_DEVICE_INLINE void init(uint32_t partition, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m_size, uint32_t n_size) {
@@ -151,7 +152,7 @@ public:
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
             const uint32_t row = global_thread / LDG_X_THREADS;
             const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
-            const uint32_t source_offset = a_begin + row * a_stride + wmma_.swizzle(row, column);
+            const uint32_t source_offset = a_begin + row * a_stride + swizzle_(row, column);
             gfx950_detail::raw_buffer_load_lds(a_resource,
                                                (gfx950_detail::SharedPointer) static_cast<uintptr_t>(shared_a_wave + i * BLOCK_DMA_STRIDE), 16,
                                                source_offset * sizeof(scalar_t), 0, 0, 0);
@@ -161,7 +162,7 @@ public:
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
             const uint32_t row = global_thread / LDG_X_THREADS;
             const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
-            const uint32_t source_offset = b_begin + row * b_stride + wmma_.swizzle(row, column);
+            const uint32_t source_offset = b_begin + row * b_stride + swizzle_(row, column);
             gfx950_detail::raw_buffer_load_lds(b_resource,
                                                (gfx950_detail::SharedPointer) static_cast<uintptr_t>(shared_b_wave + i * BLOCK_DMA_STRIDE), 16,
                                                source_offset * sizeof(scalar_t), 0, 0, 0);
@@ -183,12 +184,12 @@ public:
             FragmentBT fragment_b[WARP_N_STEPS];
 #pragma unroll
             for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
-                wmma_.load_matrix_b(fragment_b[n], shared_b, warp_n + n * WARP_ATOM_N, column, BLOCK_K);
+                wmma_.load_matrix_b(fragment_b[n], shared_b, warp_n + n * WARP_ATOM_N, column, BLOCK_K, swizzle_);
             }
             gfx950_detail::schedule_barrier();
 #pragma unroll
             for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
-                wmma_.load_matrix_a(fragment_a[m], shared_a, warp_m + m * WARP_ATOM_M, column, BLOCK_K);
+                wmma_.load_matrix_a(fragment_a[m], shared_a, warp_m + m * WARP_ATOM_M, column, BLOCK_K, swizzle_);
             }
             gfx950_detail::schedule_barrier();
 #pragma unroll
@@ -279,6 +280,7 @@ private:
     uint32_t shared_a_;
     uint32_t shared_b_;
     wmma_t wmma_;
+    const swizzle_t &swizzle_;
     uint32_t *semaphore_;
     uint32_t *signal_;
     scalar_t *c_;
@@ -305,13 +307,14 @@ PEAKGEMM_DEVICE_INLINE void run_epilogue_stages(block_tile_t &block_tile, shared
     }
 }
 
-template <typename scalar_t, typename wmma_t, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS, uint32_t WARP_N_STEPS,
-          uint32_t STAGES, uint32_t SWIZZLE_M, bool HAS_BIAS, bool IS_SPLIT_K>
+template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS,
+          uint32_t WARP_N_STEPS, uint32_t STAGES, uint32_t SWIZZLE_M, bool HAS_BIAS, bool IS_SPLIT_K>
 __attribute__((amdgpu_waves_per_eu(2, 2),
                amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE))) __global__
 void hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size, uint32_t split_k, uint32_t *semaphore,
                    uint32_t *signal, const scalar_t *bias) {
-    using BlockTile = HgemmBlockTile<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, HAS_BIAS, IS_SPLIT_K>;
+    using BlockTile =
+        HgemmBlockTile<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, HAS_BIAS, IS_SPLIT_K>;
     constexpr uint32_t BLOCK_M = BlockTile::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTile::BLOCK_N;
     constexpr uint32_t COPY_INSTRUCTIONS = BlockTile::COPY_INSTRUCTIONS;
@@ -328,7 +331,8 @@ void hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_
     uint32_t b_begin = block_n_idx * BLOCK_N * k_size + begin_k;
     const uint32_t a_end = a_begin + partition_k;
     __shared__ HgemmSharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> shared;
-    BlockTile block_tile(threadIdx.x, semaphore, signal, c, bias);
+    const swizzle_t swizzle;
+    BlockTile block_tile(threadIdx.x, swizzle, semaphore, signal, c, bias);
 
     block_tile.init(partition, block_m_idx, block_n_idx, m_size, n_size);
     block_tile.init_copy(&shared.a[0][0], &shared.b[0][0]);
@@ -360,8 +364,9 @@ template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_
           uint32_t SWIZZLE_M, bool HAS_BIAS, bool IS_SPLIT_K>
 void hgemm_template(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t split_k, uint32_t *semaphore,
                     uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
-    using wmma_t = backend::WmmaDefault<scalar_t, float, true, BLOCK_K * sizeof(scalar_t) / 16>;
     constexpr uint32_t K_BLOCKS_16 = BLOCK_K * sizeof(scalar_t) / 16;
+    using wmma_t = backend::WmmaDefault<scalar_t, float>;
+    using swizzle_t = backend::Gfx950Swizzle<scalar_t, K_BLOCKS_16>;
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);
     static_assert(K_BLOCKS_16 > 0 && (K_BLOCKS_16 & (K_BLOCKS_16 - 1)) == 0,
                   "ROCm HGEMM BLOCK_K bytes must be a power-of-two multiple of 16");
@@ -427,7 +432,7 @@ void hgemm_template(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t 
         }
     }
     const dim3 grid(m_blocks * n_blocks, split_k);
-    hgemm_kernel<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, HAS_BIAS, IS_SPLIT_K>
+    hgemm_kernel<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, HAS_BIAS, IS_SPLIT_K>
         <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, split_k, semaphore, signal, bias);
 }
 

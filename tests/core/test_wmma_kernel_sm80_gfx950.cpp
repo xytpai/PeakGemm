@@ -14,7 +14,13 @@ __global__ void wmma_kernel(
     uint32_t m_size,
     uint32_t n_size,
     uint32_t k_size) {
-    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float, false>;
+#if defined(__CUDACC__)
+    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
+    using SwizzleT = peak_gemm::backend::IdentitySwizzle;
+#else
+    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
+    using SwizzleT = peak_gemm::backend::Gfx950IdentitySwizzle;
+#endif
     __shared__ scalar_t tile_a[WmmaT::M * WmmaT::K];
     __shared__ scalar_t tile_b[WmmaT::N * WmmaT::K];
     __shared__ scalar_t tile_c[WmmaT::M * WmmaT::N];
@@ -26,6 +32,7 @@ __global__ void wmma_kernel(
     typename WmmaT::FragmentCT fragment_c;
     wmma.init(threadIdx.x);
     wmma.reset_fragment_c(fragment_c);
+    const SwizzleT swizzle;
 
     for (uint32_t tile_k = 0; tile_k < k_size; tile_k += WmmaT::K) {
         for (uint32_t i = threadIdx.x; i < WmmaT::M * WmmaT::K; i += blockDim.x) {
@@ -39,8 +46,8 @@ __global__ void wmma_kernel(
             tile_b[i] = n < n_size && k < k_size ? b[n * k_size + k] : scalar_t(0.0F);
         }
         __syncthreads();
-        wmma.load_matrix_a(fragment_a, tile_a, 0, 0, WmmaT::K);
-        wmma.load_matrix_b(fragment_b, tile_b, 0, 0, WmmaT::K);
+        wmma.load_matrix_a(fragment_a, tile_a, 0, 0, WmmaT::K, swizzle);
+        wmma.load_matrix_b(fragment_b, tile_b, 0, 0, WmmaT::K, swizzle);
         wmma(fragment_c, fragment_a, fragment_b, fragment_c);
         __syncthreads();
     }
@@ -63,7 +70,7 @@ void wmma_gpu(
     uint32_t n_size,
     uint32_t k_size,
     gpuStream_t stream = nullptr) {
-    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float, false>;
+    using WmmaT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
     using Warp = peak_gemm::backend::Warp;
     dim3 grid(
         (n_size + WmmaT::N - 1) / WmmaT::N,

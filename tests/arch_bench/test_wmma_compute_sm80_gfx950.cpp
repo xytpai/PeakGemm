@@ -43,8 +43,14 @@ __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
     WMMAT wmma;
     wmma.init(w_tid);
     wmma.reset_fragment_c(c_frag);
-    wmma.load_matrix_a(a_frag, as_, 0, 0, WK);
-    wmma.load_matrix_b(b_frag, bs_, 0, 0, WK);
+#if defined(__CUDACC__)
+    using SwizzleT = peak_gemm::backend::IdentitySwizzle;
+#else
+    using SwizzleT = peak_gemm::backend::Gfx950IdentitySwizzle;
+#endif
+    const SwizzleT swizzle;
+    wmma.load_matrix_a(a_frag, as_, 0, 0, WK, swizzle);
+    wmma.load_matrix_b(b_frag, bs_, 0, 0, WK, swizzle);
     for (int i = 0; i < LOOP; ++i) {
         wmma(c_frag, a_frag, b_frag, c_frag);
     }
@@ -147,7 +153,7 @@ float wmma_test() {
 
 template <typename scalar_t>
 void run_type() {
-    using WMMAT = peak_gemm::backend::WmmaDefault<scalar_t, float, false>;
+    using WMMAT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
     constexpr int warp_size = peak_gemm::backend::Warp::size;
     constexpr int accuracy_loop = 1;
     constexpr int accuracy_blocks = 4;

@@ -21,11 +21,20 @@ PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE floatx4_t mfma_bf16_m16n16k32(
     return accumulator;
 }
 
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle = true,
-    uint32_t KBlocks16 = 0>
+template <typename Scalar, uint32_t KBlocks16>
+struct Gfx950Swizzle {
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t row, uint32_t column) const {
+        return (column * sizeof(Scalar) ^ row % KBlocks16 * 16) / sizeof(Scalar);
+    }
+};
+
+struct Gfx950IdentitySwizzle {
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
+        return column;
+    }
+};
+
+template <typename Scalar, typename Accumulator>
 struct MfmaM16N16K32 {
     static constexpr uint32_t m = 16, n = 16, k = 32;
     enum : uint32_t { M = m,
@@ -69,35 +78,32 @@ struct MfmaM16N16K32 {
         fragment.fill(value);
     }
 
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t swizzle(
-        uint32_t row, uint32_t column) const {
-        return (column * sizeof(Scalar) ^ row % KBlocks16 * 16) / sizeof(Scalar);
-    }
-
-    template <typename Fragment>
+    template <typename Fragment, typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix(
         Fragment &fragment,
         Scalar *base,
         uint32_t row,
         uint32_t column,
-        uint32_t stride) const {
+        uint32_t stride,
+        const Swizzle &swizzle) const {
         const auto target_row = row + lane_ % 16;
-        auto target_column = column + lane_ / 16 * 8;
-        if constexpr (UseSwizzle) target_column = swizzle(target_row, target_column);
+        const auto target_column = swizzle(target_row, column + lane_ / 16 * 8);
         fragment = *reinterpret_cast<Fragment *>(
             base + target_row * stride + target_column);
     }
 
+    template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
         FragmentAT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride) const {
-        load_matrix(fragment, base, row, column, stride);
+        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, row, column, stride, swizzle);
     }
 
+    template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
         FragmentBT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride) const {
-        load_matrix(fragment, base, row, column, stride);
+        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, row, column, stride, swizzle);
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
@@ -115,12 +121,7 @@ private:
     uint32_t lane_ = 0;
 };
 
-template <
-    typename Scalar,
-    typename Accumulator,
-    bool UseSwizzle = true,
-    uint32_t KBlocks16 = 0>
-using WmmaDefault =
-    MfmaM16N16K32<Scalar, Accumulator, UseSwizzle, KBlocks16>;
+template <typename Scalar, typename Accumulator>
+using WmmaDefault = MfmaM16N16K32<Scalar, Accumulator>;
 
 } // namespace peak_gemm::backend
