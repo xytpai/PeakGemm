@@ -1,52 +1,88 @@
 # PeakGemm
 
-PeakGemm is a small, header-first GPU GEMM library focused on kernel
-experimentation and peak throughput.
+PeakGemm is a compact, header-first GPU GEMM library for studying low-level
+kernel design and approaching hardware peak throughput on NVIDIA CUDA and AMD
+ROCm.
 
-The current optimized path is an SM80-style Tensor Core HGEMM kernel for
-NVIDIA GPUs. It supports FP16 and BF16 inputs, FP32 accumulation, optional
-kernel-side bias, asynchronous global-to-shared copies, split-K for small M,
-and grouped block swizzling for L2 reuse. The PyTorch API currently launches
-the kernel through a JIT-compiled extension without bias.
+It currently provides:
 
-## Requirements
+- FP16 and BF16 inputs with FP32 accumulation.
+- Optional fused bias: `C = A @ B.T + bias`.
+- Pipelined global-to-shared copies, shared-memory swizzling, and split-K.
+- An SM80-style Tensor Core path for NVIDIA GPUs.
+- Standard and hand-scheduled HTI MFMA paths for AMD GFX950, including AGPR
+  accumulation.
+- Standalone C++ tests/benchmarks and a CUDA-only PyTorch JIT API.
 
-- Linux
-- Python 3.10+
-- A CUDA-enabled PyTorch installation
-- CUDA Toolkit with `nvcc`
-- NVIDIA GPU with SM80 or newer Tensor Core instructions
+## Supported targets
 
-The PyTorch binding is currently CUDA-only. HIP backend primitives and the
-GFX950 architecture layer are present, but the optimized GFX950 HGEMM entry
-point is not implemented yet.
+| Target | Compiler | Optimized HGEMM | C++ | PyTorch JIT |
+| --- | --- | --- | :---: | :---: |
+| NVIDIA SM80-compatible | `nvcc` | `hgemm_sm80.hpp` | Yes | Yes |
+| AMD GFX950 | `hipcc` | `hgemm_gfx950.hpp`, `hgemm_hti_gfx950.hpp` | Yes | No |
 
-## Install
+The SM80 path is tested on an RTX 4090 (SM89). Backend and architecture
+selection are compile-time: PeakGemm does not contain a runtime device
+dispatcher or central kernel registry.
 
-Install the Python package from the repository root:
+## HGEMM performance
+
+An `8192 x 8192 x 8192` snapshot:
+
+| GPU | Kernel | Type | No bias | Bias |
+| --- | --- | --- | ---: | ---: |
+| NVIDIA RTX 4090 | SM80 | FP16 | 163.6 TFLOPS | 164.0 TFLOPS |
+| NVIDIA RTX 4090 | SM80 | BF16 | 164.9 TFLOPS | 165.8 TFLOPS |
+| AMD Instinct MI355X | GFX950 HTI | FP16 | 1528.7 TFLOPS | 1510.5 TFLOPS |
+| AMD Instinct MI355X | GFX950 HTI | BF16 | 1609.2 TFLOPS | 1590.8 TFLOPS |
+
+These results were measured on 2026-08-05 with the C++ GEMM benchmarks. Each
+case first passed an accuracy check, then ran 10 warmups and 8 measurements of
+20 iterations; the reported value is the median and uses
+`TFLOPS = 2 * M * N * K / time`. Results are single-system measurements rather
+than vendor specifications.
+
+## Build and test
+
+Requirements:
+
+- Linux.
+- A C++20-capable `nvcc` or `hipcc`.
+- A CUDA toolkit for the SM80 path, or ROCm for the GFX950 path.
+- Python, PyTorch, and Ninja only when using the Python JIT API.
+
+Run the complete C++ suite:
+
+```bash
+bash test_all.sh cuda
+bash test_all.sh rocm
+```
+
+Build and run one benchmark:
+
+```bash
+# RTX 4090
+ARCH=sm_89 bash build_single.sh tests/gemm/test_hgemm_sm80.cpp
+./a.out
+
+# MI355X
+BACKEND=rocm bash build_single.sh \
+  tests/gemm/test_hgemm_gfx950.cpp --offload-arch=gfx950
+./a.out
+```
+
+With no backend argument, `build_single.sh` selects `nvcc` first and otherwise
+falls back to `hipcc`. There is no CMake build.
+
+## PyTorch JIT API
+
+The Python package currently exposes the CUDA SM80 path. Installation only
+installs Python code; `compile_hgemm` builds and caches the requested extension
+on first use.
 
 ```bash
 python3 -m pip install -v -e . --no-build-isolation
-# -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
-
-No CUDA extension is built during installation. `compile_hgemm` invokes
-PyTorch's JIT extension builder for the requested config. For
-cross-compilation, set
-`PEAKGEMM_CUDA_ARCH_LIST` explicitly, for example `8.9+PTX` for an RTX 4090
-binary with a forward-compatible PTX fallback.
-
-## PyTorch API
-
-The callable returned by `compile_hgemm` computes:
-
-```text
-C[M, N] = A[M, K] @ B[N, K].T
-```
-
-Inputs and output must be contiguous, 16-byte-aligned CUDA tensors with the
-same FP16 or BF16 dtype. Flattened A, B, and C element counts must each fit in
-`uint32`. The output tensor is supplied by the caller and updated in place.
 
 ```python
 import torch
@@ -66,90 +102,140 @@ gemm = PeakGemm.compile_hgemm(params, cache_dir="./temp")
 m = n = k = 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
-c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+bias = torch.randn((n,), device="cuda", dtype=a.dtype)
+c = torch.empty((m, n), device="cuda", dtype=a.dtype)
 
-gemm(c, a, b, split_k=1)
+gemm(c, a, b, split_k=1, bias=bias)
 torch.cuda.synchronize()
 
-reference = a @ b.T
-torch.testing.assert_close(c, reference, atol=1.0, rtol=1e-2)
+torch.testing.assert_close(c, a @ b.T + bias, atol=1.0, rtol=1e-2)
 ```
 
-The callable keeps split-K workspace per CUDA device and stream. One extension
-embeds all four `bias/no-bias × split/non-split` kernel variants. Therefore
-`ConstexprParams` contains only tile parameters; `split_k` and optional `bias`
-are runtime arguments:
+`A`, `B`, `C`, and optional bias must be contiguous, on the same CUDA device,
+and use the same FP16 or BF16 dtype. `C` is updated in place. The selected tile
+configuration determines the M/N/K divisibility constraints; unsupported
+shapes raise an exception. For JIT cross-compilation, use PyTorch's
+`TORCH_CUDA_ARCH_LIST`, for example `TORCH_CUDA_ARCH_LIST=8.9`.
 
-```python
-bias = torch.randn((n,), device="cuda", dtype=a.dtype)
-gemm(c, a, b, split_k=4, bias=bias)
-```
-
-`cache_dir` is required and must be supplied by the caller. Each compiled
-extension is stored under `<cache_dir>/<extension-hash>` and reused by PyTorch
-when requested again.
-
-## Shape constraints
-
-For selected constexpr parameters, M and N must be divisible by `block_m` and `block_n`.
-K must be divisible by `split_k * block_k`, and each split must contain enough
-K tiles to fill the configured pipeline. Unsupported shapes raise an
-exception instead of silently selecting another config.
-
-## Python accuracy and performance test
-
-Run the parameterized accuracy suite:
+Run the Python accuracy and profiler benchmarks with:
 
 ```bash
 pytest -s tests/torch/test_hgemm_sm80.py -k acc
-```
-
-Run the interleaved PeakGemm/PyTorch benchmark:
-
-```bash
 pytest -s tests/torch/test_hgemm_sm80.py -k benchmark
 ```
 
-The benchmark rotates through approximately 8 GiB of inputs, alternates
-PeakGemm and native PyTorch launches, and prints CUDA activity collected by
-`torch.profiler`.
+## Architecture
 
-## C++ tests and benchmarks
+PeakGemm deliberately separates portable runtime support, ISA primitives, and
+GEMM scheduling:
 
-Compile and run one test:
-
-```bash
-bash build_single.sh tests/gemm/test_hgemm_sm80.cpp
-./a.out
+```text
+core/*                       backend-neutral layouts, vectors, and math
+backend/runtime.hpp          CUDA/HIP runtime, warp, atomics, events, streams
+backend/arch_<target>.hpp    target ISA primitives, swizzles, WMMA/MFMA
+kernel/hgemm_<target>.hpp    target-specific GEMM pipeline and launchers
+tests or Python JIT          explicitly include and instantiate one target
 ```
 
-For a specific CUDA architecture:
+`runtime.hpp` selects CUDA or HIP through `__CUDACC__` / `__HIPCC__`. It is the
+shared layer for non-GEMM code that only needs allocation, copies, streams,
+events, warp operations, or atomics. It does **not** contain SM80/GFX950 tensor
+instructions.
 
-```bash
-ARCH=sm_89 bash build_single.sh tests/gemm/test_hgemm_sm80.cpp
-./a.out
+Architecture primitives are added separately in `arch_*.hpp`. GEMM
+implementations are then appended one target at a time as
+`kernel/hgemm_<target>.hpp`, with a matching benchmark. Callers explicitly
+include the required pair; for example:
+
+```cpp
+#include "peak_gemm/backend/arch_sm80.hpp"
+#include "peak_gemm/kernel/hgemm_sm80.hpp"
 ```
 
-Run the complete CUDA test suite:
+The umbrella header `peak_gemm.hpp` intentionally includes core utilities,
+`runtime.hpp`, and `data.hpp`, but not architecture or GEMM headers.
 
-```bash
-bash test_all.sh cuda
-```
+### Adding a new target
 
-The GEMM benchmarks perform an accuracy check before timing, followed by
-warmup and repeated measurements. They report median latency and TFLOPS for
-each shape.
+1. **Reuse or extend the runtime.** A new CUDA or HIP architecture normally
+   needs no `runtime.hpp` change. A new GPU vendor must add a compiler branch,
+   warp/atomic implementations, runtime API mappings, and a compiler case in
+   `build_single.sh`.
+2. **Add ISA primitives.** Create `backend/arch_<target>.hpp` with the target
+   swizzle/copy primitives and a WMMA/MFMA type exposing `M`, `N`, `K`,
+   fragment types, load/store methods, accumulation, and `WmmaDefault`.
+3. **Append the GEMM implementation.** Create
+   `kernel/hgemm_<target>.hpp`; bind the new `WmmaDefault` and swizzle, then
+   implement its block tile, pipeline, epilogue, validation, and host launcher.
+4. **Add coverage.** Add target-specific WMMA tests/benchmarks when the ISA
+   changes, plus `tests/gemm/test_hgemm_<target>.cpp`. `test_all.sh` picks up
+   new C++ test files automatically.
+5. **Expose Python only if needed.** Add a target JIT module and export it from
+   `PeakGemm/__init__.py`; the current JIT source is intentionally SM80-only.
+
+For a second schedule on an existing target, follow the GFX950 pattern:
+keep the shared ISA layer in `arch_gfx950.hpp` and add a separate kernel such
+as `hgemm_hti_gfx950.hpp`.
 
 ## Repository layout
 
+The complete tracked source tree is:
+
 ```text
-include/peak_gemm/
-  backend/          CUDA/HIP runtime and architecture primitives
-  core/             vectors, layouts, shapes, math, and block swizzling
-  kernel/           naive GEMM and architecture-specific HGEMM kernels
-PeakGemm/           Python JIT API
-tests/              core, bandwidth, compute, and GEMM tests
+PeakGemm/
+├── include/peak_gemm/
+│   ├── peak_gemm.hpp                 umbrella: core + runtime + Data
+│   ├── data.hpp                      host/device RAII buffer and copies
+│   ├── gemm_bench_infra.hpp          accuracy, timing, and TFLOPS harness
+│   ├── backend/
+│   │   ├── runtime.hpp               shared CUDA/HIP runtime abstraction
+│   │   ├── arch_sm80.hpp             cp.async, swizzle, m16n8k16 MMA
+│   │   └── arch_gfx950.hpp           swizzle, m16n16k16/k32 MFMA, AGPR
+│   ├── core/
+│   │   ├── config.hpp                compile macros and basic enums
+│   │   ├── block_swizzle.hpp         grouped GEMM grid traversal
+│   │   ├── layout.hpp                compile-time strided layouts
+│   │   ├── math.hpp                  ceil_div and compile-time Log2
+│   │   ├── shape.hpp                 static shape metadata
+│   │   └── vector.hpp                aligned vector load/store wrapper
+│   └── kernel/
+│       ├── gemm_naive.hpp            portable reference GPU GEMM
+│       ├── hgemm_sm80.hpp            CUDA HGEMM, bias, split-K
+│       ├── hgemm_gfx950.hpp          ROCm HGEMM, bias, split-K
+│       └── hgemm_hti_gfx950.hpp      hand-scheduled GFX950 HTI HGEMM
+├── PeakGemm/
+│   ├── __init__.py                   public Python exports
+│   └── hgemm_sm80_jit.py             PyTorch CUDA source generation/cache
+├── tests/
+│   ├── core/
+│   │   ├── test_atomic.cpp           scalar and packed GPU atomics
+│   │   ├── test_core.cpp             shape/layout/vector/math units
+│   │   ├── test_data.cpp             allocation, copy, and validation
+│   │   ├── test_reduce_kernel.cpp    warp shuffle reduction
+│   │   └── test_wmma_kernel_sm80_gfx950.cpp  WMMA/MFMA correctness
+│   ├── arch_bench/
+│   │   ├── test_fma_compute.cpp      FP32 FMA throughput
+│   │   ├── test_global_bandwidth.cpp vectorized copy bandwidth
+│   │   └── test_wmma_compute_sm80_gfx950.cpp WMMA/MFMA peak throughput
+│   ├── gemm/
+│   │   ├── test_gemm_naive.cpp       reference GEMM accuracy/performance
+│   │   ├── test_hgemm_sm80.cpp       SM80 HGEMM dispatch and benchmark
+│   │   └── test_hgemm_gfx950.cpp     GFX950 standard/HTI dispatch
+│   └── torch/
+│       └── test_hgemm_sm80.py        JIT accuracy and profiler benchmark
+├── build_single.sh                   compile one C++ source with nvcc/hipcc
+├── test_all.sh                       build and run every C++ test
+├── format.sh                         clang-format all C/C++ sources
+├── setup.py                          Python package metadata/dependencies
+├── pyproject.toml                    Python build-system metadata
+├── .clang-format                     C/C++ formatting rules
+├── .gitignore                        generated-file exclusions
+├── LICENSE
+└── README.md
 ```
+
+Generated binaries, JIT caches, Python caches, and profiler output are not part
+of the source tree.
 
 ## License
 
