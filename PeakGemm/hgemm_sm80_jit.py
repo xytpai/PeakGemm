@@ -68,6 +68,8 @@ class Compiler:
             and 1 <= p.block_m // warp_m <= 4
             and 1 <= p.block_n // warp_n <= 4
             and p.block_k % 16 == 0
+            and block_threads % (p.block_k // 8) == 0
+            and block_threads % (p.block_n // 8) == 0
             and all(
                 elements >= vector_threads and elements % vector_threads == 0
                 for elements in (

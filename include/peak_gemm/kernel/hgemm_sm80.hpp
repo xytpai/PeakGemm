@@ -25,6 +25,7 @@ template <
     uint32_t BLOCK_N_WARPS,
     uint32_t WARP_M_STEPS,
     uint32_t WARP_N_STEPS,
+    uint32_t STAGES,
     bool HAS_BIAS,
     bool IS_SPLIT_K>
 class HgemmBlockTile {
@@ -55,17 +56,23 @@ public:
     };
 
     using vec_t = core::Vector<scalar_t, VEC_SIZE>;
+    using SharedA = scalar_t[STAGES][BLOCK_M * BLOCK_K];
+    using SharedB = scalar_t[STAGES][BLOCK_N * BLOCK_K];
 
     static_assert(NUM_A_LOADS >= 1 && NUM_B_LOADS >= 1);
     static_assert(VEC_SIZE * BLOCK_THREADS * NUM_A_LOADS == BLOCK_M * BLOCK_K);
     static_assert(VEC_SIZE * BLOCK_THREADS * NUM_B_LOADS == BLOCK_N * BLOCK_K);
     static_assert(LDG_X_THREADS >= 1 && BLOCK_K % VEC_SIZE == 0);
+    static_assert(BLOCK_THREADS % LDG_X_THREADS == 0);
     static_assert(WARP_K_STEPS >= 1 && BLOCK_K % WARP_ATOM_K == 0);
     static_assert(STG_X_THREADS >= 1 && BLOCK_N % VEC_SIZE == 0);
+    static_assert(IS_SPLIT_K || BLOCK_THREADS % STG_X_THREADS == 0);
     static_assert(STG_ITERS >= 1 && BLOCK_M * BLOCK_N % (BLOCK_THREADS * VEC_SIZE) == 0);
 
-    PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(uint32_t thread, uint32_t *semaphore, uint32_t *signal, scalar_t *c, const scalar_t *bias) :
-        thread_(thread), warp_(thread >> WARP_SHIFT), lane_(thread & WARP_MASK), semaphore_(semaphore), signal_(signal), c_(c), bias_(bias) {
+    PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(
+        uint32_t thread, SharedA &shared_a, SharedB &shared_b, uint32_t *semaphore, uint32_t *signal, scalar_t *c, const scalar_t *bias) :
+        thread_(thread), warp_(thread >> WARP_SHIFT), lane_(thread & WARP_MASK), shared_a_(shared_a), shared_b_(shared_b), semaphore_(semaphore), signal_(signal),
+        c_(c), bias_(bias) {
     }
 
     PEAKGEMM_DEVICE_INLINE void init(uint32_t partition, uint32_t block_m_idx, uint32_t block_n_idx, uint32_t m_size, uint32_t n_size) {
@@ -105,22 +112,21 @@ public:
         }
     }
 
-    PEAKGEMM_DEVICE_INLINE void copy_async(scalar_t *shared_a, scalar_t *shared_b, const scalar_t *a, uint32_t stride_a, const scalar_t *b, uint32_t stride_b) {
+    PEAKGEMM_DEVICE_INLINE void copy_async(uint32_t stage, const scalar_t *a, uint32_t stride_a, const scalar_t *b, uint32_t stride_b) {
+        const uint32_t x_vector = thread_ % LDG_X_THREADS;
 #pragma unroll
         for (uint32_t i = 0; i < NUM_A_LOADS; ++i) {
             const uint32_t thread = BLOCK_THREADS * i + thread_;
-            const uint32_t x_vector = thread % LDG_X_THREADS;
             const uint32_t shared_offset = wmma_.swizzle(thread * VEC_SIZE);
             const auto *source = a + thread / LDG_X_THREADS * stride_a + x_vector * VEC_SIZE;
-            backend::AsyncCopy::copy(reinterpret_cast<vec_t *>(shared_a + shared_offset), reinterpret_cast<const vec_t *>(source));
+            backend::AsyncCopy::copy(reinterpret_cast<vec_t *>(shared_a_[stage] + shared_offset), reinterpret_cast<const vec_t *>(source));
         }
 #pragma unroll
         for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
             const uint32_t thread = BLOCK_THREADS * i + thread_;
-            const uint32_t x_vector = thread % LDG_X_THREADS;
             const uint32_t shared_offset = wmma_.swizzle(thread * VEC_SIZE);
             const auto *source = b + thread / LDG_X_THREADS * stride_b + x_vector * VEC_SIZE;
-            backend::AsyncCopy::copy(reinterpret_cast<vec_t *>(shared_b + shared_offset), reinterpret_cast<const vec_t *>(source));
+            backend::AsyncCopy::copy(reinterpret_cast<vec_t *>(shared_b_[stage] + shared_offset), reinterpret_cast<const vec_t *>(source));
         }
     }
 
@@ -133,7 +139,7 @@ public:
         backend::AsyncCopy::commit();
     }
 
-    PEAKGEMM_DEVICE_INLINE void compute(scalar_t *shared_a, scalar_t *shared_b) {
+    PEAKGEMM_DEVICE_INLINE void compute(uint32_t stage) {
         const uint32_t warp_m = warp_ / BLOCK_N_WARPS * WARP_M;
         const uint32_t warp_n = warp_ % BLOCK_N_WARPS * WARP_N;
 #pragma unroll
@@ -143,11 +149,11 @@ public:
             FragmentBT fragment_b[WARP_N_STEPS];
 #pragma unroll
             for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
-                wmma_.load_matrix_b(fragment_b[n], shared_b, warp_n + n * WARP_ATOM_N, column, BLOCK_K);
+                wmma_.load_matrix_b(fragment_b[n], shared_b_[stage], warp_n + n * WARP_ATOM_N, column, BLOCK_K);
             }
 #pragma unroll
             for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
-                wmma_.load_matrix_a(fragment_a[m], shared_a, warp_m + m * WARP_ATOM_M, column, BLOCK_K);
+                wmma_.load_matrix_a(fragment_a[m], shared_a_[stage], warp_m + m * WARP_ATOM_M, column, BLOCK_K);
             }
 #pragma unroll
             for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
@@ -211,18 +217,20 @@ public:
             }
         } else {
             __syncthreads();
+            const uint32_t local_n = thread_ % STG_X_THREADS * VEC_SIZE;
+            const uint32_t global_n = block_n_idx * BLOCK_N + local_n;
+            vec_t bias_value;
+            if constexpr (HAS_BIAS) {
+                bias_value.load(bias_ + global_n);
+            }
 #pragma unroll
             for (uint32_t i = 0; i < STG_ITERS; ++i) {
                 const uint32_t global_thread = BLOCK_THREADS * i + thread_;
                 const uint32_t local_m = global_thread / STG_X_THREADS;
-                const uint32_t local_n = global_thread % STG_X_THREADS * VEC_SIZE;
                 const uint32_t global_m = block_m_idx * BLOCK_M + local_m;
-                const uint32_t global_n = block_n_idx * BLOCK_N + local_n;
                 if (global_m < m_size && global_n < n_size) {
                     auto value = *reinterpret_cast<vec_t *>(&shared_c[local_m * BLOCK_N + local_n]);
-                    if (bias_ != nullptr) {
-                        vec_t bias_value;
-                        bias_value.load(bias_ + global_n);
+                    if constexpr (HAS_BIAS) {
                         value += bias_value;
                     }
                     auto *destination = c_ + global_m * n_size + global_n;
@@ -237,6 +245,8 @@ private:
     uint32_t warp_;
     uint32_t lane_;
     wmma_t wmma_;
+    SharedA &shared_a_;
+    SharedB &shared_b_;
     uint32_t *semaphore_;
     uint32_t *signal_;
     scalar_t *c_;
@@ -268,7 +278,8 @@ template <
 __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void hgemm_kernel(
     scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size, uint32_t split_k,
     uint32_t *semaphore, uint32_t *signal, const scalar_t *bias) {
-    using BlockTile = HgemmBlockTile<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, HAS_BIAS, IS_SPLIT_K>;
+    using BlockTile =
+        HgemmBlockTile<scalar_t, wmma_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, HAS_BIAS, IS_SPLIT_K>;
     constexpr uint32_t BLOCK_M = BlockTile::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTile::BLOCK_N;
     const uint32_t m_blocks = core::ceil_div(m_size, BLOCK_M);
@@ -284,13 +295,13 @@ __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void h
     uint32_t b_begin = block_n_idx * BLOCK_N * k_size + begin_k;
     const uint32_t a_end = a_begin + partition_k;
     __shared__ HgemmSharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> shared;
-    BlockTile block_tile(thread, semaphore, signal, c, bias);
+    BlockTile block_tile(thread, shared.a, shared.b, semaphore, signal, c, bias);
 
     block_tile.init(partition, block_m_idx, block_n_idx, m_size, n_size);
 
 #pragma unroll
     for (uint32_t stage = 0; stage < STAGES - 1; ++stage) {
-        block_tile.copy_async(shared.a[stage], shared.b[stage], a + a_begin + stage * BLOCK_K, k_size, b + b_begin + stage * BLOCK_K, k_size);
+        block_tile.copy_async(stage, a + a_begin + stage * BLOCK_K, k_size, b + b_begin + stage * BLOCK_K, k_size);
         block_tile.commit();
     }
 
@@ -298,11 +309,10 @@ __global__ __launch_bounds__(BLOCK_M_WARPS *BLOCK_N_WARPS *Warp::size, 2) void h
     for (; a_begin < a_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         block_tile.template wait<STAGES - 2>();
         __syncthreads();
-        block_tile.compute(shared.a[current_stage], shared.b[current_stage]);
+        block_tile.compute(current_stage);
         if (a_begin + (STAGES - 1) * BLOCK_K < a_end) {
             const uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-            block_tile.copy_async(shared.a[write_stage], shared.b[write_stage], a + a_begin + (STAGES - 1) * BLOCK_K, k_size,
-                                  b + b_begin + (STAGES - 1) * BLOCK_K, k_size);
+            block_tile.copy_async(write_stage, a + a_begin + (STAGES - 1) * BLOCK_K, k_size, b + b_begin + (STAGES - 1) * BLOCK_K, k_size);
         }
         block_tile.commit();
         current_stage = (current_stage + 1) % STAGES;
