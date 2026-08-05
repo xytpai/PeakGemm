@@ -333,11 +333,11 @@ hgemm_hti_kernel(
     HTI_LDMAT_A(1, 1);
     s_barrier();
     block_tile.template consume<1, 0>();
+    s_barrier();
+    block_tile.template consume<1, 1>();
     wait_barrier<0>();
     block_tile.template store_matrix_to_shared<0, 0>(shared.c);
     block_tile.template store_matrix_to_shared<0, 1>(shared.c);
-    s_barrier();
-    block_tile.template consume<1, 1>();
     wait_barrier<0>();
     block_tile.template store_matrix_from_shared<0, 0>(c, shared.c, bias, block_m_idx, block_n_idx, m_size, n_size);
     block_tile.template store_matrix_from_shared<0, 1>(c, shared.c, bias, block_m_idx, block_n_idx, m_size, n_size);
