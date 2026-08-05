@@ -54,20 +54,18 @@ Requirements:
 Run the complete C++ suite:
 
 ```bash
-bash test_all.sh cuda
-bash test_all.sh rocm
+bash test_all.sh
 ```
 
 Build and run one benchmark:
 
 ```bash
 # RTX 4090
-ARCH=sm_89 bash build_single.sh tests/gemm/test_hgemm_sm80.cpp
+bash build_single.sh tests/gemm/test_hgemm_sm80.cpp
 ./a.out
 
 # MI355X
-BACKEND=rocm bash build_single.sh \
-  tests/gemm/test_hgemm_gfx950.cpp --offload-arch=gfx950
+bash build_single.sh tests/gemm/test_hgemm_gfx950.cpp
 ./a.out
 ```
 
