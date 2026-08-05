@@ -8,12 +8,12 @@
 
 namespace peak_gemm::core {
 
-template <std::uint32_t... Extents>
+template <uint32_t... Extents>
 struct Shape {
     static_assert(sizeof...(Extents) > 0, "A shape must have at least one dimension");
     static_assert(((Extents > 0) && ...), "Shape extents must be positive");
 
-    using extent_type = std::uint32_t;
+    using extent_type = uint32_t;
     using coordinate_type = std::array<extent_type, sizeof...(Extents)>;
 
     static constexpr std::size_t dim = sizeof...(Extents);

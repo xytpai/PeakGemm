@@ -24,17 +24,17 @@ struct HgemmGfx950Launch {
     void operator()(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, const scalar_t *bias) const {
         if (m <= 256) {
             if (bias == nullptr) {
-                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 1, 2, 8, false, true>(
+                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 1, 2, 0, false, true>(
                     a, b, c, m, n, k, 4, semaphore.data(), signal.data(), bias);
             } else {
-                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 1, 2, 8, true, true>(
+                kernel::hgemm_template<scalar_t, 16, 64, 64, 1, 1, 2, 0, true, true>(
                     a, b, c, m, n, k, 4, semaphore.data(), signal.data(), bias);
             }
         } else if (bias == nullptr) {
-            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 8, false, false>(
+            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 0, false, false>(
                 a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
         } else {
-            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 8, true, false>(
+            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 0, true, false>(
                 a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
         }
     }

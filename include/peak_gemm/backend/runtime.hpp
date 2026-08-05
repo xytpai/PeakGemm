@@ -14,7 +14,7 @@
 namespace peak_gemm::backend {
 
 struct Warp {
-    static constexpr std::uint32_t size = 64;
+    static constexpr uint32_t size = 64;
 
     template <typename T>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {
@@ -128,7 +128,7 @@ PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void atomic_pair_add(__hip_bfloat16 *destin
 namespace peak_gemm::backend {
 
 struct Warp {
-    static constexpr std::uint32_t size = 32;
+    static constexpr uint32_t size = 32;
 
     template <typename T>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {
