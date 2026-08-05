@@ -4,6 +4,7 @@
 
 #include "peak_gemm/backend/arch_gfx950.hpp"
 #include "peak_gemm/kernel/hgemm_gfx950.hpp"
+#include "peak_gemm/kernel/hgemm_hti_gfx950.hpp"
 
 using peak_gemm::Data;
 namespace bench = peak_gemm::bench;
@@ -31,11 +32,19 @@ struct HgemmGfx950Launch {
                     a, b, c, m, n, k, 4, semaphore.data(), signal.data(), bias);
             }
         } else if (bias == nullptr) {
-            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 0, false, false>(
-                a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+            if (k % 128 != 0) {
+                kernel::hgemm_template<scalar_t, 256, 256, 64, 4, 4, 2, 0, false, false>(
+                    a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+            } else {
+                kernel::hgemm_hti_template<scalar_t, 256, 256, 64, 2, 4, 0, false>(a, b, c, m, n, k, bias);
+            }
         } else {
-            kernel::hgemm_template<scalar_t, 256, 256, 64, 2, 4, 2, 0, true, false>(
-                a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+            if (k % 128 != 0) {
+                kernel::hgemm_template<scalar_t, 256, 256, 64, 4, 4, 2, 0, true, false>(
+                    a, b, c, m, n, k, 1, semaphore.data(), signal.data(), bias);
+            } else {
+                kernel::hgemm_hti_template<scalar_t, 256, 256, 64, 2, 4, 0, true>(a, b, c, m, n, k, bias);
+            }
         }
     }
 };

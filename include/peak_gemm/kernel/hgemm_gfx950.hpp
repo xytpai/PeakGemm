@@ -88,8 +88,10 @@ public:
     static_assert(VEC_SIZE * BLOCK_THREADS * NUM_A_LOADS == BLOCK_M * BLOCK_K);
     static_assert(VEC_SIZE * BLOCK_THREADS * NUM_B_LOADS == BLOCK_N * BLOCK_K);
     static_assert(LDG_X_THREADS >= 1 && BLOCK_K % VEC_SIZE == 0);
+    static_assert(BLOCK_THREADS % LDG_X_THREADS == 0);
     static_assert(WARP_K_STEPS >= 1 && BLOCK_K % WARP_ATOM_K == 0);
     static_assert(STG_X_THREADS >= 1 && BLOCK_N % VEC_SIZE == 0);
+    static_assert(IS_SPLIT_K || BLOCK_THREADS % STG_X_THREADS == 0);
     static_assert(STG_ITERS >= 1 && BLOCK_M * BLOCK_N % (BLOCK_THREADS * VEC_SIZE) == 0);
 
     PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(
