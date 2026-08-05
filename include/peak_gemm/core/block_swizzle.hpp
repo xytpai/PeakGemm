@@ -1,0 +1,32 @@
+#pragma once
+
+#include <cstdint>
+
+#include "peak_gemm/core/config.hpp"
+
+namespace peak_gemm::core {
+
+struct BlockCoordinate {
+    uint32_t m;
+    uint32_t n;
+};
+
+template <uint32_t GroupM>
+PEAKGEMM_HOST_DEVICE constexpr BlockCoordinate block_swizzle(
+    uint32_t block,
+    uint32_t m_blocks,
+    uint32_t n_blocks) {
+    if constexpr (GroupM == 0) {
+        return {block / n_blocks, block % n_blocks};
+    }
+    const uint32_t group_size = GroupM * n_blocks;
+    const uint32_t first_m = block / group_size * GroupM;
+    const uint32_t actual_group_m =
+        m_blocks - first_m < GroupM ? m_blocks - first_m : GroupM;
+    const uint32_t block_in_group = block % group_size;
+    return {
+        first_m + block_in_group % actual_group_m,
+        block_in_group / actual_group_m};
+}
+
+} // namespace peak_gemm::core
