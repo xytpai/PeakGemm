@@ -12,6 +12,28 @@ using floatx4_t = float __attribute__((__vector_size__(4 * sizeof(float))));
 using fp16x8_t = __fp16 __attribute__((__vector_size__(8 * sizeof(__fp16))));
 using bf16x8_t = __bf16 __attribute__((__vector_size__(8 * sizeof(__bf16))));
 
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE floatx4_t mfma_f32_16x16x32_f16_agpr(
+    fp16x8_t &lhs,
+    fp16x8_t &rhs,
+    floatx4_t &accumulator) {
+    asm volatile(
+        "v_mfma_f32_16x16x32_f16 %0, %1, %2, %0"
+        : "+a"(accumulator)
+        : "v"(lhs), "v"(rhs));
+    return accumulator;
+}
+
+PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE floatx4_t mfma_f32_16x16x32_bf16_agpr(
+    bf16x8_t &lhs,
+    bf16x8_t &rhs,
+    floatx4_t &accumulator) {
+    asm volatile(
+        "v_mfma_f32_16x16x32_bf16 %0, %1, %2, %0"
+        : "+a"(accumulator)
+        : "v"(lhs), "v"(rhs));
+    return accumulator;
+}
+
 template <uint32_t SwizzleBits = 3, uint32_t BaseBits = 3, uint32_t ShiftBits = 3>
 struct Gfx950Swizzle {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
@@ -34,7 +56,7 @@ struct Gfx950IdentitySwizzle {
     }
 };
 
-template <typename Scalar, typename Accumulator>
+template <typename Scalar, typename Accumulator, bool UseAgpr = false>
 struct MfmaM16N16K32 {
     static constexpr uint32_t m = 16, n = 16, k = 32;
     enum : uint32_t { M = m,
@@ -54,17 +76,30 @@ struct MfmaM16N16K32 {
         const FragmentAT &lhs,
         const FragmentBT &rhs,
         const FragmentCT &accumulator) const {
-        const auto *a = reinterpret_cast<const uint32_t *>(&lhs);
-        const auto *b = reinterpret_cast<const uint32_t *>(&rhs);
+        auto *a = reinterpret_cast<uint32_t *>(const_cast<FragmentAT *>(&lhs));
+        auto *b = reinterpret_cast<uint32_t *>(const_cast<FragmentBT *>(&rhs));
         const auto *c = reinterpret_cast<const Accumulator *>(&accumulator);
-        auto *d = reinterpret_cast<Accumulator *>(&destination);
         if constexpr (std::is_same_v<Scalar, __half>) {
-            *reinterpret_cast<floatx4_t *>(d) =
-                __builtin_amdgcn_mfma_f32_16x16x32_f16(
-                    *reinterpret_cast<const fp16x8_t *>(a),
-                    *reinterpret_cast<const fp16x8_t *>(b),
-                    *reinterpret_cast<const floatx4_t *>(c), 0, 0, 0);
+            if constexpr (UseAgpr) {
+                mfma_f32_16x16x32_f16_agpr(
+                    *reinterpret_cast<fp16x8_t *>(a),
+                    *reinterpret_cast<fp16x8_t *>(b),
+                    *reinterpret_cast<floatx4_t *>(const_cast<Accumulator *>(c)));
+            } else {
+                auto *d = reinterpret_cast<Accumulator *>(&destination);
+                *reinterpret_cast<floatx4_t *>(d) =
+                    __builtin_amdgcn_mfma_f32_16x16x32_f16(
+                        *reinterpret_cast<const fp16x8_t *>(a),
+                        *reinterpret_cast<const fp16x8_t *>(b),
+                        *reinterpret_cast<const floatx4_t *>(c), 0, 0, 0);
+            }
+        } else if constexpr (UseAgpr) {
+            mfma_f32_16x16x32_bf16_agpr(
+                *reinterpret_cast<bf16x8_t *>(a),
+                *reinterpret_cast<bf16x8_t *>(b),
+                *reinterpret_cast<floatx4_t *>(const_cast<Accumulator *>(c)));
         } else {
+            auto *d = reinterpret_cast<Accumulator *>(&destination);
             *reinterpret_cast<floatx4_t *>(d) =
                 __builtin_amdgcn_mfma_f32_16x16x32_bf16(
                     *reinterpret_cast<const bf16x8_t *>(a),
@@ -120,7 +155,7 @@ private:
     uint32_t lane_ = 0;
 };
 
-template <typename Scalar, typename Accumulator>
-using WmmaDefault = MfmaM16N16K32<Scalar, Accumulator>;
+template <typename Scalar, typename Accumulator, bool UseAgpr = false>
+using WmmaDefault = MfmaM16N16K32<Scalar, Accumulator, UseAgpr>;
 
 } // namespace peak_gemm::backend
