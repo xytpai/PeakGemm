@@ -104,9 +104,7 @@ public:
 #pragma unroll
         for (uint32_t i = 0; i < SWIZZLE_CACHE_SIZE; ++i) {
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
-            const uint32_t row = global_thread / LDG_X_THREADS;
-            const uint32_t column = global_thread % LDG_X_THREADS * VEC_SIZE;
-            swizzle_cache_[i] = swizzle_(row, column);
+            swizzle_cache_[i] = swizzle_(global_thread * VEC_SIZE);
         }
     }
 
@@ -153,17 +151,17 @@ public:
         const uint32_t shared_b_wave = shared_b_address_ + stage * BLOCK_N * BLOCK_K * sizeof(scalar_t);
 #pragma unroll
         for (uint32_t i = 0; i < NUM_A_LOADS; ++i) {
-            const uint32_t global_thread = BLOCK_THREADS * i + thread_;
-            const uint32_t row = global_thread / LDG_X_THREADS;
-            const uint32_t source_offset = a_begin + row * a_stride + swizzle_cache_[i];
+            const uint32_t row = swizzle_cache_[i] / BLOCK_K;
+            const uint32_t column = swizzle_cache_[i] % BLOCK_K;
+            const uint32_t source_offset = a_begin + row * a_stride + column;
             raw_buffer_load_lds(a_resource, (SharedPointer) static_cast<uintptr_t>(shared_a_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
 #pragma unroll
         for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
-            const uint32_t global_thread = BLOCK_THREADS * i + thread_;
-            const uint32_t row = global_thread / LDG_X_THREADS;
-            const uint32_t source_offset = b_begin + row * b_stride + swizzle_cache_[i];
+            const uint32_t row = swizzle_cache_[i] / BLOCK_K;
+            const uint32_t column = swizzle_cache_[i] % BLOCK_K;
+            const uint32_t source_offset = b_begin + row * b_stride + column;
             raw_buffer_load_lds(b_resource, (SharedPointer) static_cast<uintptr_t>(shared_b_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
@@ -363,12 +361,9 @@ template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_
           uint32_t SWIZZLE_M, bool HAS_BIAS, bool IS_SPLIT_K>
 void hgemm_template(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t split_k, uint32_t *semaphore,
                     uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
-    constexpr uint32_t K_BLOCKS_16 = BLOCK_K * sizeof(scalar_t) / 16;
     using wmma_t = backend::WmmaDefault<scalar_t, float>;
-    using swizzle_t = backend::Gfx950Swizzle<scalar_t, K_BLOCKS_16>;
+    using swizzle_t = backend::Gfx950Swizzle<3, 3, 3>;
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);
-    static_assert(K_BLOCKS_16 > 0 && (K_BLOCKS_16 & (K_BLOCKS_16 - 1)) == 0,
-                  "ROCm HGEMM BLOCK_K bytes must be a power-of-two multiple of 16");
     constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / wmma_t::M;
     constexpr uint32_t WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / wmma_t::N;
     static_assert(STAGES >= 2);

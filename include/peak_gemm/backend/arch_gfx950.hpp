@@ -12,14 +12,23 @@ using floatx4_t = float __attribute__((__vector_size__(4 * sizeof(float))));
 using fp16x8_t = __fp16 __attribute__((__vector_size__(8 * sizeof(__fp16))));
 using bf16x8_t = __bf16 __attribute__((__vector_size__(8 * sizeof(__bf16))));
 
-template <typename Scalar, uint32_t KBlocks16>
+template <uint32_t SwizzleBits = 3, uint32_t BaseBits = 3, uint32_t ShiftBits = 3>
 struct Gfx950Swizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t row, uint32_t column) const {
-        return (column * sizeof(Scalar) ^ row % KBlocks16 * 16) / sizeof(Scalar);
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
+        constexpr uint32_t swizzle_mask = ((1U << SwizzleBits) - 1U) << BaseBits;
+        return ((address >> ShiftBits) & swizzle_mask) ^ address;
+    }
+
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
+        return (*this)(column);
     }
 };
 
 struct Gfx950IdentitySwizzle {
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
+        return address;
+    }
+
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
         return column;
     }
@@ -78,9 +87,8 @@ struct MfmaM16N16K32 {
         uint32_t stride,
         const Swizzle &swizzle) const {
         const auto target_row = row + lane_ % 16;
-        const auto target_column = swizzle(target_row, column + lane_ / 16 * 8);
-        fragment = *reinterpret_cast<Fragment *>(
-            base + target_row * stride + target_column);
+        const auto offset = swizzle(target_row * stride + column + lane_ / 16 * 8);
+        fragment = *reinterpret_cast<Fragment *>(base + offset);
     }
 
     template <typename Swizzle>
