@@ -93,8 +93,8 @@ public:
     static_assert(STG_ITERS >= 1 && BLOCK_M * BLOCK_N % (BLOCK_THREADS * VEC_SIZE) == 0);
 
     PEAKGEMM_DEVICE_INLINE explicit HgemmBlockTile(
-        uint32_t thread, SharedA &shared_a, SharedB &shared_b, const swizzle_t &swizzle, uint32_t *semaphore, uint32_t *signal, scalar_t *c,
-        const scalar_t *bias) :
+        uint32_t thread, uint32_t k_size, SharedA &shared_a, SharedB &shared_b, const swizzle_t &swizzle, uint32_t *semaphore, uint32_t *signal,
+        scalar_t *c, const scalar_t *bias) :
         thread_(thread), warp_(thread >> WARP_SHIFT), lane_(thread & WARP_MASK), shared_a_(shared_a), shared_b_(shared_b), swizzle_(swizzle),
         semaphore_(semaphore), signal_(signal), c_(c), bias_(bias) {
         const uint32_t shared_a_address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&shared_a_[0][0]));
@@ -104,7 +104,10 @@ public:
 #pragma unroll
         for (uint32_t i = 0; i < SWIZZLE_CACHE_SIZE; ++i) {
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
-            swizzle_cache_[i] = swizzle_(global_thread * VEC_SIZE);
+            const uint32_t shared_offset = swizzle_(global_thread * VEC_SIZE);
+            const uint32_t row = shared_offset / BLOCK_K;
+            const uint32_t column = shared_offset % BLOCK_K;
+            swizzle_cache_[i] = row * k_size + column;
         }
     }
 
@@ -145,24 +148,20 @@ public:
         }
     }
 
-    PEAKGEMM_DEVICE_INLINE void copy_async(uint32_t stage, BufferResource &a_resource, uint32_t a_begin, uint32_t a_stride, BufferResource &b_resource,
-                                           uint32_t b_begin, uint32_t b_stride) {
-        const uint32_t shared_a_wave = shared_a_address_ + stage * BLOCK_M * BLOCK_K * sizeof(scalar_t);
+    PEAKGEMM_DEVICE_INLINE void copy_async(
+        uint32_t stage, BufferResource &a_resource, uint32_t a_begin, BufferResource &b_resource, uint32_t b_begin) {
         const uint32_t shared_b_wave = shared_b_address_ + stage * BLOCK_N * BLOCK_K * sizeof(scalar_t);
 #pragma unroll
-        for (uint32_t i = 0; i < NUM_A_LOADS; ++i) {
-            const uint32_t row = swizzle_cache_[i] / BLOCK_K;
-            const uint32_t column = swizzle_cache_[i] % BLOCK_K;
-            const uint32_t source_offset = a_begin + row * a_stride + column;
-            raw_buffer_load_lds(a_resource, (SharedPointer) static_cast<uintptr_t>(shared_a_wave + i * BLOCK_DMA_STRIDE), 16,
+        for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
+            const uint32_t source_offset = b_begin + swizzle_cache_[i];
+            raw_buffer_load_lds(b_resource, (SharedPointer) static_cast<uintptr_t>(shared_b_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
+        const uint32_t shared_a_wave = shared_a_address_ + stage * BLOCK_M * BLOCK_K * sizeof(scalar_t);
 #pragma unroll
-        for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
-            const uint32_t row = swizzle_cache_[i] / BLOCK_K;
-            const uint32_t column = swizzle_cache_[i] % BLOCK_K;
-            const uint32_t source_offset = b_begin + row * b_stride + column;
-            raw_buffer_load_lds(b_resource, (SharedPointer) static_cast<uintptr_t>(shared_b_wave + i * BLOCK_DMA_STRIDE), 16,
+        for (uint32_t i = 0; i < NUM_A_LOADS; ++i) {
+            const uint32_t source_offset = a_begin + swizzle_cache_[i];
+            raw_buffer_load_lds(a_resource, (SharedPointer) static_cast<uintptr_t>(shared_a_wave + i * BLOCK_DMA_STRIDE), 16,
                                 source_offset * sizeof(scalar_t), 0, 0, 0);
         }
     }
@@ -330,7 +329,7 @@ hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size,
     const uint32_t a_end = a_begin + partition_k;
     __shared__ HgemmSharedStorage<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K> shared;
     const swizzle_t swizzle;
-    BlockTile block_tile(threadIdx.x, shared.a, shared.b, swizzle, semaphore, signal, c, bias);
+    BlockTile block_tile(threadIdx.x, k_size, shared.a, shared.b, swizzle, semaphore, signal, c, bias);
 
     block_tile.init(partition, block_m_idx, block_n_idx, m_size, n_size);
     auto a_resource = make_buffer_resource(a);
@@ -338,7 +337,7 @@ hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size,
 
 #pragma unroll
     for (uint32_t stage = 0; stage < STAGES - 1; ++stage) {
-        block_tile.copy_async(stage, a_resource, a_begin + stage * BLOCK_K, k_size, b_resource, b_begin + stage * BLOCK_K, k_size);
+        block_tile.copy_async(stage, a_resource, a_begin + stage * BLOCK_K, b_resource, b_begin + stage * BLOCK_K);
     }
     schedule_barrier();
 
@@ -347,7 +346,7 @@ hgemm_kernel(scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size,
     for (; a_begin < main_end; a_begin += BLOCK_K, b_begin += BLOCK_K) {
         block_tile.template wait<(STAGES - 2) * COPY_INSTRUCTIONS>();
         const uint32_t write_stage = (current_stage + STAGES - 1) % STAGES;
-        block_tile.copy_async(write_stage, a_resource, a_begin + (STAGES - 1) * BLOCK_K, k_size, b_resource, b_begin + (STAGES - 1) * BLOCK_K, k_size);
+        block_tile.copy_async(write_stage, a_resource, a_begin + (STAGES - 1) * BLOCK_K, b_resource, b_begin + (STAGES - 1) * BLOCK_K);
         schedule_barrier();
         block_tile.compute(current_stage);
         current_stage = (current_stage + 1) % STAGES;
