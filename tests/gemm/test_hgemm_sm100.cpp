@@ -29,7 +29,15 @@ struct HgemmSm100Launch {
         uint32_t k,
         const scalar_t *bias) const {
         if (bias == nullptr) {
-            kernel::hgemm_template<scalar_t, false>(
+            kernel::hgemm_template<
+                scalar_t,
+                128,
+                256,
+                64,
+                6,
+                8,
+                false,
+                false>(
                 a,
                 b,
                 c,
@@ -40,7 +48,15 @@ struct HgemmSm100Launch {
                 semaphore.data(),
                 signal.data());
         } else {
-            kernel::hgemm_template<scalar_t, true>(
+            kernel::hgemm_template<
+                scalar_t,
+                128,
+                256,
+                64,
+                6,
+                8,
+                true,
+                false>(
                 a,
                 b,
                 c,

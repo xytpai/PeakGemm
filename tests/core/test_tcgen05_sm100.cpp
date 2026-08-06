@@ -83,7 +83,10 @@ __global__ void tcgen05_smoke_kernel(
             storage.tmem_base,
             descriptor_a,
             descriptor_b,
-            sm100::mma_instruction_descriptor<scalar_t>(),
+            sm100::mma_instruction_descriptor<
+                scalar_t,
+                TileM,
+                TileN>(),
             false);
         sm100::mma_commit_multicast(&storage.mma_barrier, 0x3);
     }

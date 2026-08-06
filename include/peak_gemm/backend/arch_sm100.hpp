@@ -313,11 +313,16 @@ PEAKGEMM_DEVICE_INLINE void tcgen05_fence() {
 #endif
 }
 
-template <typename scalar_t>
+template <
+    typename scalar_t,
+    uint32_t M,
+    uint32_t N>
 PEAKGEMM_DEVICE_INLINE constexpr uint32_t mma_instruction_descriptor() {
+    static_assert(M == 128 || M == 256);
+    static_assert(N >= 16 && N <= 256 && N % 16 == 0);
     constexpr uint32_t input_type =
         std::is_same_v<scalar_t, __bfloat16> ? 1U : 0U;
-    return (1U << 4U) | (input_type << 7U) | (input_type << 10U) | ((256U >> 3U) << 17U) | ((256U >> 4U) << 24U);
+    return (1U << 4U) | (input_type << 7U) | (input_type << 10U) | ((N >> 3U) << 17U) | ((M >> 4U) << 24U);
 }
 
 PEAKGEMM_DEVICE_INLINE void mma_f16_2cta(
