@@ -72,6 +72,22 @@ bash build_single.sh tests/gemm/test_hgemm_gfx950.cpp
 With no backend argument, `build_single.sh` selects `nvcc` first and otherwise
 falls back to `hipcc`. There is no CMake build.
 
+### GFX950 thread trace
+
+After building the GFX950 benchmark, collect an instruction-level Advanced
+Thread Trace (ATT) with:
+
+```bash
+rocprofv3 --att=true \
+  --att-library-path /opt/rocm/lib \
+  -d att_out \
+  -- ./a.out
+```
+
+The `./` prefix is required because the current directory is normally not in
+`PATH`. The generated `att_out` directory contains the raw trace, instruction
+statistics, and `ui_output_agent_*_dispatch_*` data for ROCprof Compute Viewer.
+
 ## PyTorch JIT API
 
 The Python package currently exposes the CUDA SM80 path. Installation only
