@@ -78,10 +78,7 @@ After building the GFX950 benchmark, collect an instruction-level Advanced
 Thread Trace (ATT) with:
 
 ```bash
-rocprofv3 --att=true \
-  --att-library-path /opt/rocm/lib \
-  -d att_out \
-  -- ./a.out
+rocprofv3 --att=true --att-library-path /opt/rocm/lib -d att_out -- ./a.out
 ```
 
 The `./` prefix is required because the current directory is normally not in
