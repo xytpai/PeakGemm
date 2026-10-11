@@ -1,0 +1,157 @@
+// Torch may disable native half operators; the kernels need them.
+#undef __HIP_NO_HALF_OPERATORS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#undef __CUDA_NO_HALF_OPERATORS__
+#undef __CUDA_NO_HALF_CONVERSIONS__
+#undef __CUDA_NO_HALF2_OPERATORS__
+#undef __CUDA_NO_BFLOAT16_CONVERSIONS__
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+
+#include <ATen/ATen.h>
+#include <c10/core/DeviceGuard.h>
+#include <torch/library.h>
+
+#if defined(__HIPCC__)
+#include <c10/hip/HIPStream.h>
+#include "peak_gemm/backend/arch_gfx950.hpp"
+#include "peak_gemm/kernel/hgemm_gfx950.hpp"
+#include "peak_gemm/kernel/hgemm_hti_gfx950.hpp"
+#else
+#include <c10/cuda/CUDAStream.h>
+#include "peak_gemm/backend/arch_sm80.hpp"
+#include "peak_gemm/kernel/hgemm_sm80.hpp"
+#endif
+
+namespace {
+
+#if defined(__HIPCC__)
+constexpr uint32_t N_WARPS_64 = 1, N_WARPS_128 = 2, SWIZZLE_M = 0;
+#else
+constexpr uint32_t N_WARPS_64 = 2, N_WARPS_128 = 4, SWIZZLE_M = 8;
+#endif
+
+struct GemmArgs {
+    const void *a;
+    const void *b;
+    void *c;
+    const void *bias;
+    uint32_t m, n, k, split_k;
+    uint32_t *semaphore;
+    uint32_t *signal;
+    gpuStream_t stream;
+};
+
+template <typename scalar_t, bool HAS_BIAS, bool SPLIT_K>
+void launch(const GemmArgs &args, int64_t config) {
+    const auto *a = static_cast<const scalar_t *>(args.a);
+    const auto *b = static_cast<const scalar_t *>(args.b);
+    auto *c = static_cast<scalar_t *>(args.c);
+    const auto *bias = static_cast<const scalar_t *>(args.bias);
+    using peak_gemm::kernel::hgemm_template;
+
+    // Only these four tile configurations are instantiated at build time.
+    switch (config) {
+    case 0:
+        hgemm_template<scalar_t, 16, 64, 64, 1, N_WARPS_64, 2, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+            a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
+        break;
+    case 1:
+        hgemm_template<scalar_t, 64, 64, 32, 2, N_WARPS_64, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+            a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
+        break;
+    case 2:
+        hgemm_template<scalar_t, 64, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+            a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
+        break;
+    case 3:
+#if defined(__HIPCC__)
+        // Large shapes: HTI with a fixed 2x4 (M, N) wave layout.
+        if constexpr (SPLIT_K) {
+            TORCH_CHECK(false, "PeakGemm HTI config=3 requires split_k=1; use config=0..2 for split-K");
+        } else {
+            peak_gemm::kernel::hgemm_hti_template<scalar_t, 256, 256, 64, 2, 4, 0, HAS_BIAS>(
+                a, b, c, args.m, args.n, args.k, bias, args.stream);
+        }
+#else
+        hgemm_template<scalar_t, 128, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+            a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
+#endif
+        break;
+    }
+}
+
+template <typename scalar_t>
+void dispatch(const GemmArgs &args, int64_t config) {
+    if (args.split_k > 1) {
+        if (args.bias) {
+            launch<scalar_t, true, true>(args, config);
+        } else {
+            launch<scalar_t, false, true>(args, config);
+        }
+    } else if (args.bias) {
+        launch<scalar_t, true, false>(args, config);
+    } else {
+        launch<scalar_t, false, false>(args, config);
+    }
+}
+
+void hgemm(
+    at::Tensor c, const at::Tensor &a, const at::Tensor &b, int64_t split_k,
+    const std::optional<at::Tensor> &bias, int64_t config,
+    const std::optional<at::Tensor> &semaphore, const std::optional<at::Tensor> &signal) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda(), "PeakGemm expects GPU tensors");
+    TORCH_CHECK(a.device() == b.device() && a.device() == c.device(), "PeakGemm tensors must be on the same device");
+    TORCH_CHECK(a.scalar_type() == b.scalar_type() && a.scalar_type() == c.scalar_type(), "PeakGemm tensors must have the same dtype");
+    TORCH_CHECK(a.scalar_type() == at::kHalf || a.scalar_type() == at::kBFloat16, "PeakGemm supports fp16 and bf16");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && c.is_contiguous(), "PeakGemm tensors must be contiguous");
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2, "PeakGemm expects matrices");
+    TORCH_CHECK(config >= 0 && config <= 3, "PeakGemm config must be between 0 and 3");
+    TORCH_CHECK(split_k > 0 && split_k <= 65535, "PeakGemm split_k must be between 1 and 65535");
+
+    const auto m = a.size(0), n = b.size(0), k = a.size(1);
+    TORCH_CHECK(b.size(1) == k && c.size(0) == m && c.size(1) == n, "PeakGemm tensor shapes do not match");
+    TORCH_CHECK(m <= std::numeric_limits<uint32_t>::max() && n <= std::numeric_limits<uint32_t>::max()
+                    && k <= std::numeric_limits<uint32_t>::max(), "PeakGemm dimensions exceed uint32");
+    if (bias) {
+        TORCH_CHECK(bias->device() == a.device() && bias->scalar_type() == a.scalar_type()
+                        && bias->is_contiguous() && bias->numel() == n,
+                    "PeakGemm bias must be contiguous, have N elements, and match input device/dtype");
+    }
+    if (split_k > 1) {
+        for (const auto *workspace : {&semaphore, &signal}) {
+            TORCH_CHECK(workspace->has_value() && (*workspace)->device() == a.device()
+                            && (*workspace)->scalar_type() == at::kUInt32 && (*workspace)->is_contiguous()
+                            && (*workspace)->numel() >= peak_gemm::kernel::kSemaphoreCount,
+                        "PeakGemm split-K workspace must be contiguous uint32 on the input device with at least 256 elements");
+        }
+    }
+
+    c10::DeviceGuard guard(a.device());
+#if defined(__HIPCC__)
+    auto stream = c10::hip::getCurrentHIPStream(a.get_device()).stream();
+#else
+    auto stream = c10::cuda::getCurrentCUDAStream(a.get_device()).stream();
+#endif
+    const GemmArgs args{
+        a.data_ptr(), b.data_ptr(), c.data_ptr(), bias ? bias->data_ptr() : nullptr,
+        static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k), static_cast<uint32_t>(split_k),
+        split_k > 1 ? semaphore->data_ptr<uint32_t>() : nullptr,
+        split_k > 1 ? signal->data_ptr<uint32_t>() : nullptr, stream};
+    if (a.scalar_type() == at::kHalf) {
+        dispatch<__half>(args, config);
+    } else {
+        dispatch<__bfloat16>(args, config);
+    }
+    const auto error = gpuGetLastError();
+    TORCH_CHECK(error == gpuSuccess, "PeakGemm kernel launch failed: ", gpuGetErrorString(error));
+}
+
+} // namespace
+
+TORCH_LIBRARY(PeakGemm, module) {
+    module.def("hgemm(Tensor(a!) c, Tensor a, Tensor b, int split_k, Tensor? bias, int config, "
+               "Tensor(b!)? semaphore, Tensor(c!)? signal) -> ()", &hgemm);
+}
