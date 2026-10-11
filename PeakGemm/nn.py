@@ -18,7 +18,7 @@ class RMSNorm(nn.Module):
 
 
 class Linear(nn.Linear):
-    """nn.Linear-compatible parameters; HGEMM forward where supported."""
+    """nn.Linear-compatible parameters; HGEMM forward/backward where supported."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return functional.linear(x, self.weight, self.bias)

@@ -23,7 +23,7 @@ def compare(x, weight, bias=None, autocast=False):
         ref = torch.autograd.grad(expected, params, dy)
         for a, b, p in zip(dx, ref, params):
             assert a.dtype == p.dtype
-            # Native backward should agree exactly up to backend reduction choices.
+            # FP32 accumulation followed by the same output dtype; reduction order may differ.
             torch.testing.assert_close(a, b, atol=tol, rtol=tol)
 
 
@@ -83,9 +83,12 @@ def test_linear_training(train_x, train_w):
             assert p.grad.dtype == torch.float32
             torch.testing.assert_close(p.grad, q.grad, atol=0.1, rtol=0.03)
     if train_w:
+        # Gradients were compared above. Check SGD uses the computed FP32
+        # gradient exactly, without imposing a tighter native-gradient tolerance.
+        expected_update = layer.weight.detach() - layer.weight.grad * 1e-3
         optimizer = torch.optim.SGD(layer.parameters(), lr=1e-3)
         optimizer.step()
-        torch.testing.assert_close(layer.weight, ref - ref.grad * 1e-3, atol=1e-4, rtol=1e-3)
+        torch.testing.assert_close(layer.weight, expected_update, atol=1e-7, rtol=1e-6)
 
 
 @gpu_only
@@ -166,3 +169,67 @@ def test_linear_autocast_cache(monkeypatch):
     (y1.float().sum() + y2.float().sum()).backward()
     assert layer.weight.grad.dtype == torch.float32
     assert torch.isfinite(layer.weight.grad).all()
+
+
+@gpu_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("train_x,train_w", [(True, False), (False, True), (True, True)])
+def test_linear_backward_uses_peakgemm(dtype, train_x, train_w):
+    torch.manual_seed(2026)
+    x = torch.randn(2, 256, 256, device="cuda", dtype=dtype, requires_grad=train_x)
+    w = torch.randn(256, 256, device="cuda", dtype=dtype, requires_grad=train_w)
+    params = [p for p in (x, w) if p.requires_grad]
+    dy = torch.randn(2, 256, 256, device="cuda", dtype=dtype).transpose(0, 1).contiguous().transpose(0, 1)
+    # Keep forward outside the profiler: these launches must come from backward.
+    y = F.linear(x, w)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        grads = torch.autograd.grad(y, params, dy)
+        torch.cuda.synchronize()
+    kernel = "hgemm_hti_kernel" if torch.version.hip else "hgemm_kernel"
+    launches = sum(kernel in event.name for event in prof.events())
+    assert launches == int(train_x) + int(train_w), launches
+    expected = torch.autograd.grad(native.linear(x, w), params, dy)
+    tolerance = 0.15 if dtype == torch.bfloat16 else 0.02
+    for actual, ref, parameter in zip(grads, expected, params):
+        assert actual.dtype == parameter.dtype
+        torch.testing.assert_close(actual, ref, atol=tolerance, rtol=0.03)
+
+
+@gpu_only
+@pytest.mark.parametrize("m,n,k,expected_launches", [
+    (256, 256, 256, 2),  # dx and dweight both supported
+    (17, 256, 256, 0),   # dx M not tile aligned; dweight K not pipeline aligned
+    (256, 256, 65, 0),   # dx/dweight output N not tile aligned
+    (16, 256, 256, 1),   # dx uses the small tile; dweight K=16 falls back
+    (32, 256, 256, 1),   # dweight K=32 is below the pipeline minimum
+])
+def test_linear_backward_independent_fallback(m, n, k, expected_launches):
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(n, k, device="cuda", dtype=x.dtype, requires_grad=True)
+    dy = torch.randn(m, n, device="cuda", dtype=x.dtype)
+    y = F.linear(x, w)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        grads = torch.autograd.grad(y, (x, w), dy)
+        torch.cuda.synchronize()
+    launches = sum("hgemm_kernel" in event.name or "hgemm_hti_kernel" in event.name for event in prof.events())
+    assert launches == expected_launches, launches
+    expected = torch.autograd.grad(native.linear(x, w), (x, w), dy)
+    for actual, ref in zip(grads, expected):
+        torch.testing.assert_close(actual, ref, atol=0.15, rtol=0.03)
+
+
+@gpu_only
+def test_linear_backward_inside_autocast_keeps_fp32():
+    # Autocast during backward must not downcast a forward that ran in FP32.
+    x = torch.randn(256, 256, device="cuda", requires_grad=True)
+    w = torch.randn(256, 256, device="cuda", requires_grad=True)
+    dy = torch.randn_like(x)
+    y = F.linear(x, w)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        grads = torch.autograd.grad(y, (x, w), dy)
+    expected = torch.autograd.grad(native.linear(x, w), (x, w), dy)
+    for actual, ref in zip(grads, expected):
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, ref, atol=2e-5, rtol=2e-5)

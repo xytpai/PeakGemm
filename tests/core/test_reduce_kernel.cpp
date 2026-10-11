@@ -71,11 +71,7 @@ int main() {
         Data device_y({batch_size}, gpu);
         reduce_gpu(device_x.data(), device_y.data(), batch_size, reduce_size);
         auto host_y = device_y.copy_to(cpu);
-        float max_diff = 0.0F;
-        for (uint32_t batch = 0; batch < batch_size; ++batch) {
-            max_diff = std::max(max_diff, std::abs(host_y[batch] - expected_y[batch]));
-        }
-        assert(max_diff <= 0.1);
+        const double max_diff = peak_gemm::check_allclose(host_y, expected_y, 0.1, 0.0, "reduce");
 
         std::cout << "batch=" << batch_size << ", reduce_size=" << reduce_size
                   << ", max_diff=" << max_diff << '\n';

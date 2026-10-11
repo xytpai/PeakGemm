@@ -118,13 +118,7 @@ int main() {
         wmma_gpu(
             device_a.data(), device_b.data(), device_c.data(), m_size, n_size, k_size);
         auto c = device_c.copy_to(cpu);
-        float max_diff = 0.0F;
-        for (uint32_t i = 0; i < m_size * n_size; ++i) {
-            max_diff = std::max(
-                max_diff,
-                std::abs(static_cast<float>(c[i]) - expected[i]));
-        }
-        assert(max_diff <= 0.01);
+        const double max_diff = peak_gemm::check_allclose(c, expected, 0.01, 0.0, "wmma");
         std::cout << "M=" << m_size << ", N=" << n_size << ", K=" << k_size
                   << ", max_diff=" << max_diff << '\n';
     }

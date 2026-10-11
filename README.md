@@ -192,9 +192,15 @@ y = F.linear(x, self.weight, self.bias)
 - Other shapes, FP32/FP64, unaligned storage offsets, CPU and biased layers
   use native PyTorch Linear. Empty dimensions also work. No padding or split-K.
 - Autocast uses PyTorch's cached casts; FP32 master parameters keep FP32 `.grad`.
-- **Backward uses native PyTorch GEMMs**, not the HGEMM out operator. This keeps
-  transpose handling and autocast gradient semantics without materializing
-  transposed inputs or changing the existing GEMM kernels.
+- Backward reuses the same dispatcher: `dx = linear(dy, weight.T)` and
+  `dweight = linear(dy.T, x.T)` after flattening batch dimensions. Each gradient
+  independently uses HGEMM/HTI when its shape/dtype is supported, otherwise
+  native PyTorch. Only requested gradients are computed.
+- The current kernels accept contiguous `A @ B.T`, so supported backward
+  multiplications materialize transposed operands. This adds memory and copy
+  overhead; using HGEMM is not a guarantee of faster end-to-end training.
+  Accumulation is FP32, with FP16/BF16 GEMM outputs converted back to FP32 master
+  parameter gradients by autograd's cast backward, matching autocast dtypes.
 - Autograd, fake tensors/`torch.compile`, and graph capture are registered and
   tested. The raw `hgemm(c, a, b, ...)` remains an inference/out API.
 
@@ -357,7 +363,7 @@ The complete tracked source tree is:
 PeakGemm/
 ├── include/peak_gemm/
 │   ├── peak_gemm.hpp                 umbrella: core + runtime + Data
-│   ├── data.hpp                      host/device RAII buffer and copies
+│   ├── data.hpp                      host/device buffers, copies, check_allclose
 │   ├── gemm_bench_infra.hpp          accuracy, timing, and TFLOPS harness
 │   ├── backend/
 │   │   ├── runtime.hpp               shared CUDA/HIP runtime abstraction
@@ -387,7 +393,7 @@ PeakGemm/
 │   ├── core/
 │   │   ├── test_atomic.cpp           scalar and packed GPU atomics
 │   │   ├── test_core.cpp             shape/layout/vector/math units
-│   │   ├── test_data.cpp             allocation, copy, and validation
+│   │   ├── test_data.cpp             allocation, copy, allclose, validation
 │   │   ├── test_rms_norm.cpp         RMSNorm CPU reference, gradients, timing
 │   │   ├── test_reduce_kernel.cpp    warp shuffle reduction
 │   │   └── test_wmma_kernel_sm80_gfx950.cpp  WMMA/MFMA correctness

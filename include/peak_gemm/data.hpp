@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -400,5 +402,35 @@ private:
     int device_index_;
     T *data_;
 };
+
+// Host containers with size() and operator[]: Data<T> on CPU, vector, array, etc.
+// Return max absolute error for benchmark logs; reject NaN/Inf on either side.
+template <typename Actual, typename Expected>
+double check_allclose(
+    const Actual &actual, const Expected &expected,
+    double atol = 1e-5, double rtol = 1e-5, const char *name = "tensor") {
+    if (actual.size() != expected.size()) {
+        throw std::invalid_argument("check_allclose: size mismatch");
+    }
+    if (!std::isfinite(atol) || !std::isfinite(rtol) || atol < 0 || rtol < 0) {
+        throw std::invalid_argument("check_allclose: tolerances must be finite and non-negative");
+    }
+    double max_diff = 0.0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const double value = static_cast<double>(actual[i]);
+        const double reference = static_cast<double>(expected[i]);
+        const double diff = std::abs(value - reference);
+        if (!std::isfinite(value) || !std::isfinite(reference) || !std::isfinite(diff)
+            || diff > atol + rtol * std::abs(reference)) {
+            std::ostringstream message;
+            message.precision(17);
+            message << name << '[' << i << "]: actual=" << value << ", expected=" << reference
+                    << ", abs_diff=" << diff << ", atol=" << atol << ", rtol=" << rtol;
+            throw std::runtime_error(message.str());
+        }
+        max_diff = std::max(max_diff, diff);
+    }
+    return max_diff;
+}
 
 } // namespace peak_gemm

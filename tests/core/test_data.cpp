@@ -1,8 +1,10 @@
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -234,7 +236,72 @@ void test_gpu_data() {
     assert(gpuSetDevice(original_device) == gpuSuccess);
 }
 
+void require_allclose_test(bool passed) {
+    if (!passed) throw std::runtime_error("check_allclose test failed");
+}
+
+template <typename Exception, typename Function>
+void expect_allclose_error(Function function, const char *message) {
+    try {
+        function();
+    } catch (const Exception &error) {
+        require_allclose_test(std::string(error.what()).find(message) != std::string::npos);
+        return;
+    }
+    throw std::runtime_error("expected check_allclose to fail");
+}
+
+void test_allclose() {
+    using peak_gemm::check_allclose;
+    const std::vector<float> actual{1, -2, 0};
+    const std::array<double, 3> expected{1, -2, 0};
+    require_allclose_test(check_allclose(actual, expected, 0, 0) == 0);
+    require_allclose_test(check_allclose(std::vector<double>{}, std::vector<float>{}) == 0);
+
+    // Exact binary fractions exercise the inclusive tolerance boundary.
+    const std::vector<double> reference{1, -2, 0};
+    require_allclose_test(check_allclose(std::vector<double>{1.125, -1.875, 0.125}, reference, 0.125, 0) == 0.125);
+    require_allclose_test(check_allclose(std::vector<double>{1.125, -2.25, 0}, reference, 0, 0.125) == 0.25);
+    require_allclose_test(check_allclose(std::vector<double>{1.25, -2.375, 0.125}, reference, 0.125, 0.125) == 0.375);
+
+    expect_allclose_error<std::invalid_argument>([&] {
+        check_allclose(actual, std::vector<double>{1});
+    }, "size mismatch");
+    expect_allclose_error<std::runtime_error>([&] {
+        check_allclose(std::vector<double>{1, -2, 0.25}, reference, 0.125, 0, "output");
+    }, "output[2]");
+    // Preserve FP64 reference/actual precision (no intermediate float cast).
+    expect_allclose_error<std::runtime_error>([] {
+        check_allclose(std::vector<double>{1.0 + 1e-10}, std::vector<double>{1}, 0, 0);
+    }, "abs_diff=");
+
+    for (double value : {std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity()}) {
+        expect_allclose_error<std::runtime_error>([&] {
+            check_allclose(std::vector<double>{value}, std::vector<double>{0});
+        }, "tensor[0]");
+        expect_allclose_error<std::runtime_error>([&] {
+            check_allclose(std::vector<double>{0}, std::vector<double>{value});
+        }, "tensor[0]");
+        expect_allclose_error<std::runtime_error>([&] {
+            check_allclose(std::vector<double>{value}, std::vector<double>{value});
+        }, "tensor[0]");
+    }
+    for (double tolerance : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity()}) {
+        expect_allclose_error<std::invalid_argument>([&] {
+            check_allclose(actual, expected, tolerance, 0);
+        }, "tolerances");
+        expect_allclose_error<std::invalid_argument>([&] {
+            check_allclose(actual, expected, 0, tolerance);
+        }, "tolerances");
+    }
+    std::cout << "[pass] check_allclose: containers, tolerances, precision, failures\n";
+}
+
 int main() {
+    test_allclose();
     test_cpu_data();
     std::cout << "[pass] cpu data\n";
     test_move_semantics();

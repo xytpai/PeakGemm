@@ -66,15 +66,15 @@ def _linear_setup_context(ctx, inputs, output):
 
 def _linear_backward(ctx, grad_output):
     x, weight = ctx.saved_tensors
-    # The current HGEMM only accepts contiguous A @ B.T and low-precision output.
-    # Native GEMMs handle transposed gradients without materializing both inputs.
+    # Reuse A @ B.T dispatch for each gradient; unsupported shapes/dtypes
+    # fall back independently. The C++ launcher materializes supported transposes.
     with torch.autocast("cuda", enabled=False):
-        grad_input = grad_output.matmul(weight) if ctx.needs_input_grad[0] else None
+        grad_input = torch.ops.PeakGemm.linear(grad_output, weight.T) if ctx.needs_input_grad[0] else None
         grad_weight = None
         if ctx.needs_input_grad[1]:
             grad_output_2d = grad_output.flatten(0, -2) if grad_output.dim() > 1 else grad_output.unsqueeze(0)
             input_2d = x.flatten(0, -2) if x.dim() > 1 else x.unsqueeze(0)
-            grad_weight = grad_output_2d.T.matmul(input_2d)
+            grad_weight = torch.ops.PeakGemm.linear(grad_output_2d.T, input_2d.T)
     return grad_input, grad_weight
 
 
@@ -88,7 +88,7 @@ torch.library.register_autograd(
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Linear with precompiled HGEMM forward and native PyTorch backward.
+    """Linear with precompiled HGEMM forward and backward where supported.
 
     Aligned FP16/BF16 GPU shapes use PeakGemm; other shapes/dtypes, CPU and
     biased layers use torch.nn.functional.linear. Autocast uses PyTorch's

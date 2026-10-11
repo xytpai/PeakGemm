@@ -9,25 +9,10 @@
 #include "peak_gemm/kernel/rms_norm.hpp"
 
 using peak_gemm::Data;
+using peak_gemm::check_allclose;
 namespace kernel = peak_gemm::kernel;
 constexpr auto cpu = peak_gemm::DataDevice::cpu;
 constexpr auto gpu = peak_gemm::DataDevice::gpu;
-
-template <typename T>
-void check_close(const Data<T> &actual, const std::vector<double> &expected, const char *name) {
-    const double tolerance = std::is_same_v<T, __bfloat16> ? 1e-2 : (std::is_same_v<T, __half> ? 2e-3 : 2e-5);
-    double max_diff = 0;
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-        const double value = static_cast<float>(actual[i]);
-        const double diff = std::abs(value - expected[i]);
-        max_diff = std::max(max_diff, diff);
-        if (!std::isfinite(value) || diff > tolerance * (1 + std::abs(expected[i]))) {
-            std::cerr << name << "[" << i << "]: " << value << " != " << expected[i] << '\n';
-            assert(false);
-        }
-    }
-    std::cout << " " << name << "_max_diff=" << max_diff;
-}
 
 template <typename input_t, typename weight_t>
 void test_case(uint32_t rows, uint32_t dim, float eps, bool zeros = false, float scale = 1.0F, float shift = 0.0F) {
@@ -77,10 +62,12 @@ void test_case(uint32_t rows, uint32_t dim, float eps, bool zeros = false, float
     assert(gpuStreamSynchronize(stream) == gpuSuccess);
     assert(gpuStreamDestroy(stream) == gpuSuccess);
     std::cout << "rows=" << rows << " dim=" << dim << " eps=" << eps;
-    check_close(y.copy_to(cpu), expected_y, "y");
-    check_close(rstd.copy_to(cpu), expected_rstd, "rstd");
-    check_close(dx.copy_to(cpu), expected_dx, "dx");
-    check_close(dw.copy_to(cpu), expected_dw, "dw");
+    constexpr double input_tol = std::is_same_v<input_t, __bfloat16> ? 1e-2 : (std::is_same_v<input_t, __half> ? 2e-3 : 2e-5);
+    constexpr double weight_tol = std::is_same_v<weight_t, __bfloat16> ? 1e-2 : (std::is_same_v<weight_t, __half> ? 2e-3 : 2e-5);
+    std::cout << " y_max_diff=" << check_allclose(y.copy_to(cpu), expected_y, input_tol, input_tol, "y")
+              << " rstd_max_diff=" << check_allclose(rstd.copy_to(cpu), expected_rstd, 2e-5, 2e-5, "rstd")
+              << " dx_max_diff=" << check_allclose(dx.copy_to(cpu), expected_dx, input_tol, input_tol, "dx")
+              << " dw_max_diff=" << check_allclose(dw.copy_to(cpu), expected_dw, weight_tol, weight_tol, "dw");
     std::cout << '\n';
 }
 
