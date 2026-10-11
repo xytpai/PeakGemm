@@ -11,6 +11,7 @@
 #include <optional>
 
 #include <ATen/ATen.h>
+#include <ATen/autocast_mode.h>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 
@@ -149,9 +150,74 @@ void hgemm(
     TORCH_CHECK(error == gpuSuccess, "PeakGemm kernel launch failed: ", gpuGetErrorString(error));
 }
 
+
+// Select only among precompiled, non-split configurations. No padding/JIT.
+int linear_config(int64_t m, int64_t n, int64_t k) {
+    if (m <= 0 || n <= 0 || k <= 0) return -1;
+#if defined(__HIPCC__)
+    constexpr int64_t max_elements = std::numeric_limits<uint32_t>::max() / 2;
+    if (m > max_elements / k || n > max_elements / k || m > max_elements / n) return -1;
+    if (m % 256 == 0 && n % 256 == 0 && k % 128 == 0) return 3; // HTI, waves 2x4
+#else
+    constexpr int64_t max_elements = std::numeric_limits<uint32_t>::max();
+    if (m > max_elements / k || n > max_elements / k || m > max_elements / n) return -1;
+    if (m % 128 == 0 && n % 128 == 0 && k >= 64 && k % 32 == 0) return 3;
+#endif
+    if (m % 64 == 0 && k >= 64 && k % 32 == 0) {
+        if (n % 128 == 0) return 2;
+        if (n % 64 == 0) return 1;
+    }
+    if (m % 16 == 0 && n % 64 == 0 && k % 64 == 0) return 0;
+    return -1;
+}
+
+at::Tensor linear(const at::Tensor &x, const at::Tensor &weight) {
+    TORCH_CHECK(x.is_cuda() && weight.device() == x.device(), "PeakGemm linear expects tensors on the same GPU");
+    TORCH_CHECK(x.dim() >= 1 && weight.dim() == 2 && x.size(-1) == weight.size(1),
+                "PeakGemm linear expects x[..., K] and weight[N, K]");
+    TORCH_CHECK(x.scalar_type() == weight.scalar_type(), "PeakGemm linear tensors must have the same dtype");
+    c10::DeviceGuard guard(x.device());
+    const auto k = weight.size(1), n = weight.size(0);
+    const auto m = k == 0 ? 0 : x.numel() / k;
+    const int config = linear_config(m, n, k);
+    if (config < 0 || (x.scalar_type() != at::kHalf && x.scalar_type() != at::kBFloat16)) {
+        return at::linear(x, weight);
+    }
+    auto a = x.reshape({m, k}).contiguous();
+    auto b = weight.contiguous();
+    // A contiguous tensor can still have an unaligned storage offset.
+    if (reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 || reinterpret_cast<uintptr_t>(b.data_ptr()) % 16) {
+        return at::linear(x, weight);
+    }
+    auto c = at::empty({m, n}, x.options());
+    hgemm(c, a, b, 1, std::nullopt, config, std::nullopt, std::nullopt);
+    auto shape = x.sizes().vec();
+    shape.back() = n;
+    return c.view(shape);
+}
+
+at::Tensor linear_autocast(const at::Tensor &x, const at::Tensor &weight) {
+    c10::impl::ExcludeDispatchKeyGuard guard(c10::DispatchKey::AutocastCUDA);
+    const auto dtype = at::autocast::get_autocast_dtype(at::kCUDA);
+    // Redispatch through autograd after casting, just like native Linear.
+    static auto op = c10::Dispatcher::singleton()
+        .findSchemaOrThrow("PeakGemm::linear", "")
+        .typed<at::Tensor(const at::Tensor &, const at::Tensor &)>();
+    return op.call(at::autocast::cached_cast(dtype, x), at::autocast::cached_cast(dtype, weight));
+}
+
 } // namespace
 
 TORCH_LIBRARY(PeakGemm, module) {
+    module.def("linear(Tensor x, Tensor weight) -> Tensor");
     module.def("hgemm(Tensor(a!) c, Tensor a, Tensor b, int split_k, Tensor? bias, int config, "
                "Tensor(b!)? semaphore, Tensor(c!)? signal) -> ()", &hgemm);
+}
+
+TORCH_LIBRARY_IMPL(PeakGemm, CUDA, module) {
+    module.impl("linear", &linear);
+}
+
+TORCH_LIBRARY_IMPL(PeakGemm, AutocastCUDA, module) {
+    module.impl("linear", &linear_autocast);
 }

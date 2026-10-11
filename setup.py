@@ -38,6 +38,6 @@ setup(
     packages=find_packages(),
     ext_modules=[Extension("PeakGemm.libPeakGemm", sources=[])],
     cmdclass={"build_ext": CMakeBuild},
-    install_requires=["torch"],
+    install_requires=["torch>=2.4"],
     python_requires=">=3.10",
 )

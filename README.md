@@ -12,6 +12,7 @@ It currently provides:
 - An SM80-style Tensor Core path for NVIDIA GPUs.
 - Standard and hand-scheduled HTI MFMA paths for AMD GFX950, including AGPR
   accumulation.
+- Fused RMSNorm forward/backward for CUDA and ROCm, with PyTorch autograd.
 - Standalone C++ tests/benchmarks and a CMake-built PyTorch API.
 
 ## Supported targets
@@ -172,6 +173,129 @@ pytest -s tests/torch/test_hgemm.py -k "not benchmark"
 pytest -s tests/torch/test_hgemm.py -k benchmark
 ```
 
+## Training-compatible Linear
+
+`PeakGemm.functional.linear(x, weight, bias=None)` follows the
+`torch.nn.functional.linear` interface. `PeakGemm.Linear` is an `nn.Linear`
+subclass with the same constructor and parameter names.
+
+```python
+from PeakGemm import functional as F
+
+# In an existing module, keep the same parameters/checkpoint:
+y = F.linear(x, self.weight, self.bias)
+```
+
+- Supported FP16/BF16 GPU forwards select among the four precompiled HGEMM
+  tiles. ROCm uses the HTI 2x4-wave configuration when M/N are 256-aligned and
+  K is 128-aligned, otherwise it tries the standard small tiles.
+- Other shapes, FP32/FP64, unaligned storage offsets, CPU and biased layers
+  use native PyTorch Linear. Empty dimensions also work. No padding or split-K.
+- Autocast uses PyTorch's cached casts; FP32 master parameters keep FP32 `.grad`.
+- **Backward uses native PyTorch GEMMs**, not the HGEMM out operator. This keeps
+  transpose handling and autocast gradient semantics without materializing
+  transposed inputs or changing the existing GEMM kernels.
+- Autograd, fake tensors/`torch.compile`, and graph capture are registered and
+  tested. The raw `hgemm(c, a, b, ...)` remains an inference/out API.
+
+```bash
+pytest -q tests/torch/test_linear.py
+```
+
+## Fused RMSNorm (training)
+
+`PeakGemm.functional.rms_norm` matches the following computation, including FP32
+accumulation and casting the final output back to the input dtype:
+
+```python
+y = x.float()
+y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
+y = (weight.float() * y).to(x.dtype)
+```
+
+The kernel uses only `backend/runtime.hpp` (no MMA or architecture headers).
+The same source compiles with CUDA and HIP. Forward is one kernel; backward
+fuses `dx` and grouped FP32 partial `dweight` into one kernel, then reduces the
+partial gradients in a second kernel. No global atomic accumulation is used.
+
+Each kernel derives `constexpr VEC_SIZE = 16 / sizeof(T)`: 4 FP32 elements
+or 8 FP16/BF16 elements. Forward/backward use the input dtype; the final
+weight-gradient reduction uses the weight dtype. Aligned input/output vectors
+use direct `*reinterpret_cast<const vec_t *>(ptr)` loads and
+`*reinterpret_cast<vec_t *>(ptr) = value` stores. Mixed-dtype operands use vectors
+with the same element count, so their byte size may differ. Alignment is checked
+against `alignof(vec_t)` in the launcher. Unsupported dimensions or pointer
+alignment raise an error before launch; there are no scalar/tail kernels or
+load/store helper branches.
+
+**Numerics:** RMSNorm reduces `mean(x^2)`, not centered variance
+`mean(x^2) - mean(x)^2`; it does not require zero-mean/unit-variance input.
+Welford's protection against cancellation in centered variance is therefore
+not needed here. Squaring, sums and gradients use FP32. The backward uses
+`dx = r * (dy*w - x_hat * mean(dy*w*x_hat))`, with `x_hat=x*r`, avoiding
+unnormalized intermediate dot products and explicit `r^2`/`r^3`.
+
+This is still FP32 arithmetic: extreme inputs can overflow the square/sum,
+and very small values can underflow. Welford is not a general remedy for that;
+handling the entire BF16/FP32 exponent range would require scaled sum-of-squares
+or a wider accumulator. `eps > 0` is recommended for training; all-zero rows
+with `eps=0` are undefined. Tests compare nonzero-mean, constant, and outlier
+inputs at scales from `1e-12` to `1e12` against FP64; this is not a guarantee of
+long-run convergence or arbitrary-range numerical stability.
+
+Use the functional API like `torch.nn.functional`, without monkey-patching
+PyTorch:
+
+```python
+from PeakGemm import functional as F
+
+# Inside an existing nn.Module; keep self.weight and the checkpoint unchanged:
+def forward(self, x):
+    return F.rms_norm(x, self.weight, self.eps)
+```
+
+Or replace the whole module:
+
+```python
+import torch
+from PeakGemm import RMSNorm
+
+norm = RMSNorm(4096, eps=1e-6, device="cuda")  # weight defaults to FP32
+x = torch.randn(2, 128, 4096, device="cuda", dtype=torch.bfloat16,
+                requires_grad=True)
+y = norm(x)
+y.float().square().mean().backward()
+# x.grad is BF16; norm.weight.grad is FP32.
+```
+
+- `x` has shape `[..., dim]`, weight has shape `[dim]`, on the same GPU.
+- FP32/FP16/BF16 input and weight dtypes can differ. Output and `dx` match
+  `x.dtype`; `dweight` matches `weight.dtype`.
+- `1 <= dim <= 65536`, divisible by **both** `16 / sizeof(input_t)` and
+  `16 / sizeof(weight_t)` (4 for FP32, 8 for FP16/BF16). Empty batches work.
+- Input and weight must already be contiguous and vector-aligned; the public
+  function does not copy, pad, or fall back. Input/output vectors require 16B
+  alignment; the weight loads require `sizeof(weight_t) * (16 / sizeof(input_t))`
+  alignment (32B for BF16 input + FP32 weight). Launcher checks also cover
+  gradient buffers and workspace. Invalid arguments raise an error.
+- Autograd materializes noncontiguous upstream gradients (e.g. `sum()`'s
+  broadcast gradient) before calling the same vector-only backward kernel.
+  Contiguous but misaligned upstream gradients are rejected.
+- `eps` is a finite, non-negative FP32-representable scalar (default `1e-6`).
+- Supports first-order autograd, FP32 parameter gradient accumulation,
+  autocast, graph capture, and `torch.compile`. Double backward is explicitly
+  unsupported. Requires PyTorch 2.4+.
+- `RMSNorm(dim, eps)` retains the original `weight` state-dict key, so existing
+  weights/checkpoints can be loaded unchanged.
+
+C++ reference checks and event benchmark (automatically included in `test_all.sh`):
+
+```bash
+bash build_single.sh tests/core/test_rms_norm.cpp
+./a.out
+pytest -q tests/torch/test_rms_norm.py
+```
+
 ## Architecture
 
 PeakGemm deliberately separates portable runtime support, ISA primitives, and
@@ -247,18 +371,24 @@ PeakGemm/
 │   │   ├── shape.hpp                 static shape metadata
 │   │   └── vector.hpp                aligned vector load/store wrapper
 │   └── kernel/
+│       ├── rms_norm.hpp              portable fused RMSNorm forward/backward
 │       ├── gemm_naive.hpp            portable reference GPU GEMM
 │       ├── hgemm_sm80.hpp            CUDA HGEMM, bias, split-K
 │       ├── hgemm_gfx950.hpp          ROCm HGEMM, bias, split-K
 │       └── hgemm_hti_gfx950.hpp      hand-scheduled GFX950 HTI HGEMM
 ├── PeakGemm/
-│   └── __init__.py                   shared-library loading and Python API
-├── csrc/hgemm.cpp                    PyTorch operator and fixed GPU configurations
+│   ├── __init__.py                   shared-library loading and Python API
+│   ├── functional.py                 RMSNorm autograd/fake registration
+│   └── nn.py                         RMSNorm module
+├── csrc/
+│   ├── hgemm.cpp                     PyTorch GEMM operator and fixed configurations
+│   └── rms_norm.cpp                  PyTorch RMSNorm forward/backward operators
 ├── tests/
 │   ├── core/
 │   │   ├── test_atomic.cpp           scalar and packed GPU atomics
 │   │   ├── test_core.cpp             shape/layout/vector/math units
 │   │   ├── test_data.cpp             allocation, copy, and validation
+│   │   ├── test_rms_norm.cpp         RMSNorm CPU reference, gradients, timing
 │   │   ├── test_reduce_kernel.cpp    warp shuffle reduction
 │   │   └── test_wmma_kernel_sm80_gfx950.cpp  WMMA/MFMA correctness
 │   ├── arch_bench/
@@ -270,7 +400,8 @@ PeakGemm/
 │   │   ├── test_hgemm_sm80.cpp       SM80 HGEMM dispatch and benchmark
 │   │   └── test_hgemm_gfx950.cpp     GFX950 standard/HTI dispatch
 │   └── torch/
-│       └── test_hgemm.py             PyTorch accuracy and profiler benchmark
+│       ├── test_hgemm.py             PyTorch accuracy and profiler benchmark
+│       └── test_rms_norm.py          autograd, mixed dtype, graph/compile checks
 ├── build_single.sh                   compile one C++ source with nvcc/hipcc
 ├── test_all.sh                       build and run every C++ test
 ├── format.sh                         clang-format all C/C++ sources

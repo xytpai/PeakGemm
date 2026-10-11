@@ -37,4 +37,9 @@ def hgemm(
     return c
 
 
-__all__ = ["hgemm"]
+# Register differentiable operators after loading the shared library.
+from . import functional
+from .functional import rms_norm
+from .nn import Linear, RMSNorm
+
+__all__ = ["hgemm", "rms_norm", "functional", "RMSNorm", "Linear"]
