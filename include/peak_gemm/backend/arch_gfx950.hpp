@@ -257,11 +257,42 @@ struct MfmaM16N16K32 {
         load_matrix(fragment, base, row, column, stride, swizzle);
     }
 
-    template <typename Swizzle>
+    // A TR16 read produces 8B, i.e. half of the 16B B fragment.
+    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static void load_matrix_b_half(
+        FragmentBT &fragment, uint32_t half, uint32_t address) {
+        using load_vec_t = std::conditional_t<std::is_same_v<Scalar, __half>, fp16x4_t, bf16x4_t>;
+        using lds_vec_t = load_vec_t __attribute__((address_space(3)));
+        static_assert(sizeof(FragmentBT) == 2 * sizeof(load_vec_t));
+        auto *ptr = reinterpret_cast<lds_vec_t *>(static_cast<uintptr_t>(address));
+        load_vec_t values;
+        if constexpr (std::is_same_v<Scalar, __half>) {
+            values = __builtin_amdgcn_ds_read_tr16_b64_v4f16(ptr);
+        } else {
+            values = __builtin_amdgcn_ds_read_tr16_b64_v4bf16(ptr);
+        }
+        // Bit copy: HIP scalar wrappers and compiler vector scalars differ in type.
+        __builtin_memcpy(&fragment[half * 4], &values, sizeof(values));
+    }
+
+    template <typename Swizzle, bool B_TRANSPOSE = true>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
         FragmentBT &fragment, Scalar *base, uint32_t row,
         uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        if constexpr (B_TRANSPOSE) {
+            load_matrix(fragment, base, row, column, stride, swizzle);
+        } else {
+            // Like FlyDSL's gemm_gfx950 LDSReadTrans16_64b path.
+            // TR16 transposes each 16-lane group: four lanes supply one K row.
+            // Two reads give the eight K values required by m16n16k32 MFMA.
+            const uint32_t n = row + lane_ % 4 * 4;
+            const uint32_t k = column + lane_ / 16 * 8 + lane_ % 16 / 4;
+#pragma unroll
+            for (uint32_t i = 0; i < 2; ++i) {
+                const auto address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                    base + swizzle((k + i * 4) * stride + n)));
+                load_matrix_b_half(fragment, i, address);
+            }
+        }
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(

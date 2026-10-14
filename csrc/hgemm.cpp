@@ -45,7 +45,7 @@ struct GemmArgs {
     gpuStream_t stream;
 };
 
-template <typename scalar_t, bool HAS_BIAS, bool SPLIT_K>
+template <typename scalar_t, bool HAS_BIAS, bool SPLIT_K, bool B_TRANSPOSE>
 void launch(const GemmArgs &args, int64_t config) {
     const auto *a = static_cast<const scalar_t *>(args.a);
     const auto *b = static_cast<const scalar_t *>(args.b);
@@ -56,15 +56,15 @@ void launch(const GemmArgs &args, int64_t config) {
     // Only these four tile configurations are instantiated at build time.
     switch (config) {
     case 0:
-        hgemm_template<scalar_t, 16, 64, 64, 1, N_WARPS_64, 2, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+        hgemm_template<scalar_t, 16, 64, 64, 1, N_WARPS_64, 2, SWIZZLE_M, HAS_BIAS, SPLIT_K, B_TRANSPOSE>(
             a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
         break;
     case 1:
-        hgemm_template<scalar_t, 64, 64, 32, 2, N_WARPS_64, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+        hgemm_template<scalar_t, 64, 64, 32, 2, N_WARPS_64, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K, B_TRANSPOSE>(
             a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
         break;
     case 2:
-        hgemm_template<scalar_t, 64, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+        hgemm_template<scalar_t, 64, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K, B_TRANSPOSE>(
             a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
         break;
     case 3:
@@ -73,47 +73,61 @@ void launch(const GemmArgs &args, int64_t config) {
         if constexpr (SPLIT_K) {
             TORCH_CHECK(false, "PeakGemm HTI config=3 requires split_k=1; use config=0..2 for split-K");
         } else {
-            peak_gemm::kernel::hgemm_hti_template<scalar_t, 256, 256, 64, 2, 4, 0, HAS_BIAS>(
+            peak_gemm::kernel::hgemm_hti_template<scalar_t, 256, 256, 64, 2, 4, 0, HAS_BIAS, B_TRANSPOSE>(
                 a, b, c, args.m, args.n, args.k, bias, args.stream);
         }
 #else
-        hgemm_template<scalar_t, 128, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K>(
+        hgemm_template<scalar_t, 128, 128, 32, 2, N_WARPS_128, 3, SWIZZLE_M, HAS_BIAS, SPLIT_K, B_TRANSPOSE>(
             a, b, c, args.m, args.n, args.k, args.split_k, args.semaphore, args.signal, bias, args.stream);
 #endif
         break;
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool B_TRANSPOSE>
 void dispatch(const GemmArgs &args, int64_t config) {
     if (args.split_k > 1) {
         if (args.bias) {
-            launch<scalar_t, true, true>(args, config);
+            launch<scalar_t, true, true, B_TRANSPOSE>(args, config);
         } else {
-            launch<scalar_t, false, true>(args, config);
+            launch<scalar_t, false, true, B_TRANSPOSE>(args, config);
         }
     } else if (args.bias) {
-        launch<scalar_t, true, false>(args, config);
+        launch<scalar_t, true, false, B_TRANSPOSE>(args, config);
     } else {
-        launch<scalar_t, false, false>(args, config);
+        launch<scalar_t, false, false, B_TRANSPOSE>(args, config);
+    }
+}
+
+
+template <typename scalar_t>
+void dispatch_layout(const GemmArgs &args, int64_t config, bool transpose_b) {
+    if (transpose_b) {
+        dispatch<scalar_t, true>(args, config);
+    } else {
+        dispatch<scalar_t, false>(args, config);
     }
 }
 
 void hgemm(
     at::Tensor c, const at::Tensor &a, const at::Tensor &b, int64_t split_k,
     const std::optional<at::Tensor> &bias, int64_t config,
-    const std::optional<at::Tensor> &semaphore, const std::optional<at::Tensor> &signal) {
+    const std::optional<at::Tensor> &semaphore, const std::optional<at::Tensor> &signal, bool transpose_b = true) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda(), "PeakGemm expects GPU tensors");
     TORCH_CHECK(a.device() == b.device() && a.device() == c.device(), "PeakGemm tensors must be on the same device");
     TORCH_CHECK(a.scalar_type() == b.scalar_type() && a.scalar_type() == c.scalar_type(), "PeakGemm tensors must have the same dtype");
     TORCH_CHECK(a.scalar_type() == at::kHalf || a.scalar_type() == at::kBFloat16, "PeakGemm supports fp16 and bf16");
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && c.is_contiguous(), "PeakGemm tensors must be contiguous");
     TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2, "PeakGemm expects matrices");
+    TORCH_CHECK(a.is_contiguous() && c.is_contiguous(), "PeakGemm A and C must be contiguous");
+    TORCH_CHECK(b.is_contiguous() || b.transpose(0, 1).is_contiguous(),
+                "PeakGemm B must be contiguous or a transpose of a contiguous matrix");
     TORCH_CHECK(config >= 0 && config <= 3, "PeakGemm config must be between 0 and 3");
     TORCH_CHECK(split_k > 0 && split_k <= 65535, "PeakGemm split_k must be between 1 and 65535");
 
-    const auto m = a.size(0), n = b.size(0), k = a.size(1);
-    TORCH_CHECK(b.size(1) == k && c.size(0) == m && c.size(1) == n, "PeakGemm tensor shapes do not match");
+    const auto m = a.size(0), n = b.size(transpose_b ? 0 : 1), k = a.size(1);
+    TORCH_CHECK(b.size(transpose_b ? 1 : 0) == k && c.size(0) == m && c.size(1) == n, "PeakGemm tensor shapes do not match");
+    // A transpose view changes the logical operation, not the underlying data.
+    const bool b_transpose = b.is_contiguous() ? transpose_b : !transpose_b;
     TORCH_CHECK(m <= std::numeric_limits<uint32_t>::max() && n <= std::numeric_limits<uint32_t>::max()
                     && k <= std::numeric_limits<uint32_t>::max(), "PeakGemm dimensions exceed uint32");
     if (bias) {
@@ -142,9 +156,9 @@ void hgemm(
         split_k > 1 ? semaphore->data_ptr<uint32_t>() : nullptr,
         split_k > 1 ? signal->data_ptr<uint32_t>() : nullptr, stream};
     if (a.scalar_type() == at::kHalf) {
-        dispatch<__half>(args, config);
+        dispatch_layout<__half>(args, config, b_transpose);
     } else {
-        dispatch<__bfloat16>(args, config);
+        dispatch_layout<__bfloat16>(args, config, b_transpose);
     }
     const auto error = gpuGetLastError();
     TORCH_CHECK(error == gpuSuccess, "PeakGemm kernel launch failed: ", gpuGetErrorString(error));
@@ -184,7 +198,8 @@ at::Tensor linear(const at::Tensor &x, const at::Tensor &weight) {
         return at::linear(x, weight);
     }
     auto a = x.reshape({m, k}).contiguous();
-    auto b = weight.contiguous();
+    // A weight.T view can be consumed by the NN specialization without a copy.
+    auto b = weight.is_contiguous() || weight.transpose(0, 1).is_contiguous() ? weight : weight.contiguous();
     // A contiguous tensor can still have an unaligned storage offset.
     if (reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 || reinterpret_cast<uintptr_t>(b.data_ptr()) % 16) {
         return at::linear(x, weight);
@@ -211,7 +226,7 @@ at::Tensor linear_autocast(const at::Tensor &x, const at::Tensor &weight) {
 TORCH_LIBRARY(PeakGemm, module) {
     module.def("linear(Tensor x, Tensor weight) -> Tensor");
     module.def("hgemm(Tensor(a!) c, Tensor a, Tensor b, int split_k, Tensor? bias, int config, "
-               "Tensor(b!)? semaphore, Tensor(c!)? signal) -> ()", &hgemm);
+               "Tensor(b!)? semaphore, Tensor(c!)? signal, bool transpose_b=True) -> ()", &hgemm);
 }
 
 TORCH_LIBRARY_IMPL(PeakGemm, CUDA, module) {

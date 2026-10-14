@@ -120,7 +120,7 @@ struct MmaM16N8K16 {
             : "r"(address));
     }
 
-    template <typename Swizzle>
+    template <typename Swizzle, bool B_TRANSPOSE = true>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
         FragmentBT &fragment,
         Scalar *base,
@@ -130,12 +130,20 @@ struct MmaM16N8K16 {
         const Swizzle &swizzle) const {
         const auto y = column + lane_ % 4 * 2;
         const auto x = row + lane_ / 4;
-        const auto offset0 = swizzle(x * stride + y);
-        const auto offset1 = swizzle(x * stride + y + 8);
-        fragment.values[0] = base[offset0];
-        fragment.values[1] = base[offset0 + 1];
-        fragment.values[2] = base[offset1];
-        fragment.values[3] = base[offset1 + 1];
+        if constexpr (B_TRANSPOSE) {
+            const auto offset0 = swizzle(x * stride + y);
+            const auto offset1 = swizzle(x * stride + y + 8);
+            fragment.values[0] = base[offset0];
+            fragment.values[1] = base[offset0 + 1];
+            fragment.values[2] = base[offset1];
+            fragment.values[3] = base[offset1 + 1];
+        } else {
+            // NN shared tile is [K, N]; preserve the MMA fragment's K ordering.
+#pragma unroll
+            for (uint32_t i = 0; i < 4; ++i) {
+                fragment[i] = base[swizzle((y + (i / 2) * 8 + i % 2) * stride + x)];
+            }
+        }
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(

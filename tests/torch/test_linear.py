@@ -233,3 +233,106 @@ def test_linear_backward_inside_autocast_keeps_fp32():
     for actual, ref in zip(grads, expected):
         assert actual.dtype == torch.float32
         torch.testing.assert_close(actual, ref, atol=2e-5, rtol=2e-5)
+
+
+@gpu_only
+def test_linear_transposed_weight_no_copy():
+    x = torch.randn(512, 384, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    storage = torch.randn(384, 768, device="cuda", dtype=x.dtype, requires_grad=True)
+    weight = storage.T
+    F.linear(x, weight)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        y = F.linear(x, weight)
+        torch.cuda.synchronize()
+    names = [event.name for event in prof.events()]
+    assert not any(name in {"aten::clone", "aten::copy_", "aten::contiguous"} for name in names), names
+    ref = native.linear(x, weight)
+    torch.testing.assert_close(y, ref, atol=0.15, rtol=0.03)
+    dy = torch.randn_like(y)
+    grads = torch.autograd.grad(y, (x, storage), dy)
+    expected = torch.autograd.grad(ref, (x, storage), dy)
+    for actual, expected_grad in zip(grads, expected):
+        torch.testing.assert_close(actual, expected_grad, atol=0.2, rtol=0.03)
+
+
+@gpu_only
+@pytest.mark.parametrize("which,expected_clones", [("x", 0), ("weight", 1)])
+def test_linear_backward_transpose_copy_count(which, expected_clones):
+    x = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16, requires_grad=which == "x")
+    w = torch.randn(256, 256, device="cuda", dtype=x.dtype, requires_grad=which == "weight")
+    y = F.linear(x, w)
+    dy = torch.randn_like(y)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        y.backward(dy)
+        torch.cuda.synchronize()
+    names = [event.name for event in prof.events()]
+    assert sum(name == "aten::clone" for name in names) == expected_clones, names
+
+
+
+@gpu_only
+@pytest.mark.parametrize("m,n,k", [
+    (512, 768, 1024),
+    (4096, 4096, 4096),
+    (4096, 1024, 4096),
+    (4096, 12288, 4096),
+])
+def test_linear_native_benchmark(m, n, k):
+    from statistics import median
+
+    torch.manual_seed(2026)
+    x = (torch.randn(m, k, device="cuda") * 0.1).requires_grad_()
+    weight = (torch.randn(n, k, device="cuda") * 0.1).requires_grad_()
+    dy = torch.randn(m, n, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    def forward(fn):
+        # Exit the autocast region each iteration, as in a training step.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return fn(x, weight)
+
+    pg_y, native_y = forward(F.linear), forward(native.linear)
+    pg_grad = torch.autograd.grad(pg_y, (x, weight), dy, retain_graph=True)
+    native_grad = torch.autograd.grad(native_y, (x, weight), dy, retain_graph=True)
+    torch.testing.assert_close(pg_y, native_y, atol=0.05, rtol=0.03)
+    for actual, expected in zip(pg_grad, native_grad):
+        assert actual.dtype == expected.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.03)
+    del pg_grad, native_grad
+
+    def backward(y):
+        return torch.autograd.grad(y, (x, weight), dy, retain_graph=True)
+
+    def forward_backward(fn):
+        return torch.autograd.grad(forward(fn), (x, weight), dy)
+
+    functions = {
+        "PG forward": lambda: forward(F.linear),
+        "native forward": lambda: forward(native.linear),
+        "PG backward": lambda: backward(pg_y),
+        "native backward": lambda: backward(native_y),
+        "PG fwd+bwd": lambda: forward_backward(F.linear),
+        "native fwd+bwd": lambda: forward_backward(native.linear),
+    }
+    for fn in functions.values():
+        for _ in range(10):
+            fn()
+    torch.cuda.synchronize()
+    times = {name: [] for name in functions}
+    for repeat in range(5):
+        order = list(functions.items())
+        if repeat % 2:
+            order.reverse()
+        for name, fn in order:
+            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(20):
+                fn()
+            stop.record()
+            stop.synchronize()
+            times[name].append(start.elapsed_time(stop) * 1000 / 20)
+    print(f"\nLinear FP32 params + BF16 autocast, M/N/K={m}/{n}/{k}")
+    for phase in ["forward", "backward", "fwd+bwd"]:
+        pg_us, native_us = median(times[f"PG {phase}"]), median(times[f"native {phase}"])
+        print(f"  {phase}: PG={pg_us:.1f} us, native={native_us:.1f} us, native/PG={native_us/pg_us:.2f}x")

@@ -17,8 +17,12 @@ def hgemm(
     bias: torch.Tensor | None = None,
     *,
     config: int = 3,
+    transpose_b: bool = True,
 ) -> torch.Tensor:
-    """Write A @ B.T + bias into C using a precompiled configuration (0..3).
+    """Write A @ B.T (NT) or A @ B (NN) + bias into C; config is 0..3.
+
+    transpose_b=True: B[N,K]; False: B[K,N]. B may be contiguous or its
+    transpose view; both layouts are read directly, without a transpose copy.
 
     On ROCm, config=3 uses HTI: M/N multiples of 256, K a multiple of 128,
     and split_k=1. Configs 0..2 also support split-K.
@@ -33,7 +37,7 @@ def hgemm(
                 for _ in range(2)
             )
         semaphore, signal = _workspaces[key]
-    torch.ops.PeakGemm.hgemm(c, a, b, split_k, bias, config, semaphore, signal)
+    torch.ops.PeakGemm.hgemm(c, a, b, split_k, bias, config, semaphore, signal, transpose_b)
     return c
 
 

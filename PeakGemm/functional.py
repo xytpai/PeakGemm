@@ -67,7 +67,7 @@ def _linear_setup_context(ctx, inputs, output):
 def _linear_backward(ctx, grad_output):
     x, weight = ctx.saved_tensors
     # Reuse A @ B.T dispatch for each gradient; unsupported shapes/dtypes
-    # fall back independently. The C++ launcher materializes supported transposes.
+    # fall back independently. B transpose views use NN directly; only A may copy.
     with torch.autocast("cuda", enabled=False):
         grad_input = torch.ops.PeakGemm.linear(grad_output, weight.T) if ctx.needs_input_grad[0] else None
         grad_weight = None

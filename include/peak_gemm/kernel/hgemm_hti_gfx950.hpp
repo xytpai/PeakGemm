@@ -15,7 +15,7 @@ PEAKGEMM_DEVICE_INLINE void wait_barrier() {
 }
 
 template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_M_WARPS,
-          uint32_t BLOCK_N_WARPS, bool HAS_BIAS>
+          uint32_t BLOCK_N_WARPS, bool HAS_BIAS, bool B_TRANSPOSE = true>
 class HgemmBlockTileHti {
 public:
     using FragmentAT = typename wmma_t::FragmentAT;
@@ -27,6 +27,7 @@ public:
         WARP_SHIFT = core::Log2<WARP_SIZE>::value,
         HALF_BLOCK_M = BLOCK_M / 2,
         HALF_BLOCK_N = BLOCK_N / 2,
+        B_COLS = B_TRANSPOSE ? BLOCK_K : HALF_BLOCK_N,
         WARP_ATOM_M = wmma_t::M,
         WARP_ATOM_N = wmma_t::N,
         WARP_ATOM_K = wmma_t::K,
@@ -35,6 +36,12 @@ public:
         WARP_K_STEPS = BLOCK_K / WARP_ATOM_K,
         WARP_M = WARP_M_STEPS * WARP_ATOM_M,
         WARP_N = WARP_N_STEPS * WARP_ATOM_N,
+        // NN interleaves MMA tiles across waves, matching FlyDSL's tiled-MMA
+        // mapping so both M-wave groups can safely use the staggered pipeline.
+        M_WAVE_STRIDE = B_TRANSPOSE ? WARP_M : WARP_ATOM_M,
+        N_WAVE_STRIDE = B_TRANSPOSE ? WARP_N : WARP_ATOM_N,
+        M_STEP_STRIDE = B_TRANSPOSE ? WARP_ATOM_M : BLOCK_M_WARPS * WARP_ATOM_M,
+        N_STEP_STRIDE = B_TRANSPOSE ? WARP_ATOM_N : BLOCK_N_WARPS * WARP_ATOM_N,
         VEC_SIZE = 16 / sizeof(scalar_t),
         LDG_X_THREADS = BLOCK_K / VEC_SIZE,
         BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE,
@@ -47,6 +54,8 @@ public:
     };
 
     using vec_t = core::Vector<scalar_t, VEC_SIZE>;
+    using b_swizzle_t = std::conditional_t<B_TRANSPOSE, swizzle_t,
+        backend::Gfx950Swizzle<2, 4, core::Log2<B_COLS>::value - 4>>;
 
     static_assert(std::is_same_v<scalar_t, __half> || std::is_same_v<scalar_t, __bfloat16>, "ROCm HTI HGEMM supports fp16 and bf16 inputs");
     static_assert(BLOCK_M % 2 == 0 && BLOCK_N % 2 == 0);
@@ -94,48 +103,82 @@ public:
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
             const uint32_t swizzled_offset = swizzle(global_thread * VEC_SIZE);
             const uint32_t source_offset = swizzled_offset / BLOCK_K * k_size + swizzled_offset % BLOCK_K;
-            raw_buffer_load_lds(resource, (SharedPointer) static_cast<uintptr_t>(shared_wave + i * BLOCK_DMA_STRIDE), DMA_BYTES,
-                                (source_begin + source_offset) * sizeof(scalar_t), 0, 0, 0);
+            copy_to_lds(resource, shared_wave + i * BLOCK_DMA_STRIDE, (source_begin + source_offset) * sizeof(scalar_t));
         }
     }
 
     PEAKGEMM_DEVICE_INLINE void copy_async_b(
-        uint32_t half_n, uint32_t k_buffer, BufferResource &resource, uint32_t source_begin, uint32_t k_size, const swizzle_t &swizzle) {
+        uint32_t half_n, uint32_t k_buffer, BufferResource &resource, uint32_t source_begin, uint32_t b_stride, const swizzle_t &swizzle) {
         const uint32_t shared_offset = (k_buffer * 2 + half_n) * HALF_BLOCK_N * BLOCK_K;
         const uint32_t shared_wave = shared_b_address_ + shared_offset * sizeof(scalar_t);
 #pragma unroll
         for (uint32_t i = 0; i < NUM_B_LOADS; ++i) {
             const uint32_t global_thread = BLOCK_THREADS * i + thread_;
-            const uint32_t swizzled_offset = swizzle(global_thread * VEC_SIZE);
-            const uint32_t source_offset = swizzled_offset / BLOCK_K * k_size + swizzled_offset % BLOCK_K;
-            raw_buffer_load_lds(resource, (SharedPointer) static_cast<uintptr_t>(shared_wave + i * BLOCK_DMA_STRIDE), DMA_BYTES,
-                                (source_begin + source_offset) * sizeof(scalar_t), 0, 0, 0);
+            const uint32_t swizzled_offset = b_swizzle_t{}(global_thread * VEC_SIZE);
+            const uint32_t source_offset = swizzled_offset / B_COLS * b_stride + swizzled_offset % B_COLS;
+            copy_to_lds(resource, shared_wave + i * BLOCK_DMA_STRIDE, (source_begin + source_offset) * sizeof(scalar_t));
         }
     }
 
     PEAKGEMM_DEVICE_INLINE void load_matrix_a(scalar_t *shared, const swizzle_t &swizzle) {
-        wmma_t wmma;
-        wmma.init(thread_ & WARP_MASK);
-        const uint32_t warp_m = warp_ / BLOCK_N_WARPS * WARP_M;
-#pragma unroll
-        for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+        if constexpr (!B_TRANSPOSE) {
+            using lds_fragment_t = backend::floatx4_t __attribute__((address_space(3)));
+            const uint32_t row = warp_ / BLOCK_N_WARPS * WARP_ATOM_M + thread_ % 16;
+            const uint32_t column = (thread_ % WARP_SIZE) / 16 * 8;
 #pragma unroll
             for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
-                wmma.load_matrix_a(fragment_a_[k][m], shared, warp_m + m * WARP_ATOM_M, k * WARP_ATOM_K, BLOCK_K, swizzle);
+                auto address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(shared))
+                    + swizzle(row * BLOCK_K + column + k * WARP_ATOM_K) * sizeof(scalar_t);
+#pragma unroll
+                for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+                    *reinterpret_cast<backend::floatx4_t *>(&fragment_a_[k][m]) = *reinterpret_cast<lds_fragment_t *>(
+                        static_cast<uintptr_t>(address + m * M_STEP_STRIDE * BLOCK_K * sizeof(scalar_t)));
+                }
+            }
+        } else {
+            wmma_t wmma;
+            wmma.init(thread_ & WARP_MASK);
+            const uint32_t warp_m = warp_ / BLOCK_N_WARPS * M_WAVE_STRIDE;
+#pragma unroll
+            for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+#pragma unroll
+                for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
+                    wmma.load_matrix_a(fragment_a_[k][m], shared, warp_m + m * M_STEP_STRIDE, k * WARP_ATOM_K, BLOCK_K, swizzle);
+                }
             }
         }
     }
 
     template <uint32_t Buffer>
     PEAKGEMM_DEVICE_INLINE void load_matrix_b(scalar_t *shared, const swizzle_t &swizzle) {
-        wmma_t wmma;
-        wmma.init(thread_ & WARP_MASK);
-        const uint32_t warp_n = warp_ % BLOCK_N_WARPS * WARP_N;
+        if constexpr (!B_TRANSPOSE) {
+            const uint32_t lane = thread_ % WARP_SIZE;
+            const uint32_t n_base = warp_ % BLOCK_N_WARPS * WARP_ATOM_N + lane % 4 * 4;
+            const uint32_t k_base = lane / 16 * 8 + lane % 16 / 4;
+            auto address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(shared))
+                + b_swizzle_t{}(k_base * B_COLS + n_base) * sizeof(scalar_t);
+            // Tile steps lie above the XOR bits: one base, constant DS offsets.
 #pragma unroll
-        for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
+            for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
 #pragma unroll
-            for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
-                wmma.load_matrix_b(fragment_b_[Buffer][k][n], shared, warp_n + n * WARP_ATOM_N, k * WARP_ATOM_K, BLOCK_K, swizzle);
+                for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
+#pragma unroll
+                    for (uint32_t i = 0; i < 2; ++i) {
+                        const uint32_t offset = (n * N_STEP_STRIDE + (k * WARP_ATOM_K + i * 4) * B_COLS) * sizeof(scalar_t);
+                        wmma_t::load_matrix_b_half(fragment_b_[Buffer][k][n], i, address + offset);
+                    }
+                }
+            }
+        } else {
+            wmma_t wmma;
+            wmma.init(thread_ & WARP_MASK);
+            const uint32_t warp_n = warp_ % BLOCK_N_WARPS * N_WAVE_STRIDE;
+#pragma unroll
+            for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
+#pragma unroll
+                for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
+                    wmma.template load_matrix_b<b_swizzle_t, B_TRANSPOSE>(fragment_b_[Buffer][k][n], shared, warp_n + n * N_STEP_STRIDE, k * WARP_ATOM_K, B_COLS, b_swizzle_t{});
+                }
             }
         }
     }
@@ -143,13 +186,28 @@ public:
     template <uint32_t HalfM, uint32_t HalfN>
     PEAKGEMM_DEVICE_INLINE void consume() {
         const wmma_t wmma;
+        if constexpr (!B_TRANSPOSE) {
+            schedule_barrier();
 #pragma unroll
-        for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+            for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
 #pragma unroll
-            for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
+                for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
 #pragma unroll
-                for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
-                    wmma(output_[HalfM][HalfN][m][n], fragment_a_[k][m], fragment_b_[HalfN][k][n], output_[HalfM][HalfN][m][n]);
+                    for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+                        wmma(output_[HalfM][HalfN][m][n], fragment_a_[k][m], fragment_b_[HalfN][k][n], output_[HalfM][HalfN][m][n]);
+                    }
+                }
+            }
+            schedule_barrier();
+        } else {
+#pragma unroll
+            for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
+#pragma unroll
+                for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
+#pragma unroll
+                    for (uint32_t k = 0; k < WARP_K_STEPS; ++k) {
+                        wmma(output_[HalfM][HalfN][m][n], fragment_a_[k][m], fragment_b_[HalfN][k][n], output_[HalfM][HalfN][m][n]);
+                    }
                 }
             }
         }
@@ -159,14 +217,14 @@ public:
     PEAKGEMM_DEVICE_INLINE void store_matrix_to_shared(scalar_t (&shared_c)[BLOCK_M][BLOCK_N]) {
         wmma_t wmma;
         wmma.init(thread_ & WARP_MASK);
-        const uint32_t warp_m = warp_ / BLOCK_N_WARPS * WARP_M;
-        const uint32_t warp_n = warp_ % BLOCK_N_WARPS * WARP_N;
+        const uint32_t warp_m = warp_ / BLOCK_N_WARPS * M_WAVE_STRIDE;
+        const uint32_t warp_n = warp_ % BLOCK_N_WARPS * N_WAVE_STRIDE;
 #pragma unroll
         for (uint32_t m = 0; m < WARP_M_STEPS; ++m) {
 #pragma unroll
             for (uint32_t n = 0; n < WARP_N_STEPS; ++n) {
                 auto *destination =
-                    &shared_c[HalfM * HALF_BLOCK_M + warp_m + m * WARP_ATOM_M][HalfN * HALF_BLOCK_N + warp_n + n * WARP_ATOM_N];
+                    &shared_c[HalfM * HALF_BLOCK_M + warp_m + m * M_STEP_STRIDE][HalfN * HALF_BLOCK_N + warp_n + n * N_STEP_STRIDE];
                 wmma.store_matrix(destination, BLOCK_N, output_[HalfM][HalfN][m][n]);
             }
         }
@@ -197,6 +255,18 @@ public:
     }
 
 private:
+    PEAKGEMM_DEVICE_INLINE static void copy_to_lds(BufferResource &resource, uint32_t shared_address, uint32_t byte_offset) {
+        if constexpr (B_TRANSPOSE) {
+            raw_buffer_load_lds(resource, (SharedPointer) static_cast<uintptr_t>(shared_address), DMA_BYTES, byte_offset, 0, 0, 0);
+        } else {
+            // As in FlyDSL: wait_barrier<> controls the DMA pipeline explicitly.
+            // Avoid the intrinsic's conservative full VMEM waits between stages.
+            asm volatile(
+                "s_mov_b32 m0, %0\n\ts_nop 0\n\tbuffer_load_dwordx4 %1, %2, 0 offen sc0 lds"
+                :: "s"(shared_address), "v"(byte_offset), "s"(resource) : "memory");
+        }
+    }
+
     uint32_t thread_;
     uint32_t warp_;
     uint32_t shared_a_address_;
@@ -216,12 +286,12 @@ union alignas(16) HgemmSharedStorageHti {
 };
 
 template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_M_WARPS,
-          uint32_t BLOCK_N_WARPS, uint32_t SWIZZLE_M, bool HAS_BIAS>
+          uint32_t BLOCK_N_WARPS, uint32_t SWIZZLE_M, bool HAS_BIAS, bool B_TRANSPOSE = true>
 __attribute__((amdgpu_waves_per_eu(2, 2),
                amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE, BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE))) __global__ void
 hgemm_hti_kernel(
     scalar_t *c, const scalar_t *a, const scalar_t *b, uint32_t m_size, uint32_t n_size, uint32_t k_size, const scalar_t *bias) {
-    using BlockTile = HgemmBlockTileHti<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, HAS_BIAS>;
+    using BlockTile = HgemmBlockTileHti<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, HAS_BIAS, B_TRANSPOSE>;
     constexpr uint32_t HALF_BLOCK_M = BlockTile::HALF_BLOCK_M;
     constexpr uint32_t HALF_BLOCK_N = BlockTile::HALF_BLOCK_N;
     constexpr uint32_t BLOCK_THREADS = BlockTile::BLOCK_THREADS;
@@ -233,7 +303,10 @@ hgemm_hti_kernel(
     const uint32_t thread = threadIdx.x;
     const uint32_t warp = thread / WARP_SIZE;
     uint32_t a_begin = block_m_idx * BLOCK_M * k_size;
-    uint32_t b_begin = block_n_idx * BLOCK_N * k_size;
+    const uint32_t b_stride = B_TRANSPOSE ? k_size : n_size;
+    const uint32_t b_k_stride = B_TRANSPOSE ? 1 : n_size;
+    const uint32_t b_half_stride = B_TRANSPOSE ? HALF_BLOCK_N * k_size : HALF_BLOCK_N;
+    uint32_t b_begin = B_TRANSPOSE ? block_n_idx * BLOCK_N * k_size : block_n_idx * BLOCK_N;
     const uint32_t a_end = a_begin + k_size;
     __shared__ HgemmSharedStorageHti<scalar_t, HALF_BLOCK_M, HALF_BLOCK_N, BLOCK_K> shared;
     const swizzle_t swizzle;
@@ -244,7 +317,7 @@ hgemm_hti_kernel(
 #define HTI_LDG_A(M, K, FETCH) \
     block_tile.copy_async_a(M, K, a_resource, a_begin + (M) * HALF_BLOCK_M * k_size + ((FETCH) + (K)) * BLOCK_K, k_size, swizzle)
 #define HTI_LDG_B(N, K, FETCH) \
-    block_tile.copy_async_b(N, K, b_resource, b_begin + (N) * HALF_BLOCK_N * k_size + ((FETCH) + (K)) * BLOCK_K, k_size, swizzle)
+    block_tile.copy_async_b(N, K, b_resource, b_begin + (N) * b_half_stride + ((FETCH) + (K)) * BLOCK_K * b_k_stride, b_stride, swizzle)
 #define HTI_LDMAT_A(M, K) block_tile.load_matrix_a(&shared.a[K][M][0][0], swizzle)
 #define HTI_LDMAT_B(N, K) block_tile.template load_matrix_b<N>(&shared.b[K][N][0][0], swizzle)
 #define HTI_CONSUME(M, N, SCHEDULE)                 \
@@ -271,7 +344,7 @@ hgemm_hti_kernel(
     schedule_barrier();
     wait_barrier<BlockTile::NUM_B_LOADS + BlockTile::NUM_A_LOADS>();
 
-    for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
+    for (; a_begin < a_end - 2 * BLOCK_K; a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K * b_k_stride) {
         // 0
         HTI_LDMAT_B(0, 0);
         HTI_LDMAT_A(0, 0);
@@ -356,12 +429,13 @@ hgemm_hti_kernel(
 }
 
 template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS,
-          uint32_t SWIZZLE_M, bool HAS_BIAS>
+          uint32_t SWIZZLE_M, bool HAS_BIAS, bool B_TRANSPOSE = true>
 void hgemm_hti_template(
     const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
-    using wmma_t = backend::WmmaDefault<scalar_t, float, true>;
+    // Keep NT's AGPR schedule; compiler-managed NN accumulators avoid spills.
+    using wmma_t = backend::WmmaDefault<scalar_t, float, B_TRANSPOSE>;
     using swizzle_t = backend::Gfx950Swizzle<3, 3, 3>;
-    using BlockTile = HgemmBlockTileHti<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, HAS_BIAS>;
+    using BlockTile = HgemmBlockTileHti<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, HAS_BIAS, B_TRANSPOSE>;
     constexpr uint32_t BLOCK_THREADS = BlockTile::BLOCK_THREADS;
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);
     if (m == 0 || n == 0 || k == 0) {
@@ -395,7 +469,7 @@ void hgemm_hti_template(
         throw std::invalid_argument("ROCm HTI HGEMM grid size exceeds uint32");
     }
     const dim3 grid(m_blocks * n_blocks);
-    hgemm_hti_kernel<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, SWIZZLE_M, HAS_BIAS>
+    hgemm_hti_kernel<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, SWIZZLE_M, HAS_BIAS, B_TRANSPOSE>
         <<<grid, BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, bias);
 }
 
