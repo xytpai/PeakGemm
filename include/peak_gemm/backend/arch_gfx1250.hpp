@@ -84,16 +84,12 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
 #undef PEAKGEMM_WMMA4
 #endif
 
-// One wave32 computes C[16,16] += A[16,32] * B[32,16], with B held in the same
-// register layout as A after substituting N for M. Both tiles are therefore
-// loaded from row-major (M or N) x K memory.
 template <typename Scalar, typename Accumulator>
 struct WmmaM16N16K32 {
     static constexpr uint32_t m = 16, n = 16, k = 32;
     enum : uint32_t { M = m,
                       N = n,
                       K = k };
-    static constexpr uint32_t wave_size = 32;
     using FragmentAT = core::Vector<Scalar, 16>;
     using FragmentBT = core::Vector<Scalar, 16>;
     using FragmentCT = core::Vector<Accumulator, 8>;

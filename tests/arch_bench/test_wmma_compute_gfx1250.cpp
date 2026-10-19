@@ -157,7 +157,7 @@ float wmma_test() {
 template <typename scalar_t>
 void run_type() {
     using WMMAT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
-    constexpr int warp_size = WMMAT::wave_size;
+    constexpr int warp_size = peak_gemm::backend::Warp::size;
     constexpr int accuracy_loop = 1;
     constexpr int accuracy_blocks = 4;
     constexpr int accuracy_block_warps = 8;

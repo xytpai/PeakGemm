@@ -37,8 +37,12 @@ case "$backend" in
             echo "hipcc is required" >&2
             exit 1
         }
-        # echo "Using ROCm (hipcc)"
-        hipcc -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
+        info=$(rocminfo)
+        warp_size=32
+        if grep -qwE 'gfx950|gfx942' <<< "$info"; then
+            warp_size=64
+        fi
+        hipcc -DPEAKGEMM_WARP_SIZE="$warp_size" -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
         ;;
     *)
         echo "unsupported BACKEND: $backend" >&2
