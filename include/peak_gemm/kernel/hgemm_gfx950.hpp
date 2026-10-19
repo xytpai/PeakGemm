@@ -8,6 +8,7 @@
 #include "peak_gemm/backend/runtime.hpp"
 #include "peak_gemm/core/block_swizzle.hpp"
 #include "peak_gemm/core/math.hpp"
+#include "peak_gemm/core/swizzle.hpp"
 #include "peak_gemm/core/vector.hpp"
 
 using Warp = peak_gemm::backend::Warp;
@@ -363,7 +364,7 @@ template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_
 void hgemm_template(const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, uint32_t split_k, uint32_t *semaphore,
                     uint32_t *signal, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     using wmma_t = backend::WmmaDefault<scalar_t, float>;
-    using swizzle_t = backend::Gfx950Swizzle<3, 3, 3>;
+    using swizzle_t = core::XorSwizzle<3, 3, 3>;
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);
     constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / wmma_t::M;
     constexpr uint32_t WARP_N_STEPS = BLOCK_N / BLOCK_N_WARPS / wmma_t::N;

@@ -1,5 +1,4 @@
-#if (defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))) || \
-    (defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800))
+#if (defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))) || (defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800))
 
 #include <cstdio>
 #include <cstring>
@@ -8,13 +7,15 @@
 
 #include "peak_gemm/peak_gemm.hpp"
 
+#include "peak_gemm/core/swizzle.hpp"
+
 #if defined(__HIPCC__)
 #include "peak_gemm/backend/arch_gfx950.hpp"
-using SwizzleT = peak_gemm::backend::Gfx950IdentitySwizzle;
 #else
 #include "peak_gemm/backend/arch_sm80.hpp"
-using SwizzleT = peak_gemm::backend::IdentitySwizzle;
 #endif
+
+using SwizzleT = peak_gemm::core::IdentitySwizzle;
 
 template <typename scalar_t>
 __global__ void wmma_kernel(

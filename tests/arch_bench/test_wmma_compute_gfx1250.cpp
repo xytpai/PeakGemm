@@ -13,6 +13,7 @@
 
 #include "peak_gemm/peak_gemm.hpp"
 #include "peak_gemm/backend/arch_gfx1250.hpp"
+#include "peak_gemm/core/swizzle.hpp"
 
 template <typename scalar_t, typename WMMAT, int BLOCK_WARPS, int WARP_SIZE, int LOOP, bool ZERO>
 __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
@@ -47,7 +48,7 @@ __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
     WMMAT wmma;
     wmma.init(w_tid);
     wmma.reset_fragment_c(c_frag);
-    const peak_gemm::backend::Gfx1250IdentitySwizzle swizzle;
+    const peak_gemm::core::IdentitySwizzle swizzle;
     wmma.load_matrix_a(a_frag, as_, 0, 0, WK, swizzle);
     wmma.load_matrix_b(b_frag, bs_, 0, 0, WK, swizzle);
     if constexpr (LOOP == 1) {

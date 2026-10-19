@@ -31,28 +31,6 @@ struct AsyncCopy {
     }
 };
 
-template <uint32_t SwizzleBits = 3, uint32_t BaseBits = 3, uint32_t ShiftBits = 3>
-struct Sm80Swizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        constexpr uint32_t swizzle_mask = ((1U << SwizzleBits) - 1U) << BaseBits;
-        return ((address >> ShiftBits) & swizzle_mask) ^ address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return (*this)(column);
-    }
-};
-
-struct IdentitySwizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        return address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return column;
-    }
-};
-
 template <typename Scalar, typename Accumulator>
 struct MmaM16N8K16 {
     static constexpr uint32_t m = 16, n = 8, k = 16;

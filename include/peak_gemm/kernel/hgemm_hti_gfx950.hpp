@@ -1,6 +1,7 @@
 #pragma once
 
 #include "peak_gemm/backend/arch_gfx950.hpp"
+#include "peak_gemm/core/swizzle.hpp"
 #include "peak_gemm/kernel/hgemm_gfx950.hpp"
 
 namespace peak_gemm::kernel {
@@ -360,7 +361,7 @@ template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_
 void hgemm_hti_template(
     const scalar_t *a, const scalar_t *b, scalar_t *c, uint32_t m, uint32_t n, uint32_t k, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     using wmma_t = backend::WmmaDefault<scalar_t, float, true>;
-    using swizzle_t = backend::Gfx950Swizzle<3, 3, 3>;
+    using swizzle_t = core::XorSwizzle<3, 3, 3>;
     using BlockTile = HgemmBlockTileHti<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M, BLOCK_N, BLOCK_M_WARPS, BLOCK_N_WARPS, HAS_BIAS>;
     constexpr uint32_t BLOCK_THREADS = BlockTile::BLOCK_THREADS;
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);

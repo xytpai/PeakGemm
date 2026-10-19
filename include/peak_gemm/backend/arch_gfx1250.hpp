@@ -35,11 +35,8 @@ PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE fp32x8_t wmma_f32_16x16x32_bf16(
 // before the previous one retires.
 constexpr int kWmmaPeakBatch = 32;
 
-#define PEAKGEMM_WMMA4(op)                         \
-    #op " %[c0], %[a], %[b], 0\n\t"                \
-    #op " %[c1], %[a], %[b], 0\n\t"                \
-    #op " %[c2], %[a], %[b], 0\n\t"                \
-    #op " %[c3], %[a], %[b], 0\n\t"
+#define PEAKGEMM_WMMA4(op) \
+    #op " %[c0], %[a], %[b], 0\n\t" #op " %[c1], %[a], %[b], 0\n\t" #op " %[c2], %[a], %[b], 0\n\t" #op " %[c3], %[a], %[b], 0\n\t"
 
 template <bool IsHalf>
 PEAKGEMM_DEVICE void wmma_peak_asm(
@@ -51,18 +48,16 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
         asm volatile(
             "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1\n\t"
             "s_mov_b32 %[cnt], %[trips]\n\t"
-            "%=:\n\t"
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            "s_sub_u32 %[cnt], %[cnt], 1\n\t"
-            "s_cmp_eq_u32 %[cnt], 0\n\t"
-            "s_cbranch_scc0 %=b\n\t"
+            "%=:\n\t" PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16) "s_sub_u32 %[cnt], %[cnt], 1\n\t"
+                                                                                "s_cmp_eq_u32 %[cnt], 0\n\t"
+                                                                                "s_cbranch_scc0 %=b\n\t"
             : [c0] "=v"(c0), [c1] "=v"(c1), [c2] "=v"(c2), [c3] "=v"(c3), [cnt] "=&s"(cnt)
             : [a] "v"(lhs), [b] "v"(rhs), [trips] "s"(trips)
             : "scc");
@@ -70,18 +65,16 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
         asm volatile(
             "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1\n\t"
             "s_mov_b32 %[cnt], %[trips]\n\t"
-            "%=:\n\t"
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            "s_sub_u32 %[cnt], %[cnt], 1\n\t"
-            "s_cmp_eq_u32 %[cnt], 0\n\t"
-            "s_cbranch_scc0 %=b\n\t"
+            "%=:\n\t" PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16) "s_sub_u32 %[cnt], %[cnt], 1\n\t"
+                                                                                 "s_cmp_eq_u32 %[cnt], 0\n\t"
+                                                                                 "s_cbranch_scc0 %=b\n\t"
             : [c0] "=v"(c0), [c1] "=v"(c1), [c2] "=v"(c2), [c3] "=v"(c3), [cnt] "=&s"(cnt)
             : [a] "v"(lhs), [b] "v"(rhs), [trips] "s"(trips)
             : "scc");
@@ -90,16 +83,6 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
 
 #undef PEAKGEMM_WMMA4
 #endif
-
-struct Gfx1250IdentitySwizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        return address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return column;
-    }
-};
 
 // One wave32 computes C[16,16] += A[16,32] * B[32,16], with B held in the same
 // register layout as A after substituting N for M. Both tiles are therefore
