@@ -49,3 +49,16 @@ For single cpp test:
 ```bash
 bash build_single.sh tests/common_bench/test_global_bandwidth.cpp && ./a.out
 ```
+
+## ROCM thread trace
+
+After building the ROCM benchmark, collect an instruction-level Advanced
+Thread Trace (ATT) with:
+
+```bash
+rocprofv3 --att=true --att-library-path /opt/rocm/lib -d att_out -- ./a.out
+```
+
+The `./` prefix is required because the current directory is normally not in
+`PATH`. The generated `att_out` directory contains the raw trace, instruction
+statistics, and `ui_output_agent_*_dispatch_*` data for ROCprof Compute Viewer.
