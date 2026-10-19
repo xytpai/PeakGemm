@@ -11,8 +11,6 @@
 
 #include "peak_gemm/peak_gemm.hpp"
 
-#include "peak_gemm/core/swizzle.hpp"
-
 #if defined(__HIPCC__)
 #include "peak_gemm/backend/arch_gfx950.hpp"
 #else

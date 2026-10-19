@@ -29,7 +29,7 @@ An `8192 x 8192 x 8192` snapshot:
 | `include/peak_gemm/kernel/*.hpp` | Kernel templates |
 | `include/peak_gemm/data.hpp` | Wrappers for test data units |
 | `include/peak_gemm/gemm_bench_infra.hpp` | Shared framework for GEMM tests |
-| `include/peak_gemm/peak_gemm.hpp` | Public include entry point |
+| `include/peak_gemm/peak_gemm.hpp` | Public include entry point, without MMA architecture headers |
 | `tests/arch_bench/test_wmma_compute_*.cpp` | WMMA compute FLOPS on a single GPU |
 | `tests/common_bench/test_fma_compute.cpp` | FP32 compute FLOPS on a single GPU |
 | `tests/common_bench/test_global_bandwidth.cpp` | Device-memory copy bandwidth on a single GPU |
