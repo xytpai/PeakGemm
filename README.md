@@ -30,22 +30,22 @@ An `8192 x 8192 x 8192` snapshot:
 | `include/peak_gemm/data.hpp` | Wrappers for test data units |
 | `include/peak_gemm/gemm_bench_infra.hpp` | Shared framework for GEMM tests |
 | `include/peak_gemm/peak_gemm.hpp` | Public include entry point |
-| `tests/arch_bench/test_fma_compute.cpp` | FP32 compute FLOPS on a single GPU |
-| `tests/arch_bench/test_global_bandwidth.cpp` | Device-memory copy bandwidth on a single GPU |
 | `tests/arch_bench/test_wmma_compute_*.cpp` | WMMA compute FLOPS on a single GPU |
+| `tests/common_bench/test_fma_compute.cpp` | FP32 compute FLOPS on a single GPU |
+| `tests/common_bench/test_global_bandwidth.cpp` | Device-memory copy bandwidth on a single GPU |
 | `tests/core/*.cpp` | Tests of GPU features and utilities |
-| `tests/kernel/*.cpp` | Kernel tests |
+| `tests/gemm/*.cpp` | GEMM correctness tests and benchmarks |
 
 ## Test
 
-To run all tests:
+To run all cpp tests:
 
 ```bash
 bash test_all.sh
 ```
 
-For single target test:
+For single cpp test:
 
 ```bash
-bash build_single.sh tests/arch_bench/test_global_bandwidth.cpp ; ./a.out
+bash build_single.sh tests/common_bench/test_global_bandwidth.cpp && ./a.out
 ```
