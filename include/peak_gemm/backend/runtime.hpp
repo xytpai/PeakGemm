@@ -14,7 +14,11 @@
 namespace peak_gemm::backend {
 
 struct Warp {
+#if defined(__gfx1250__)
+    static constexpr uint32_t size = 32;
+#else
     static constexpr uint32_t size = 64;
+#endif
 
     template <typename T>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {
