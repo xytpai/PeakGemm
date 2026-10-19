@@ -1,3 +1,5 @@
+// reviewed: xytpai
+
 #pragma once
 
 #include <cstdint>
@@ -46,7 +48,7 @@ struct MfmaM16N16K32 {
     using ComputeT = Scalar;
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(uint32_t lane) {
-        lane_ = lane;
+        lane_ = lane; // 0, 1, ..., warp_size - 1.
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void operator()(
@@ -95,36 +97,36 @@ struct MfmaM16N16K32 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix(
         Fragment &fragment,
         Scalar *base,
-        uint32_t row,
-        uint32_t column,
-        uint32_t stride,
+        uint32_t warp_row,
+        uint32_t warp_column,
+        uint32_t row_stride,
         const Swizzle &swizzle) const {
-        const auto target_row = row + lane_ % 16;
-        const auto offset = swizzle(target_row * stride + column + lane_ / 16 * 8);
+        const auto target_row = warp_row + lane_ % 16;
+        const auto offset = swizzle(target_row * row_stride + warp_column + lane_ / 16 * 8);
         fragment = *reinterpret_cast<Fragment *>(base + offset);
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
-        FragmentAT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentAT &fragment, Scalar *base, uint32_t warp_m_begin,
+        uint32_t warp_k_begin, uint32_t m_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, warp_m_begin, warp_k_begin, m_stride, swizzle);
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
-        FragmentBT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentBT &fragment, Scalar *base, uint32_t warp_n_begin,
+        uint32_t warp_k_begin, uint32_t n_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, warp_n_begin, warp_k_begin, n_stride, swizzle);
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer, uint32_t stride, const FragmentCT &fragment) const {
+        Scalar *pointer, uint32_t m_stride, const FragmentCT &fragment) const {
         const auto x = lane_ % 16;
         const auto y = lane_ / 16 * 4;
 #pragma unroll
         for (uint32_t index = 0; index < 4; ++index) {
-            pointer[(y + index) * stride + x] =
+            pointer[(y + index) * m_stride + x] =
                 static_cast<Scalar>(fragment[index]);
         }
     }
