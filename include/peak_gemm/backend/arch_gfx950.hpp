@@ -108,16 +108,16 @@ struct MfmaM16N16K32 {
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
-        FragmentAT &fragment, Scalar *base, uint32_t warp_m_begin,
-        uint32_t warp_k_begin, uint32_t m_stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, warp_m_begin, warp_k_begin, m_stride, swizzle);
+        FragmentAT &fragment, Scalar *base, uint32_t mma_m_begin,
+        uint32_t mma_k_begin, uint32_t m_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_m_begin, mma_k_begin, m_stride, swizzle);
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
-        FragmentBT &fragment, Scalar *base, uint32_t warp_n_begin,
-        uint32_t warp_k_begin, uint32_t n_stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, warp_n_begin, warp_k_begin, n_stride, swizzle);
+        FragmentBT &fragment, Scalar *base, uint32_t mma_n_begin,
+        uint32_t mma_k_begin, uint32_t n_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_n_begin, mma_k_begin, n_stride, swizzle);
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
