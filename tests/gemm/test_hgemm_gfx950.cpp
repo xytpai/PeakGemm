@@ -1,6 +1,7 @@
 #if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))
 
 #include <cstdio>
+#include <iostream>
 #include <cstring>
 
 #include "peak_gemm/gemm_bench_infra.hpp"
@@ -61,7 +62,7 @@ int main() {
         return 1;
     }
     if (!((std::strncmp(properties.gcnArchName, "gfx950", 6) == 0 && (properties.gcnArchName[6] == '\0' || properties.gcnArchName[6] == ':')))) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
     const std::vector<bench::GemmShape> mnks{
@@ -91,10 +92,10 @@ int main() {
 
 #else
 
-#include <cstdio>
+#include <iostream>
 
 int main() {
-    std::puts("[skip] architecture guard is inactive");
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 

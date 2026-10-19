@@ -1,6 +1,7 @@
 #if defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 
 #include <cstdio>
+#include <iostream>
 
 #include "peak_gemm/gemm_bench_infra.hpp"
 #include "peak_gemm/backend/arch_sm80.hpp"
@@ -51,7 +52,7 @@ int main() {
         return 1;
     }
     if (!(properties.major >= 8)) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
     const std::vector<bench::GemmShape> mnks{
@@ -80,10 +81,10 @@ int main() {
 
 #else
 
-#include <cstdio>
+#include <iostream>
 
 int main() {
-    std::puts("[skip] architecture guard is inactive");
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 

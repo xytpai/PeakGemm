@@ -3,7 +3,6 @@
 
 #include <cstdio>
 #include <cstring>
-
 #include <iostream>
 #include <string>
 
@@ -96,7 +95,7 @@ int main() {
         return 1;
     }
     if (!((std::strncmp(properties.gcnArchName, "gfx950", 6) == 0 && (properties.gcnArchName[6] == '\0' || properties.gcnArchName[6] == ':')))) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
 #else
@@ -109,7 +108,7 @@ int main() {
         return 1;
     }
     if (!(properties.major >= 8)) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
 #endif
@@ -166,10 +165,10 @@ int main() {
 
 #else
 
-#include <cstdio>
+#include <iostream>
 
 int main() {
-    std::puts("[skip] architecture guard is inactive");
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 

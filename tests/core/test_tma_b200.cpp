@@ -2,7 +2,6 @@
     (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
 
 #include <cstdio>
-
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -173,7 +172,7 @@ int main() {
         return 1;
     }
     if (!((properties.major == 10 && properties.minor == 0))) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
     test_tma();
@@ -182,10 +181,10 @@ int main() {
 
 #else
 
-#include <cstdio>
+#include <iostream>
 
 int main() {
-    std::puts("[skip] architecture guard is inactive");
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 

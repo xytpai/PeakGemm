@@ -1,8 +1,8 @@
 #if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1250__))
 
 #include <cstdio>
+#include <iostream>
 #include <cstring>
-
 #include <algorithm>
 #include <cassert>
 #include <climits>
@@ -188,7 +188,7 @@ int main() {
         return 1;
     }
     if (!((std::strncmp(properties.gcnArchName, "gfx1250", 7) == 0 && (properties.gcnArchName[7] == '\0' || properties.gcnArchName[7] == ':')))) {
-        std::puts("[skip] unsupported GPU architecture");
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
     run_type<__half>();
@@ -199,10 +199,10 @@ int main() {
 
 #else
 
-#include <cstdio>
+#include <iostream>
 
 int main() {
-    std::puts("[skip] architecture guard is inactive");
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 
