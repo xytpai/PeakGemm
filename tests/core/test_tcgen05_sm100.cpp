@@ -1,9 +1,11 @@
+#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13) && \
+    (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
+
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
-
-#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13)
 
 #include "peak_gemm/backend/arch_sm100.hpp"
 
@@ -112,13 +114,18 @@ __global__ void tcgen05_smoke_kernel(
 }
 
 int main() {
+    int device = 0;
     cudaDeviceProp properties{};
-    cudaGetDeviceProperties(&properties, 0);
-    if (properties.major != 10 || properties.minor != 0) {
-        std::cout << "skip: TCGEN05 requires B200\n";
+    auto status = cudaGetDevice(&device);
+    if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    if (!((properties.major == 10 && properties.minor == 0))) {
+        std::cout << "[skip] unsupported GPU architecture\n";
         return 0;
     }
-
     std::vector<scalar_t> host_a(TileM * TileK, scalar_t(1.0f));
     std::vector<scalar_t> host_b(TileN * TileK, scalar_t(1.0f));
     std::vector<float> host_result(2 * 32 * 16);
@@ -205,8 +212,10 @@ int main() {
 
 #else
 
+#include <iostream>
+
 int main() {
-    std::cout << "skip: TCGEN05 requires CUDA 13+\n";
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 

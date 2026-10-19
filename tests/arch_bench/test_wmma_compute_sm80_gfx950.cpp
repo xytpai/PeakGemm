@@ -1,15 +1,24 @@
-#include "peak_gemm/peak_gemm.hpp"
+#if (defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))) || \
+    (defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800))
 
-#if defined(__CUDACC__)
-#include "peak_gemm/backend/arch_sm80.hpp"
-#elif defined(__HIPCC__)
-#include "peak_gemm/backend/arch_gfx950.hpp"
-#endif
-
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <string>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <typeinfo>
+
+#include "peak_gemm/peak_gemm.hpp"
+
+#if defined(__HIPCC__)
+#include "peak_gemm/backend/arch_gfx950.hpp"
+using SwizzleT = peak_gemm::backend::Gfx950IdentitySwizzle;
+#else
+#include "peak_gemm/backend/arch_sm80.hpp"
+using SwizzleT = peak_gemm::backend::IdentitySwizzle;
+#endif
 
 template <typename scalar_t, typename WMMAT, int BLOCK_WARPS, int WARP_SIZE, int LOOP>
 __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
@@ -43,11 +52,6 @@ __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
     WMMAT wmma;
     wmma.init(w_tid);
     wmma.reset_fragment_c(c_frag);
-#if defined(__CUDACC__)
-    using SwizzleT = peak_gemm::backend::IdentitySwizzle;
-#else
-    using SwizzleT = peak_gemm::backend::Gfx950IdentitySwizzle;
-#endif
     const SwizzleT swizzle;
     wmma.load_matrix_a(a_frag, as_, 0, 0, WK, swizzle);
     wmma.load_matrix_b(b_frag, bs_, 0, 0, WK, swizzle);
@@ -173,8 +177,46 @@ void run_type() {
 }
 
 int main() {
+#if defined(__HIPCC__)
+    int device = 0;
+    hipDeviceProp_t properties{};
+    auto status = hipGetDevice(&device);
+    if (status == hipSuccess) status = hipGetDeviceProperties(&properties, device);
+    if (status != hipSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", hipGetErrorString(status));
+        return 1;
+    }
+    if (!((std::strncmp(properties.gcnArchName, "gfx950", 6) == 0 && (properties.gcnArchName[6] == '\0' || properties.gcnArchName[6] == ':')))) {
+        std::cout << "[skip] unsupported GPU architecture\n";
+        return 0;
+    }
+#else
+    int device = 0;
+    cudaDeviceProp properties{};
+    auto status = cudaGetDevice(&device);
+    if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    if (!(properties.major >= 8)) {
+        std::cout << "[skip] unsupported GPU architecture\n";
+        return 0;
+    }
+#endif
     run_type<__half>();
     run_type<__bfloat16>();
     std::cout << "ok\n";
     return 0;
 }
+
+#else
+
+#include <iostream>
+
+int main() {
+    std::cout << "[skip] unsupported GPU architecture\n";
+    return 0;
+}
+
+#endif

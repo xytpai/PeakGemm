@@ -1,7 +1,9 @@
+#if defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+
+#include <cstdio>
+#include <iostream>
+
 #include "peak_gemm/gemm_bench_infra.hpp"
-
-#if defined(__CUDACC__)
-
 #include "peak_gemm/backend/arch_sm80.hpp"
 #include "peak_gemm/kernel/hgemm_sm80.hpp"
 
@@ -41,6 +43,18 @@ struct HgemmSm80Launch {
 };
 
 int main() {
+    int device = 0;
+    cudaDeviceProp properties{};
+    auto status = cudaGetDevice(&device);
+    if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    if (!(properties.major >= 8)) {
+        std::cout << "[skip] unsupported GPU architecture\n";
+        return 0;
+    }
     const std::vector<bench::GemmShape> mnks{
         {16, 64, 256},
         {32, 128, 512},
@@ -67,8 +81,10 @@ int main() {
 
 #else
 
+#include <iostream>
+
 int main() {
-    std::cout << "skip: sm80 requires cuda\n";
+    std::cout << "[skip] unsupported GPU architecture\n";
     return 0;
 }
 
