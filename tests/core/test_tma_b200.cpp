@@ -1,9 +1,12 @@
+#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13) && \
+    (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
+
+#include <cstdio>
+
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
-
-#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13)
 
 #include "peak_gemm/backend/arch_sm100.hpp"
 #include "peak_gemm/data.hpp"
@@ -161,10 +164,16 @@ void test_tma() {
 } // namespace
 
 int main() {
+    int device = 0;
     cudaDeviceProp properties{};
-    cudaGetDeviceProperties(&properties, 0);
-    if (properties.major != 10 || properties.minor != 0) {
-        std::cout << "[skip] B200 TMA requires SM100\n";
+    auto status = cudaGetDevice(&device);
+    if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    if (!((properties.major == 10 && properties.minor == 0))) {
+        std::puts("[skip] unsupported GPU architecture");
         return 0;
     }
     test_tma();
@@ -173,8 +182,10 @@ int main() {
 
 #else
 
+#include <cstdio>
+
 int main() {
-    std::cout << "[skip] B200 TMA requires CUDA 13+\n";
+    std::puts("[skip] architecture guard is inactive");
     return 0;
 }
 

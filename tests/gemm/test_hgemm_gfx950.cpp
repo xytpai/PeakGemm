@@ -1,7 +1,9 @@
+#if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))
+
+#include <cstdio>
+#include <cstring>
+
 #include "peak_gemm/gemm_bench_infra.hpp"
-
-#if defined(__HIPCC__)
-
 #include "peak_gemm/backend/arch_gfx950.hpp"
 #include "peak_gemm/kernel/hgemm_gfx950.hpp"
 #include "peak_gemm/kernel/hgemm_hti_gfx950.hpp"
@@ -50,6 +52,18 @@ struct HgemmGfx950Launch {
 };
 
 int main() {
+    int device = 0;
+    hipDeviceProp_t properties{};
+    auto status = hipGetDevice(&device);
+    if (status == hipSuccess) status = hipGetDeviceProperties(&properties, device);
+    if (status != hipSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", hipGetErrorString(status));
+        return 1;
+    }
+    if (!((std::strncmp(properties.gcnArchName, "gfx950", 6) == 0 && (properties.gcnArchName[6] == '\0' || properties.gcnArchName[6] == ':')))) {
+        std::puts("[skip] unsupported GPU architecture");
+        return 0;
+    }
     const std::vector<bench::GemmShape> mnks{
         {16, 64, 256},
         {32, 128, 512},
@@ -77,8 +91,10 @@ int main() {
 
 #else
 
+#include <cstdio>
+
 int main() {
-    std::cout << "skip: gfx950 requires rocm\n";
+    std::puts("[skip] architecture guard is inactive");
     return 0;
 }
 

@@ -1,7 +1,9 @@
+#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13) && \
+    (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
+
+#include <cstdio>
+
 #include "peak_gemm/gemm_bench_infra.hpp"
-
-#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13)
-
 #include "peak_gemm/kernel/hgemm_sm100.hpp"
 
 using peak_gemm::Data;
@@ -72,13 +74,18 @@ struct HgemmSm100Launch {
 };
 
 int main() {
+    int device = 0;
     cudaDeviceProp properties{};
-    cudaGetDeviceProperties(&properties, 0);
-    if (properties.major != 10 || properties.minor != 0) {
-        std::cout << "skip: sm100 hgemm requires B200\n";
+    auto status = cudaGetDevice(&device);
+    if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    if (!((properties.major == 10 && properties.minor == 0))) {
+        std::puts("[skip] unsupported GPU architecture");
         return 0;
     }
-
     const std::vector<bench::GemmShape> mnks{
         {256, 256, 64},
         {256, 256, 384},
@@ -107,8 +114,10 @@ int main() {
 
 #else
 
+#include <cstdio>
+
 int main() {
-    std::cout << "skip: sm100 hgemm requires CUDA 13+\n";
+    std::puts("[skip] architecture guard is inactive");
     return 0;
 }
 

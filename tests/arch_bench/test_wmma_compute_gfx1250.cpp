@@ -1,8 +1,7 @@
-#include "peak_gemm/peak_gemm.hpp"
+#if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1250__))
 
-#if defined(__HIPCC__)
-#include "peak_gemm/backend/arch_gfx1250.hpp"
-#endif
+#include <cstdio>
+#include <cstring>
 
 #include <algorithm>
 #include <cassert>
@@ -12,7 +11,8 @@
 #include <string>
 #include <typeinfo>
 
-#if defined(__HIPCC__)
+#include "peak_gemm/peak_gemm.hpp"
+#include "peak_gemm/backend/arch_gfx1250.hpp"
 
 template <typename scalar_t, typename WMMAT, int BLOCK_WARPS, int WARP_SIZE, int LOOP, bool ZERO>
 __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
@@ -179,15 +179,18 @@ void run_type() {
 }
 
 int main() {
-    int device_count = 0;
-    hipDeviceProp_t prop{};
-    if (hipGetDeviceCount(&device_count) != hipSuccess || device_count <= 0 ||
-        hipGetDeviceProperties(&prop, 0) != hipSuccess ||
-        std::string(prop.gcnArchName).find("gfx1250") == std::string::npos) {
-        std::cout << "skip: MI455X mma benchmark requires gfx1250\n";
+    int device = 0;
+    hipDeviceProp_t properties{};
+    auto status = hipGetDevice(&device);
+    if (status == hipSuccess) status = hipGetDeviceProperties(&properties, device);
+    if (status != hipSuccess) {
+        std::fprintf(stderr, "GPU query failed: %s\n", hipGetErrorString(status));
+        return 1;
+    }
+    if (!((std::strncmp(properties.gcnArchName, "gfx1250", 7) == 0 && (properties.gcnArchName[7] == '\0' || properties.gcnArchName[7] == ':')))) {
+        std::puts("[skip] unsupported GPU architecture");
         return 0;
     }
-    std::cout << "MI455X WMMA " << prop.name << " (" << prop.gcnArchName << ")\n";
     run_type<__half>();
     run_type<__bfloat16>();
     std::cout << "ok\n";
@@ -196,8 +199,10 @@ int main() {
 
 #else
 
+#include <cstdio>
+
 int main() {
-    std::cout << "skip: MI455X mma benchmark requires rocm\n";
+    std::puts("[skip] architecture guard is inactive");
     return 0;
 }
 
