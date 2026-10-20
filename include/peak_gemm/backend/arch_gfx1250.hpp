@@ -96,7 +96,7 @@ struct WmmaM16N16K32 {
     using ComputeT = Scalar;
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(uint32_t lane) {
-        lane_ = lane;
+        lane_ = lane; // 0, 1, ..., warp_size - 1.
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void operator()(
@@ -136,53 +136,49 @@ struct WmmaM16N16K32 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix(
         Fragment &fragment,
         Scalar *base,
-        uint32_t row,
-        uint32_t column,
-        uint32_t stride,
+        uint32_t warp_row,
+        uint32_t warp_column,
+        uint32_t row_stride,
         const Swizzle &swizzle) const {
-        const uint32_t target_row = row + (lane_ & 15U);
+        using LoadT = core::Vector<Scalar, 8>;
+        static_assert(sizeof(LoadT) == 16);
+        auto *fragment_parts = reinterpret_cast<LoadT *>(&fragment);
+        const auto target_row = warp_row + lane_ % 16;
+        const auto target_column = warp_column + lane_ / 16 * 8;
+        // Two 16B-aligned loads; swizzle must preserve each 8-element block.
 #pragma unroll
-        for (uint32_t element = 0; element < 16; ++element) {
-            const uint32_t k = fragment_k(element);
-            fragment[element] = base[swizzle(target_row * stride + column + k)];
+        for (uint32_t index = 0; index < 2; ++index) {
+            const auto offset = swizzle(target_row * row_stride + target_column + index * 16);
+            fragment_parts[index] = *reinterpret_cast<const LoadT *>(base + offset);
         }
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
-        FragmentAT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentAT &fragment, Scalar *base, uint32_t mma_m_begin,
+        uint32_t mma_k_begin, uint32_t m_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_m_begin, mma_k_begin, m_stride, swizzle);
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
-        FragmentBT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentBT &fragment, Scalar *base, uint32_t mma_n_begin,
+        uint32_t mma_k_begin, uint32_t n_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_n_begin, mma_k_begin, n_stride, swizzle);
     }
 
-    // C is stored with N along the lane and M along the accumulator VGPR:
-    // n = lane % 16, m = (lane / 16) * 8 + vgpr.
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer, uint32_t stride, const FragmentCT &fragment) const {
-        const uint32_t n = lane_ & 15U;
-        const uint32_t m = (lane_ >> 4) * 8;
+        Scalar *pointer, uint32_t m_stride, const FragmentCT &fragment) const {
+        const auto x = lane_ % 16;
+        const auto y = lane_ / 16 * 8;
 #pragma unroll
-        for (uint32_t vgpr = 0; vgpr < 8; ++vgpr) {
-            pointer[(m + vgpr) * stride + n] = static_cast<Scalar>(fragment[vgpr]);
+        for (uint32_t index = 0; index < 8; ++index) {
+            pointer[(y + index) * m_stride + x] =
+                static_cast<Scalar>(fragment[index]);
         }
     }
 
 private:
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t fragment_k(uint32_t element) const {
-        const uint32_t group = lane_ >> 4;
-        const uint32_t vgpr = element >> 1;
-        const uint32_t sub = element & 1U;
-        const uint32_t base = vgpr < 4 ? group * 8 + vgpr * 2 : 16 + group * 8 + (vgpr - 4) * 2;
-        return base + sub;
-    }
-
     uint32_t lane_ = 0;
 };
 
