@@ -1,4 +1,4 @@
-#if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))
+#if defined(__HIPCC__) && ROCM_TARGET == 950
 
 #include <cstdio>
 #include <iostream>

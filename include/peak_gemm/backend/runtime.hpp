@@ -14,12 +14,11 @@
 namespace peak_gemm::backend {
 
 struct Warp {
-// Set by the build for BOTH host and device passes; no runtime dispatch.
-#ifndef PEAKGEMM_WARP_SIZE
-#error "Use build_single.sh or define PEAKGEMM_WARP_SIZE (gfx1250=32, gfx950=64)"
+#if ROCM_TARGET == 942 || ROCM_TARGET == 950
+    static constexpr uint32_t size = 64;
+#elif ROCM_TARGET == 1250
+    static constexpr uint32_t size = 32;
 #endif
-    static constexpr uint32_t size = PEAKGEMM_WARP_SIZE;
-    static_assert(size == 32 || size == 64, "Unsupported HIP warp size");
 
     template <typename T>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE static T shuffle(T value, int source_lane) {

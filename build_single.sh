@@ -37,12 +37,8 @@ case "$backend" in
             echo "hipcc is required" >&2
             exit 1
         }
-        info=$(rocminfo)
-        warp_size=32
-        if grep -qwE 'gfx950|gfx942' <<< "$info"; then
-            warp_size=64
-        fi
-        hipcc -DPEAKGEMM_WARP_SIZE="$warp_size" -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
+        arch=$(rocminfo | grep Name | grep -m1 -o 'gfx[0-9a-z]*')
+        hipcc "--offload-arch=$arch" "-DROCM_TARGET=${arch#gfx}" -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
         ;;
     *)
         echo "unsupported BACKEND: $backend" >&2

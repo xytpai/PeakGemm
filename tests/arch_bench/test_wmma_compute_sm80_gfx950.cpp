@@ -1,4 +1,4 @@
-#if (defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__))) || (defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800))
+#if (defined(__HIPCC__) && ROCM_TARGET == 950) || (defined(__CUDACC__) && !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800))
 
 #include <cstdio>
 #include <cstring>
