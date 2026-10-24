@@ -21,6 +21,7 @@
 #include "peak_gemm/core/layout.hpp"
 #include "peak_gemm/core/math.hpp"
 #include "peak_gemm/core/shape.hpp"
+#include "peak_gemm/core/swizzle.hpp"
 #include "peak_gemm/core/vector.hpp"
 
 #include "peak_gemm/backend/runtime.hpp"

@@ -37,8 +37,8 @@ case "$backend" in
             echo "hipcc is required" >&2
             exit 1
         }
-        # echo "Using ROCm (hipcc)"
-        hipcc -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
+        arch=$(rocminfo | grep Name | grep -m1 -o 'gfx[0-9a-z]*')
+        hipcc "--offload-arch=$arch" "-DROCM_TARGET=${arch#gfx}" -Wno-unused-value -O3 "$@" --std=c++20 -Iinclude "$source_file" -o a.out
         ;;
     *)
         echo "unsupported BACKEND: $backend" >&2

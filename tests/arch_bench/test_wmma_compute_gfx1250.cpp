@@ -1,4 +1,4 @@
-#if defined(__HIPCC__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1250__))
+#if defined(__HIPCC__) && ROCM_TARGET == 1250
 
 #include <cstdio>
 #include <iostream>
@@ -13,6 +13,8 @@
 
 #include "peak_gemm/peak_gemm.hpp"
 #include "peak_gemm/backend/arch_gfx1250.hpp"
+
+using SwizzleT = peak_gemm::core::IdentitySwizzle;
 
 template <typename scalar_t, typename WMMAT, int BLOCK_WARPS, int WARP_SIZE, int LOOP, bool ZERO>
 __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
@@ -47,7 +49,7 @@ __global__ void wmma_loop_kernel(float *c, scalar_t *a, scalar_t *b) {
     WMMAT wmma;
     wmma.init(w_tid);
     wmma.reset_fragment_c(c_frag);
-    const peak_gemm::backend::Gfx1250IdentitySwizzle swizzle;
+    const SwizzleT swizzle;
     wmma.load_matrix_a(a_frag, as_, 0, 0, WK, swizzle);
     wmma.load_matrix_b(b_frag, bs_, 0, 0, WK, swizzle);
     if constexpr (LOOP == 1) {
@@ -155,7 +157,7 @@ float wmma_test() {
 template <typename scalar_t>
 void run_type() {
     using WMMAT = peak_gemm::backend::WmmaDefault<scalar_t, float>;
-    constexpr int warp_size = WMMAT::wave_size;
+    constexpr int warp_size = peak_gemm::backend::Warp::size;
     constexpr int accuracy_loop = 1;
     constexpr int accuracy_blocks = 4;
     constexpr int accuracy_block_warps = 8;
