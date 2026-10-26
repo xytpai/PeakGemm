@@ -14,10 +14,10 @@
 namespace peak_gemm::backend {
 
 struct Warp {
-#if defined(__gfx1250__)
-    static constexpr uint32_t size = 32;
-#else
+#if ROCM_TARGET == 942 || ROCM_TARGET == 950
     static constexpr uint32_t size = 64;
+#elif ROCM_TARGET == 1250
+    static constexpr uint32_t size = 32;
 #endif
 
     template <typename T>

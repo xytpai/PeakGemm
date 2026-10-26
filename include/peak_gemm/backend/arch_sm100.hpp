@@ -9,6 +9,7 @@
 
 #include "peak_gemm/backend/runtime.hpp"
 #include "peak_gemm/core/config.hpp"
+#include "peak_gemm/core/swizzle.hpp"
 
 #if defined(__CUDA_ARCH_FEAT_SM100_ALL) || (defined(__CUDA_ARCH_SPECIFIC__) && __CUDA_ARCH_SPECIFIC__ == 1000)
 #define PEAKGEMM_ARCH_SM100A 1
@@ -396,7 +397,8 @@ PEAKGEMM_DEVICE_INLINE void tmem_load_x16(
 PEAKGEMM_DEVICE_INLINE uint32_t swizzle_128b_chunk(
     uint32_t row,
     uint32_t chunk) {
-    return row * 8U + (chunk ^ (row & 7U));
+    // chunk is a 16-byte chunk index within a 128-byte row (0..7).
+    return core::XorSwizzle<3, 0, 3>{}(row * 8U + chunk);
 }
 
 } // namespace peak_gemm::backend::sm100

@@ -1,5 +1,4 @@
-#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13) && \
-    (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
+#if defined(__CUDACC__) && !defined(__HIPCC__) && (__CUDACC_VER_MAJOR__ >= 13) && (!defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || (__CUDA_ARCH_SPECIFIC__ == 1000))
 
 #include <cstdio>
 #include <algorithm>

@@ -35,11 +35,8 @@ PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE fp32x8_t wmma_f32_16x16x32_bf16(
 // before the previous one retires.
 constexpr int kWmmaPeakBatch = 32;
 
-#define PEAKGEMM_WMMA4(op)                         \
-    #op " %[c0], %[a], %[b], 0\n\t"                \
-    #op " %[c1], %[a], %[b], 0\n\t"                \
-    #op " %[c2], %[a], %[b], 0\n\t"                \
-    #op " %[c3], %[a], %[b], 0\n\t"
+#define PEAKGEMM_WMMA4(op) \
+    #op " %[c0], %[a], %[b], 0\n\t" #op " %[c1], %[a], %[b], 0\n\t" #op " %[c2], %[a], %[b], 0\n\t" #op " %[c3], %[a], %[b], 0\n\t"
 
 template <bool IsHalf>
 PEAKGEMM_DEVICE void wmma_peak_asm(
@@ -51,18 +48,16 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
         asm volatile(
             "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1\n\t"
             "s_mov_b32 %[cnt], %[trips]\n\t"
-            "%=:\n\t"
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
-            "s_sub_u32 %[cnt], %[cnt], 1\n\t"
-            "s_cmp_eq_u32 %[cnt], 0\n\t"
-            "s_cbranch_scc0 %=b\n\t"
+            "%=:\n\t" PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16)
+                                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_f16) "s_sub_u32 %[cnt], %[cnt], 1\n\t"
+                                                                                "s_cmp_eq_u32 %[cnt], 0\n\t"
+                                                                                "s_cbranch_scc0 %=b\n\t"
             : [c0] "=v"(c0), [c1] "=v"(c1), [c2] "=v"(c2), [c3] "=v"(c3), [cnt] "=&s"(cnt)
             : [a] "v"(lhs), [b] "v"(rhs), [trips] "s"(trips)
             : "scc");
@@ -70,18 +65,16 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
         asm volatile(
             "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1\n\t"
             "s_mov_b32 %[cnt], %[trips]\n\t"
-            "%=:\n\t"
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
-            "s_sub_u32 %[cnt], %[cnt], 1\n\t"
-            "s_cmp_eq_u32 %[cnt], 0\n\t"
-            "s_cbranch_scc0 %=b\n\t"
+            "%=:\n\t" PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                            PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                    PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16)
+                                        PEAKGEMM_WMMA4(v_wmma_f32_16x16x32_bf16) "s_sub_u32 %[cnt], %[cnt], 1\n\t"
+                                                                                 "s_cmp_eq_u32 %[cnt], 0\n\t"
+                                                                                 "s_cbranch_scc0 %=b\n\t"
             : [c0] "=v"(c0), [c1] "=v"(c1), [c2] "=v"(c2), [c3] "=v"(c3), [cnt] "=&s"(cnt)
             : [a] "v"(lhs), [b] "v"(rhs), [trips] "s"(trips)
             : "scc");
@@ -91,33 +84,19 @@ PEAKGEMM_DEVICE void wmma_peak_asm(
 #undef PEAKGEMM_WMMA4
 #endif
 
-struct Gfx1250IdentitySwizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        return address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return column;
-    }
-};
-
-// One wave32 computes C[16,16] += A[16,32] * B[32,16], with B held in the same
-// register layout as A after substituting N for M. Both tiles are therefore
-// loaded from row-major (M or N) x K memory.
 template <typename Scalar, typename Accumulator>
 struct WmmaM16N16K32 {
     static constexpr uint32_t m = 16, n = 16, k = 32;
     enum : uint32_t { M = m,
                       N = n,
                       K = k };
-    static constexpr uint32_t wave_size = 32;
     using FragmentAT = core::Vector<Scalar, 16>;
     using FragmentBT = core::Vector<Scalar, 16>;
     using FragmentCT = core::Vector<Accumulator, 8>;
     using ComputeT = Scalar;
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(uint32_t lane) {
-        lane_ = lane;
+        lane_ = lane; // 0, 1, ..., warp_size - 1.
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void operator()(
@@ -157,53 +136,49 @@ struct WmmaM16N16K32 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix(
         Fragment &fragment,
         Scalar *base,
-        uint32_t row,
-        uint32_t column,
-        uint32_t stride,
+        uint32_t warp_row,
+        uint32_t warp_column,
+        uint32_t row_stride,
         const Swizzle &swizzle) const {
-        const uint32_t target_row = row + (lane_ & 15U);
+        using LoadT = core::Vector<Scalar, 8>;
+        static_assert(sizeof(LoadT) == 16);
+        auto *fragment_parts = reinterpret_cast<LoadT *>(&fragment);
+        const auto target_row = warp_row + lane_ % 16;
+        const auto target_column = warp_column + lane_ / 16 * 8;
+        // Two 16B-aligned loads; swizzle must preserve each 8-element block.
 #pragma unroll
-        for (uint32_t element = 0; element < 16; ++element) {
-            const uint32_t k = fragment_k(element);
-            fragment[element] = base[swizzle(target_row * stride + column + k)];
+        for (uint32_t index = 0; index < 2; ++index) {
+            const auto offset = swizzle(target_row * row_stride + target_column + index * 16);
+            fragment_parts[index] = *reinterpret_cast<const LoadT *>(base + offset);
         }
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
-        FragmentAT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentAT &fragment, Scalar *base, uint32_t mma_m_begin,
+        uint32_t mma_k_begin, uint32_t m_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_m_begin, mma_k_begin, m_stride, swizzle);
     }
 
     template <typename Swizzle>
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
-        FragmentBT &fragment, Scalar *base, uint32_t row,
-        uint32_t column, uint32_t stride, const Swizzle &swizzle) const {
-        load_matrix(fragment, base, row, column, stride, swizzle);
+        FragmentBT &fragment, Scalar *base, uint32_t mma_n_begin,
+        uint32_t mma_k_begin, uint32_t n_stride, const Swizzle &swizzle) const {
+        load_matrix(fragment, base, mma_n_begin, mma_k_begin, n_stride, swizzle);
     }
 
-    // C is stored with N along the lane and M along the accumulator VGPR:
-    // n = lane % 16, m = (lane / 16) * 8 + vgpr.
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer, uint32_t stride, const FragmentCT &fragment) const {
-        const uint32_t n = lane_ & 15U;
-        const uint32_t m = (lane_ >> 4) * 8;
+        Scalar *pointer, uint32_t m_stride, const FragmentCT &fragment) const {
+        const auto x = lane_ % 16;
+        const auto y = lane_ / 16 * 8;
 #pragma unroll
-        for (uint32_t vgpr = 0; vgpr < 8; ++vgpr) {
-            pointer[(m + vgpr) * stride + n] = static_cast<Scalar>(fragment[vgpr]);
+        for (uint32_t index = 0; index < 8; ++index) {
+            pointer[(y + index) * m_stride + x] =
+                static_cast<Scalar>(fragment[index]);
         }
     }
 
 private:
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t fragment_k(uint32_t element) const {
-        const uint32_t group = lane_ >> 4;
-        const uint32_t vgpr = element >> 1;
-        const uint32_t sub = element & 1U;
-        const uint32_t base = vgpr < 4 ? group * 8 + vgpr * 2 : 16 + group * 8 + (vgpr - 4) * 2;
-        return base + sub;
-    }
-
     uint32_t lane_ = 0;
 };
 

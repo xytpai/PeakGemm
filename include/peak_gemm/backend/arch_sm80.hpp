@@ -1,3 +1,5 @@
+// reviewed: xytpai
+
 #pragma once
 
 #include <cstdint>
@@ -31,28 +33,6 @@ struct AsyncCopy {
     }
 };
 
-template <uint32_t SwizzleBits = 3, uint32_t BaseBits = 3, uint32_t ShiftBits = 3>
-struct Sm80Swizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        constexpr uint32_t swizzle_mask = ((1U << SwizzleBits) - 1U) << BaseBits;
-        return ((address >> ShiftBits) & swizzle_mask) ^ address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return (*this)(column);
-    }
-};
-
-struct IdentitySwizzle {
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t address) const {
-        return address;
-    }
-
-    PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE uint32_t operator()(uint32_t, uint32_t column) const {
-        return column;
-    }
-};
-
 template <typename Scalar, typename Accumulator>
 struct MmaM16N8K16 {
     static constexpr uint32_t m = 16, n = 8, k = 16;
@@ -65,7 +45,7 @@ struct MmaM16N8K16 {
     using ComputeT = Scalar;
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void init(uint32_t lane) {
-        lane_ = lane;
+        lane_ = lane; // 0, 1, ..., warp_size - 1.
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void operator()(
@@ -105,12 +85,12 @@ struct MmaM16N8K16 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_a(
         FragmentAT &fragment,
         Scalar *base,
-        uint32_t row,
-        uint32_t column,
-        uint32_t stride,
+        uint32_t mma_m_begin,
+        uint32_t mma_k_begin,
+        uint32_t m_stride,
         const Swizzle &swizzle) const {
         auto *registers = reinterpret_cast<uint32_t *>(&fragment);
-        const auto offset = swizzle((row + lane_ % 16) * stride + column + lane_ / 16 * 8);
+        const auto offset = swizzle((mma_m_begin + lane_ % 16) * m_stride + mma_k_begin + lane_ / 16 * 8);
         const auto address =
             static_cast<uint32_t>(__cvta_generic_to_shared(base + offset));
         asm volatile(
@@ -124,14 +104,14 @@ struct MmaM16N8K16 {
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void load_matrix_b(
         FragmentBT &fragment,
         Scalar *base,
-        uint32_t row,
-        uint32_t column,
-        uint32_t stride,
+        uint32_t mma_n_begin,
+        uint32_t mma_k_begin,
+        uint32_t n_stride,
         const Swizzle &swizzle) const {
-        const auto y = column + lane_ % 4 * 2;
-        const auto x = row + lane_ / 4;
-        const auto offset0 = swizzle(x * stride + y);
-        const auto offset1 = swizzle(x * stride + y + 8);
+        const auto y = mma_k_begin + lane_ % 4 * 2;
+        const auto x = mma_n_begin + lane_ / 4;
+        const auto offset0 = swizzle(x * n_stride + y);
+        const auto offset1 = swizzle(x * n_stride + y + 8);
         fragment.values[0] = base[offset0];
         fragment.values[1] = base[offset0 + 1];
         fragment.values[2] = base[offset1];
@@ -139,14 +119,14 @@ struct MmaM16N8K16 {
     }
 
     PEAKGEMM_DEVICE PEAKGEMM_FORCEINLINE void store_matrix(
-        Scalar *pointer, uint32_t stride, const FragmentCT &fragment) const {
+        Scalar *pointer, uint32_t m_stride, const FragmentCT &fragment) const {
         const auto y = lane_ / 4;
         const auto x = lane_ % 4 * 2;
         using Pair = core::Vector<Scalar, 2>;
         const Pair row0{{static_cast<Scalar>(fragment[0]), static_cast<Scalar>(fragment[1])}};
         const Pair row1{{static_cast<Scalar>(fragment[2]), static_cast<Scalar>(fragment[3])}};
-        *reinterpret_cast<Pair *>(&pointer[y * stride + x]) = row0;
-        *reinterpret_cast<Pair *>(&pointer[(y + 8) * stride + x]) = row1;
+        *reinterpret_cast<Pair *>(&pointer[y * m_stride + x]) = row0;
+        *reinterpret_cast<Pair *>(&pointer[(y + 8) * m_stride + x]) = row1;
     }
 
 private:
