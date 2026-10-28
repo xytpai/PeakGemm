@@ -26,4 +26,3 @@
 
 #include "peak_gemm/backend/runtime.hpp"
 #include "peak_gemm/data.hpp"
-#include "peak_gemm/kernel/rmsnorm.hpp"

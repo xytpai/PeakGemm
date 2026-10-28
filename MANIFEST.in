@@ -1,2 +1,0 @@
-recursive-include include *.hpp
-recursive-include PeakGemm/csrc *.cu

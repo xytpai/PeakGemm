@@ -4,22 +4,9 @@ PeakGemm is a cross-platform library of performance-critical GPU kernels, with s
 
 | Operator | Backend | Arch | Layout | DType |
 | --- | --- | --- | --- | --- |
-| rmsnorm (forward/backward) | cuda / rocm | SM80+ / gfx942, gfx950, gfx1250 | last-dim norm | fp16/bf16/fp32 |
 | hgemm | rocm | gfx950 | nn/nt, optional bias | fp16/bf16 |
 | hgemm | rocm | gfx1250 | nn/nt, optional bias | fp16/bf16 |
 | hgemm | cuda | sm80 | nn/nt, optional bias | fp16/bf16 |
-
-## RMSNorm
-
-Shared C++ CUDA/HIP [ModelX RMSNorm](https://github.com/xytpai/modelx/blob/main/model/transformer.py#L14),
-with FP32 accumulation, first-order autograd and a compatible module:
-
-    from PeakGemm import RMSNorm, rms_norm
-    norm = RMSNorm(dim=3072, eps=1e-6, device="cuda")
-
-See [RMSNorm API, tests and measured performance](docs/rmsnorm.md).
-HIP gfx950 is runtime-tested; gfx1250 is compile-tested. CUDA validation is
-pending an NVIDIA environment.
 
 ## Performance
 

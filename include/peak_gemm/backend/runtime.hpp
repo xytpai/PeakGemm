@@ -14,11 +14,7 @@
 namespace peak_gemm::backend {
 
 struct Warp {
-// Device compilation must follow each code object's actual wave size,
-    // even when a JIT build targets multiple AMD architectures.
-#if defined(__AMDGCN_WAVEFRONT_SIZE)
-    static constexpr uint32_t size = __AMDGCN_WAVEFRONT_SIZE;
-#elif ROCM_TARGET == 942 || ROCM_TARGET == 950
+#if ROCM_TARGET == 942 || ROCM_TARGET == 950
     static constexpr uint32_t size = 64;
 #elif ROCM_TARGET == 1250
     static constexpr uint32_t size = 32;
