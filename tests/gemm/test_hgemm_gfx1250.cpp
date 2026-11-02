@@ -36,10 +36,10 @@ struct HgemmGfx1250Launch {
             }
         } else if (m % 256 == 0 && n % 256 == 0 && k % 128 == 0) {
             if (bias == nullptr) {
-                kernel::hgemm_tdm_template<scalar_t, 256, 256, 128, 4, 4, 0, false>(
+                kernel::hgemm_tdm_template<scalar_t, 256, 256, 128, 4, 4, 2, 0, false>(
                     a, b, c, m, n, k);
             } else {
-                kernel::hgemm_tdm_template<scalar_t, 256, 256, 128, 4, 4, 0, true>(
+                kernel::hgemm_tdm_template<scalar_t, 256, 256, 128, 4, 4, 2, 0, true>(
                     a, b, c, m, n, k, bias);
             }
         } else if (bias == nullptr) {

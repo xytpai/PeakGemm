@@ -15,7 +15,7 @@
 namespace peak_gemm::kernel {
 
 template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K, uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS,
-          uint32_t WARP_N_STEPS, bool HAS_BIAS>
+          uint32_t WARP_N_STEPS, uint32_t STAGES, bool HAS_BIAS>
 class HgemmBlockTileTdm {
 public:
     using FragmentAT = typename wmma_t::FragmentAT;
@@ -25,7 +25,8 @@ public:
 
     enum : uint32_t {
         WARP_SIZE = backend::Warp::size,
-        STAGES = 2,
+        // One tensor_load_to_lds for A and one for B. tensorcnt counts instructions.
+        COPY_INSTRUCTIONS = 2,
         LDS_PAD = 8,
         LDS_STRIDE = BLOCK_K + LDS_PAD,
         WARP_MASK = WARP_SIZE - 1,
@@ -48,6 +49,7 @@ public:
     using SharedA = scalar_t[STAGES][BLOCK_M * LDS_STRIDE];
     using SharedB = scalar_t[STAGES][BLOCK_N * LDS_STRIDE];
 
+    static_assert(STAGES >= 2);
     static_assert(WARP_SIZE == 32);
     static_assert(BLOCK_K >= 32 && BLOCK_K <= 512 && (BLOCK_K & (BLOCK_K - 1)) == 0,
                   "TDM row padding requires power-of-two BLOCK_K in [32, 512]");
@@ -109,10 +111,11 @@ public:
         __builtin_amdgcn_tensor_load_to_lds(group0, group1, Group0{}, Group0{}, Group1{}, 0);
     }
 
+    template <uint32_t PendingLoads>
     PEAKGEMM_DEVICE_INLINE void wait() {
         // tensorcnt is per wave. Every producer must wait before the block
         // barrier lets any other wave consume (or recycle) the shared tile.
-        asm volatile("s_wait_tensorcnt 0" ::: "memory");
+        asm volatile("s_wait_tensorcnt %0" : : "n"(PendingLoads) : "memory");
         __syncthreads();
     }
 
@@ -195,27 +198,40 @@ private:
     FragmentCT output_[WARP_M_STEPS][WARP_N_STEPS];
 };
 
-template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+template <typename scalar_t, uint32_t STAGES, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t LDS_PAD>
 union alignas(16) HgemmSharedStorageTdm {
     struct {
-        scalar_t a[2][BLOCK_M * (BLOCK_K + 8)];
-        scalar_t b[2][BLOCK_N * (BLOCK_K + 8)];
+        scalar_t a[STAGES][BLOCK_M * (BLOCK_K + LDS_PAD)];
+        scalar_t b[STAGES][BLOCK_N * (BLOCK_K + LDS_PAD)];
     };
     scalar_t c[BLOCK_M * BLOCK_N];
 };
 
+template <uint32_t STAGES, uint32_t COPY_INSTRUCTIONS, uint32_t STAGE, typename block_tile_t>
+PEAKGEMM_DEVICE_INLINE void run_tdm_epilogue_stages(block_tile_t &block_tile, uint32_t &current_stage) {
+    if constexpr (STAGE < STAGES - 1) {
+        block_tile.template wait<(STAGES - 2 - STAGE) * COPY_INSTRUCTIONS>();
+        block_tile.compute(current_stage);
+        current_stage = (current_stage + 1) % STAGES;
+        run_tdm_epilogue_stages<STAGES, COPY_INSTRUCTIONS, STAGE + 1>(block_tile, current_stage);
+    }
+}
+
 template <typename scalar_t, typename wmma_t, typename swizzle_t, uint32_t BLOCK_K,
           uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t WARP_M_STEPS,
-          uint32_t WARP_N_STEPS, uint32_t SWIZZLE_M, bool HAS_BIAS>
+          uint32_t WARP_N_STEPS, uint32_t STAGES, uint32_t SWIZZLE_M, bool HAS_BIAS>
 __attribute__((amdgpu_flat_work_group_size(BLOCK_M_WARPS * BLOCK_N_WARPS * 32, BLOCK_M_WARPS * BLOCK_N_WARPS * 32)))
-__global__ void hgemm_tdm_kernel(
+__global__ void
+hgemm_tdm_kernel(
     scalar_t *c, const scalar_t *a, const scalar_t *b,
     uint32_t m_size, uint32_t n_size, uint32_t k_size, const scalar_t *bias) {
     using BlockTile = HgemmBlockTileTdm<scalar_t, wmma_t, swizzle_t, BLOCK_K,
-                                      BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, HAS_BIAS>;
+                                        BLOCK_M_WARPS, BLOCK_N_WARPS, WARP_M_STEPS, WARP_N_STEPS, STAGES, HAS_BIAS>;
     constexpr uint32_t BLOCK_M = BlockTile::BLOCK_M;
     constexpr uint32_t BLOCK_N = BlockTile::BLOCK_N;
-    using SharedStorage = HgemmSharedStorageTdm<scalar_t, BLOCK_M, BLOCK_N, BLOCK_K>;
+    constexpr uint32_t COPY_INSTRUCTIONS = BlockTile::COPY_INSTRUCTIONS;
+    using SharedStorage = HgemmSharedStorageTdm<scalar_t, STAGES, BLOCK_M, BLOCK_N, BLOCK_K, BlockTile::LDS_PAD>;
+    static_assert((STAGES - 2) * COPY_INSTRUCTIONS <= 63, "gfx1250 TDM tensorcnt immediate exceeds 6 bits");
     static_assert(sizeof(SharedStorage) <= 320 * 1024, "gfx1250 TDM tile exceeds 320 KiB LDS");
 
     const uint32_t m_blocks = core::ceil_div(m_size, BLOCK_M);
@@ -232,45 +248,65 @@ __global__ void hgemm_tdm_kernel(
     // Permit back-to-back WMMA issue (WAVE_SCHED_MODE.DISABLE_XDL_ARB_STALL).
     asm volatile("s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" ::: "memory");
     block_tile.init();
-    block_tile.copy_async(0, a, a_begin, b, b_begin);
+#pragma unroll
+    for (uint32_t stage = 0; stage < STAGES - 1; ++stage) {
+        block_tile.copy_async(stage, a, a_begin + stage * BLOCK_K, b, b_begin + stage * BLOCK_K);
+    }
     BlockTile::schedule_barrier();
 
-    // Expand one complete double-buffer ring so LDS stage offsets are constant.
-    const uint32_t main_iterations = k_size / BLOCK_K - 1;
+    // Two K blocks per iteration. STAGES == 2 keeps both LDS stages as literals.
+    uint32_t current_stage = 0;
+    const uint32_t main_iterations = k_size / BLOCK_K - (STAGES - 1);
     uint32_t iteration = 0;
     for (; iteration + 2 <= main_iterations;
          iteration += 2, a_begin += 2 * BLOCK_K, b_begin += 2 * BLOCK_K) {
-        block_tile.wait();
-        block_tile.copy_async(1, a, a_begin + BLOCK_K, b, b_begin + BLOCK_K);
-        BlockTile::schedule_barrier();
-        block_tile.compute(0);
-        block_tile.wait();
-        block_tile.copy_async(0, a, a_begin + 2 * BLOCK_K, b, b_begin + 2 * BLOCK_K);
-        BlockTile::schedule_barrier();
-        block_tile.compute(1);
+        if constexpr (STAGES == 2) {
+            block_tile.template wait<0>();
+            block_tile.copy_async(1, a, a_begin + BLOCK_K, b, b_begin + BLOCK_K);
+            BlockTile::schedule_barrier();
+            block_tile.compute(0);
+            block_tile.template wait<0>();
+            block_tile.copy_async(0, a, a_begin + 2 * BLOCK_K, b, b_begin + 2 * BLOCK_K);
+            BlockTile::schedule_barrier();
+            block_tile.compute(1);
+        } else {
+            block_tile.template wait<(STAGES - 2) * COPY_INSTRUCTIONS>();
+            block_tile.copy_async((current_stage + STAGES - 1) % STAGES, a, a_begin + (STAGES - 1) * BLOCK_K,
+                                  b, b_begin + (STAGES - 1) * BLOCK_K);
+            BlockTile::schedule_barrier();
+            block_tile.compute(current_stage);
+            current_stage = (current_stage + 1) % STAGES;
+
+            block_tile.template wait<(STAGES - 2) * COPY_INSTRUCTIONS>();
+            block_tile.copy_async((current_stage + STAGES - 1) % STAGES, a, a_begin + STAGES * BLOCK_K,
+                                  b, b_begin + STAGES * BLOCK_K);
+            BlockTile::schedule_barrier();
+            block_tile.compute(current_stage);
+            current_stage = (current_stage + 1) % STAGES;
+        }
     }
-    uint32_t current_stage = 0;
     for (; iteration < main_iterations; ++iteration, a_begin += BLOCK_K, b_begin += BLOCK_K) {
-        block_tile.wait();
-        block_tile.copy_async((current_stage + 1) % 2, a, a_begin + BLOCK_K, b, b_begin + BLOCK_K);
+        block_tile.template wait<(STAGES - 2) * COPY_INSTRUCTIONS>();
+        block_tile.copy_async((current_stage + STAGES - 1) % STAGES, a, a_begin + (STAGES - 1) * BLOCK_K,
+                              b, b_begin + (STAGES - 1) * BLOCK_K);
         BlockTile::schedule_barrier();
         block_tile.compute(current_stage);
-        current_stage = (current_stage + 1) % 2;
+        current_stage = (current_stage + 1) % STAGES;
     }
-    block_tile.wait();
-    block_tile.compute(current_stage);
+    run_tdm_epilogue_stages<STAGES, COPY_INSTRUCTIONS, 0>(block_tile, current_stage);
     block_tile.store(shared.c, block_m_idx, block_n_idx, m_size, n_size);
 }
 
-// A[M,K], B[N,K], C[M,N], all contiguous. Full tiles only, two LDS stages,
-// no split-K. Like hgemm_template, bias is added after rounding C to scalar_t.
+// A[M,K], B[N,K], C[M,N], all contiguous. Full tiles only, no split-K.
+// Like hgemm_template, bias is added after rounding C to scalar_t.
 template <typename scalar_t, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t SWIZZLE_M, bool HAS_BIAS>
+          uint32_t BLOCK_M_WARPS, uint32_t BLOCK_N_WARPS, uint32_t STAGES, uint32_t SWIZZLE_M, bool HAS_BIAS>
 void hgemm_tdm_template(
     const scalar_t *a, const scalar_t *b, scalar_t *c,
     uint32_t m, uint32_t n, uint32_t k, const scalar_t *bias = nullptr, gpuStream_t stream = nullptr) {
     using wmma_t = backend::WmmaDefault<scalar_t, float>;
     using swizzle_t = core::IdentitySwizzle;
+    static_assert(STAGES >= 2);
     static_assert(BLOCK_M_WARPS > 0 && BLOCK_N_WARPS > 0);
     static_assert(wmma_t::M == 16 && wmma_t::N == 16 && wmma_t::K == 32);
     constexpr uint32_t WARP_M_STEPS = BLOCK_M / BLOCK_M_WARPS / wmma_t::M;
@@ -304,13 +340,16 @@ void hgemm_tdm_template(
     if (m % BLOCK_M != 0 || n % BLOCK_N != 0 || k % BLOCK_K != 0) {
         throw std::invalid_argument("TDM HGEMM dimensions must be block-tile aligned");
     }
+    if (k < (STAGES - 1) * BLOCK_K) {
+        throw std::invalid_argument("TDM HGEMM K does not satisfy pipeline alignment");
+    }
     const uint32_t m_blocks = core::ceil_div(m, BLOCK_M);
     const uint32_t n_blocks = core::ceil_div(n, BLOCK_N);
     if (static_cast<uint64_t>(SWIZZLE_M) * n_blocks > std::numeric_limits<uint32_t>::max()) {
         throw std::invalid_argument("TDM HGEMM block swizzle index exceeds uint32");
     }
     hgemm_tdm_kernel<scalar_t, wmma_t, swizzle_t, BLOCK_K, BLOCK_M_WARPS, BLOCK_N_WARPS,
-                     WARP_M_STEPS, WARP_N_STEPS, SWIZZLE_M, HAS_BIAS>
+                     WARP_M_STEPS, WARP_N_STEPS, STAGES, SWIZZLE_M, HAS_BIAS>
         <<<dim3(m_blocks * n_blocks), BLOCK_THREADS, 0, stream>>>(c, a, b, m, n, k, bias);
 }
 
