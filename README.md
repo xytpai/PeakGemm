@@ -92,8 +92,8 @@ peak_gemm::kernel::fused_moe_gpu(
 
 This is a correctness-first baseline: one CTA per token, warp-level dot products,
 and sequential selected experts. Projection inputs/weights and the final output
-use 16-byte loads/stores via `core::Vector` when row addresses are aligned;
-unaligned rows and incomplete vector tails use scalar accesses. Mixed FP32
+use unconditional 16-byte loads/stores via `core::Vector`; there is no
+unaligned or scalar-tail fallback. Mixed FP32
 activations / FP16 or BF16 weights are read in separate 16-byte chunks.
 It uses the common CUDA/HIP runtime, not
 architecture-specific HGEMM tiles or tensor cores. It is not intended to match
@@ -103,9 +103,12 @@ dtype. Thus low-precision results need not be bitwise identical to PyTorch's
 per-operation rounding.
 
 Requirements: positive H/I/E, `1 <= K <= E`, finite logits/activations, and
-`4 * (H + I + E + 2*K) <= 48 KiB` shared memory per CTA. No dimension alignment
-is required. Equal router logits select lower expert ids first (PyTorch does
-not guarantee the same tie order). Output must not overlap any input.
+`4 * (H + I + E + 2*K) <= 48 KiB` shared memory per CTA. All tensor pointers
+must be 16-byte aligned; H/I must be multiples of `16 / sizeof(scalar_t)`
+(4 for FP32, 8 for FP16/BF16). Unsupported alignment is rejected by the host
+launcher before kernel execution. Equal router logits select lower expert ids
+first (PyTorch does not guarantee the same tie order). Output must not overlap
+any input.
 `T == 0` is a no-op with otherwise valid dimensions. The caller supplies
 flattened `[T,H]` tensors and restores any batch/sequence dimensions.
 

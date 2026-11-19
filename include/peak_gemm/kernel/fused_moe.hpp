@@ -20,27 +20,19 @@ PEAKGEMM_DEVICE_INLINE float moe_warp_dot(const input_t *x, const scalar_t *weig
     static_assert(VEC_SIZE % INPUT_VEC_SIZE == 0);
     const uint32_t lane = threadIdx.x % Warp::size;
     float value = 0.0F;
-    uint32_t vector_end = 0;
-    // Row strides and tensor views need not be 16-byte aligned.
-    if ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(weight)) % 16U == 0) {
-        vector_end = size / VEC_SIZE * VEC_SIZE;
-        for (uint32_t k = lane * VEC_SIZE; k < vector_end; k += Warp::size * VEC_SIZE) {
-            core::Vector<scalar_t, VEC_SIZE> w;
-            w.load(weight + k);
-            // FP32 activation + 16-bit weights: two 16B input loads per weight vector.
+    for (uint32_t k = lane * VEC_SIZE; k < size; k += Warp::size * VEC_SIZE) {
+        core::Vector<scalar_t, VEC_SIZE> w;
+        w.load(weight + k);
+        // FP32 activation + 16-bit weights: two 16B input loads per weight vector.
 #pragma unroll
-            for (uint32_t part = 0; part < VEC_SIZE; part += INPUT_VEC_SIZE) {
-                core::Vector<input_t, INPUT_VEC_SIZE> v;
-                v.load(x + k + part);
+        for (uint32_t part = 0; part < VEC_SIZE; part += INPUT_VEC_SIZE) {
+            core::Vector<input_t, INPUT_VEC_SIZE> v;
+            v.load(x + k + part);
 #pragma unroll
-                for (uint32_t j = 0; j < INPUT_VEC_SIZE; ++j) {
-                    value += static_cast<float>(v[j]) * static_cast<float>(w[part + j]);
-                }
+            for (uint32_t j = 0; j < INPUT_VEC_SIZE; ++j) {
+                value += static_cast<float>(v[j]) * static_cast<float>(w[part + j]);
             }
         }
-    }
-    for (uint32_t k = vector_end + lane; k < size; k += Warp::size) {
-        value += static_cast<float>(x[k]) * static_cast<float>(weight[k]);
     }
 #pragma unroll
     for (uint32_t offset = Warp::size / 2; offset > 0; offset /= 2) {
@@ -52,6 +44,7 @@ PEAKGEMM_DEVICE_INLINE float moe_warp_dot(const input_t *x, const scalar_t *weig
 // One CTA owns one token, so all stages need only block-local synchronization.
 // Contiguous row-major tensors: T = gridDim.x, H = hidden_size,
 // I = intermediate_size, E = num_experts. Expert slice E is the shared expert.
+// All tensor pointers and H/I row sizes in bytes must be 16-byte aligned.
 template <typename scalar_t>
 __global__ void fused_moe_kernel(
     const scalar_t *x,      // [T, H] input token activations
@@ -131,25 +124,18 @@ __global__ void fused_moe_kernel(
     constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
     constexpr uint32_t OUTPUT_VEC_SIZE = 16 / sizeof(float);
     auto *token_y = y + static_cast<std::size_t>(blockIdx.x) * hidden_size;
-    uint32_t vector_end = 0;
-    if (reinterpret_cast<uintptr_t>(token_y) % 16U == 0) {
-        vector_end = hidden_size / VEC_SIZE * VEC_SIZE;
-        for (uint32_t h = thread * VEC_SIZE; h < vector_end; h += blockDim.x * VEC_SIZE) {
-            core::Vector<scalar_t, VEC_SIZE> result;
+    for (uint32_t h = thread * VEC_SIZE; h < hidden_size; h += blockDim.x * VEC_SIZE) {
+        core::Vector<scalar_t, VEC_SIZE> result;
 #pragma unroll
-            for (uint32_t part = 0; part < VEC_SIZE; part += OUTPUT_VEC_SIZE) {
-                core::Vector<float, OUTPUT_VEC_SIZE> values;
-                values.load(output + h + part);
+        for (uint32_t part = 0; part < VEC_SIZE; part += OUTPUT_VEC_SIZE) {
+            core::Vector<float, OUTPUT_VEC_SIZE> values;
+            values.load(output + h + part);
 #pragma unroll
-                for (uint32_t j = 0; j < OUTPUT_VEC_SIZE; ++j) {
-                    result[part + j] = static_cast<scalar_t>(values[j]);
-                }
+            for (uint32_t j = 0; j < OUTPUT_VEC_SIZE; ++j) {
+                result[part + j] = static_cast<scalar_t>(values[j]);
             }
-            result.store(token_y + h);
         }
-    }
-    for (uint32_t h = vector_end + thread; h < hidden_size; h += blockDim.x) {
-        token_y[h] = static_cast<scalar_t>(output[h]);
+        result.store(token_y + h);
     }
 }
 
@@ -158,6 +144,7 @@ __global__ void fused_moe_kernel(
 // Slice E is the shared expert. No bias, EP, workspace or auxiliary launches.
 // Arithmetic and intermediates are FP32; only the final output is cast.
 // Inputs must produce finite logits/activations. Equal logits prefer lower ids.
+// All tensor pointers must be 16-byte aligned; H/I must be multiples of 16 / sizeof(scalar_t).
 // y must not overlap any input. T == 0 is a no-op (null pointers are allowed).
 template <typename scalar_t>
 void fused_moe_gpu(
@@ -168,6 +155,10 @@ void fused_moe_gpu(
                   "Fused MoE supports fp32, fp16 and bf16");
     if (hidden_size == 0 || intermediate_size == 0 || num_experts == 0 || top_k == 0 || top_k > num_experts) {
         throw std::invalid_argument("Fused MoE requires positive dimensions and 1 <= top_k <= num_experts");
+    }
+    constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
+    if (hidden_size % VEC_SIZE != 0 || intermediate_size % VEC_SIZE != 0) {
+        throw std::invalid_argument("Fused MoE H/I must be aligned to 16-byte vectors");
     }
     const std::size_t shared_bytes =
         (static_cast<std::size_t>(hidden_size) + intermediate_size + num_experts + top_k) * sizeof(float) + top_k * sizeof(uint32_t);
@@ -181,6 +172,11 @@ void fused_moe_gpu(
     if (token_count == 0) return;
     if (x == nullptr || router == nullptr || gate == nullptr || up == nullptr || down == nullptr || y == nullptr) {
         throw std::invalid_argument("Fused MoE tensor pointers must not be null");
+    }
+    const uintptr_t addresses = reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(router) | reinterpret_cast<uintptr_t>(gate)
+                                | reinterpret_cast<uintptr_t>(up) | reinterpret_cast<uintptr_t>(down) | reinterpret_cast<uintptr_t>(y);
+    if (addresses % 16U != 0) {
+        throw std::invalid_argument("Fused MoE tensor pointers must be 16-byte aligned");
     }
     fused_moe_kernel<scalar_t><<<token_count, 256, shared_bytes, stream>>>(
         x, router, gate, up, down, y, hidden_size, intermediate_size, num_experts, top_k);

@@ -94,7 +94,7 @@ void check_gpu(Error error) {
 }
 
 template <typename scalar_t>
-void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream, uint32_t pointer_offset = 0) {
+void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
     const auto [tokens, hidden, intermediate, experts, top_k] = shape;
     using DataT = Data<scalar_t>;
     const float input_scale = 1.0F / std::sqrt(static_cast<float>(hidden));
@@ -122,18 +122,12 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream, uint32
     if (input_case == InputCase::routed_only) {
         std::fill_n(down.data() + experts * stride, stride, static_cast<scalar_t>(0));
     }
-    // Offset views exercise the scalar fallback even with aligned H/I.
-    const auto copy_input = [pointer_offset](const DataT &host) {
-        DataT device({host.size() + pointer_offset}, gpu);
-        check_gpu(gpuMemcpy(device.data() + pointer_offset, host.data(), host.bytes(), gpuMemcpyHostToDevice));
-        return device;
-    };
-    auto device_x = copy_input(x);
-    auto device_router = copy_input(router);
-    auto device_gate = copy_input(gate);
-    auto device_up = copy_input(up);
-    auto device_down = copy_input(down);
-    const uint32_t guard = 16 / sizeof(scalar_t) + pointer_offset;
+    auto device_x = x.copy_to(gpu);
+    auto device_router = router.copy_to(gpu);
+    auto device_gate = gate.copy_to(gpu);
+    auto device_up = up.copy_to(gpu);
+    auto device_down = down.copy_to(gpu);
+    constexpr uint32_t guard = 16 / sizeof(scalar_t);
     DataT device_y({static_cast<std::size_t>(tokens) * hidden + 2 * guard}, gpu);
     device_y.fill(static_cast<scalar_t>(NAN));
     const auto expected = moe_reference(x, router, gate, up, down, shape);
@@ -141,8 +135,8 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream, uint32
     // Repeated launches must overwrite output without relying on a zeroed buffer.
     for (uint32_t iteration = 0; iteration < 2; ++iteration) {
         peak_gemm::kernel::fused_moe_gpu(
-            device_x.data() + pointer_offset, device_router.data() + pointer_offset, device_gate.data() + pointer_offset,
-            device_up.data() + pointer_offset, device_down.data() + pointer_offset, device_y.data() + guard,
+            device_x.data(), device_router.data(), device_gate.data(),
+            device_up.data(), device_down.data(), device_y.data() + guard,
             tokens, hidden, intermediate, experts, top_k, stream);
         check_gpu(gpuGetLastError());
         check_gpu(gpuStreamSynchronize(stream));
@@ -163,79 +157,95 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream, uint32
     }
     std::cout << peak_gemm::bench::default_type_name<scalar_t>()
               << " T=" << tokens << " H=" << hidden << " I=" << intermediate << " E=" << experts << " K=" << top_k
-              << " offset=" << pointer_offset << " case=" << static_cast<int>(input_case) << " max_diff=" << max_diff << '\n';
+              << " case=" << static_cast<int>(input_case) << " max_diff=" << max_diff << '\n';
 }
 
+template <typename Launch>
+void expect_invalid(const Launch &launch) {
+    try {
+        launch();
+    } catch (const std::invalid_argument &) {
+        return;
+    }
+    throw std::runtime_error("Fused MoE accepted invalid arguments");
+}
+
+template <typename scalar_t>
 void check_arguments() {
+    constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
     auto launch = [](MoeShape shape) {
-        peak_gemm::kernel::fused_moe_gpu<float>(
+        peak_gemm::kernel::fused_moe_gpu<scalar_t>(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             shape.tokens, shape.hidden, shape.intermediate, shape.experts, shape.top_k);
     };
-    launch({0, 1, 1, 1, 1});
+    launch({0, VEC_SIZE, VEC_SIZE, 1, 1});
     const MoeShape invalid[] = {
-        {1, 1, 1, 1, 1}, // Null tensor pointers.
-        {0, 0, 1, 1, 1},
-        {0, 1, 0, 1, 1},
-        {0, 1, 1, 0, 1},
-        {0, 1, 1, 1, 0},
-        {0, 1, 1, 1, 2},
-        {0, 12288, 1, 1, 1}, // Shared-memory limit.
-        {0, 1, UINT32_MAX, 1, 1},
-        {UINT32_MAX, 1, 1, 1, 1},
+        {1, VEC_SIZE, VEC_SIZE, 1, 1}, // Null tensor pointers.
+        {0, 0, VEC_SIZE, 1, 1},
+        {0, VEC_SIZE, 0, 1, 1},
+        {0, VEC_SIZE, VEC_SIZE, 0, 1},
+        {0, VEC_SIZE, VEC_SIZE, 1, 0},
+        {0, VEC_SIZE, VEC_SIZE, 1, 2},
+        {0, VEC_SIZE - 1, VEC_SIZE, 1, 1},
+        {0, VEC_SIZE, VEC_SIZE + 1, 1, 1},
+        {0, 12288, VEC_SIZE, 1, 1}, // Shared-memory limit.
+        {0, VEC_SIZE, UINT32_MAX - VEC_SIZE + 1, 1, 1},
+        {UINT32_MAX, VEC_SIZE, VEC_SIZE, 1, 1},
     };
     for (const auto shape : invalid) {
-        bool rejected = false;
-        try {
-            launch(shape);
-        } catch (const std::invalid_argument &) {
-            rejected = true;
+        expect_invalid([&] { launch(shape); });
+    }
+    // Reject every naturally aligned but non-16B-aligned pointer before launch.
+    Data<scalar_t> buffer({2 * VEC_SIZE}, gpu);
+    for (uint32_t index = 0; index < 6; ++index) {
+        for (uint32_t offset = 1; offset < VEC_SIZE; ++offset) {
+            scalar_t *pointers[] = {buffer.data(), buffer.data(), buffer.data(), buffer.data(), buffer.data(), buffer.data()};
+            pointers[index] += offset;
+            expect_invalid([&] {
+                peak_gemm::kernel::fused_moe_gpu(
+                    pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5],
+                    1, VEC_SIZE, VEC_SIZE, 1, 1);
+            });
         }
-        if (!rejected) throw std::runtime_error("Fused MoE accepted invalid arguments");
     }
     check_gpu(gpuGetLastError());
 }
 
 template <typename scalar_t>
 void run(gpuStream_t stream) {
+    check_arguments<scalar_t>();
+    constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
     const MoeShape shapes[] = {
-        {1, 1, 1, 1, 1},
+        {1, VEC_SIZE, VEC_SIZE, 1, 1},
+        {3, 3 * VEC_SIZE, 5 * VEC_SIZE, 5, 2},
         {5, 128, 256, 8, 2},
         {3, 520, 264, 9, 3},
         {2, 2056, 264, 5, 2},
-        {3, 12, 20, 5, 2},
-        {3, 7, 9, 5, 2},
-        {3, 511, 519, 5, 2},
-        {3, 31, 17, 5, 1},
-        {7, 65, 33, 5, 2},
-        {2, 17, 65, 7, 7},
-        {4, 257, 513, 17, 4},
-        {3, 65, 129, 257, 8},
-        {2, 17, 33, 257, 257},
-        {257, 33, 65, 5, 2},
-        {1, 17, 12268, 1, 1},
-        {1, 12268, 17, 1, 1},
+        {3, 32, 24, 5, 1},
+        {7, 72, 40, 5, 2},
+        {2, 24, 72, 7, 7},
+        {4, 264, 520, 17, 4},
+        {3, 72, 136, 257, 8},
+        {2, 24, 40, 257, 257},
+        {257, 40, 72, 5, 2},
+        {1, 16, 12264, 4, 2}, // Exactly 48 KiB of shared memory.
+        {1, 12264, 16, 4, 2},
     };
     for (const auto shape : shapes) {
         check_case<scalar_t>(shape, InputCase::random, stream);
     }
-    for (uint32_t offset = 1; offset < 16 / sizeof(scalar_t); ++offset) {
-        check_case<scalar_t>({3, 128, 256, 5, 2}, InputCase::random, stream, offset);
-        check_case<scalar_t>({3, 65, 33, 5, 2}, InputCase::random, stream, offset);
-    }
     for (const auto input_case : {InputCase::zero_input, InputCase::tied_router, InputCase::large_logits, InputCase::shared_only, InputCase::routed_only}) {
-        check_case<scalar_t>({3, 33, 65, 5, 3}, input_case, stream);
+        check_case<scalar_t>({3, 40, 72, 5, 3}, input_case, stream);
     }
 }
 
 int main() {
-    check_arguments();
     gpuStream_t stream;
     check_gpu(gpuStreamCreate(&stream));
     run<float>(stream);
     run<__half>(stream);
     run<__bfloat16>(stream);
-    check_case<float>({2, 17, 33, 3, 2}, InputCase::random, nullptr);
+    check_case<float>({2, 24, 40, 3, 2}, InputCase::random, nullptr);
     check_gpu(gpuStreamDestroy(stream));
     std::cout << "ok\n";
     return 0;
