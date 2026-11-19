@@ -37,6 +37,7 @@ An `8192 x 8192 x 8192` snapshot:
 | `tests/common_bench/test_global_bandwidth.cpp` | Device-memory copy bandwidth on a single GPU |
 | `tests/core/*.cpp` | Tests of GPU features and utilities |
 | `tests/gemm/*.cpp` | GEMM correctness tests and benchmarks |
+| `tests/moe/*.cpp` | Fused MoE correctness tests |
 
 ## Test
 
@@ -64,3 +65,46 @@ rocprofv3 --att=true --att-library-path /opt/rocm/lib -d att_out -- ./a.out
 The `./` prefix is required because the current directory is normally not in
 `PATH`. The generated `att_out` directory contains the raw trace, instruction
 statistics, and `ui_output_agent_*_dispatch_*` data for ROCprof Compute Viewer.
+
+## Minimal fused MoE
+
+`include/peak_gemm/kernel/fused_moe.hpp` implements the single-device equivalent
+of `MoE` / `EPMoE` in `skills/kernel_optimization/mega_kernel/transformer_example.py`:
+
+```text
+router -> normalized top-k -> sum(weight * down(silu(gate(x)) * up(x))) + shared(x)
+```
+
+`peak_gemm::kernel::fused_moe_gpu` performs the entire operation in **one GPU
+kernel launch**, including the router and shared expert. There is no EP
+communication, bias, external workspace, or separate dispatch/combine kernel.
+
+```cpp
+#include "peak_gemm/kernel/fused_moe.hpp"
+
+// Device pointers, contiguous row-major tensors:
+// x/y: [T,H], router: [E,H]
+// gate/up: [E+1,I,H], down: [E+1,H,I]
+// The last expert slice (index E) contains the shared expert's weights.
+peak_gemm::kernel::fused_moe_gpu(
+    x, router, gate, up, down, y, T, H, I, E, K, stream);
+```
+
+This is a correctness-first baseline: one CTA per token, warp-level dot products,
+and sequential selected experts. It uses the common CUDA/HIP runtime, not
+architecture-specific HGEMM tiles or tensor cores. It is not intended to match
+grouped-GEMM throughput. FP32, FP16 and BF16 tensors are supported; accumulation,
+routing and intermediate activations use FP32, with one final cast to the output
+dtype. Thus low-precision results need not be bitwise identical to PyTorch's
+per-operation rounding.
+
+Requirements: positive H/I/E, `1 <= K <= E`, finite logits/activations, and
+`4 * (H + I + E + 2*K) <= 48 KiB` shared memory per CTA. No dimension alignment
+is required. Equal router logits select lower expert ids first (PyTorch does
+not guarantee the same tie order). Output must not overlap any input.
+`T == 0` is a no-op with otherwise valid dimensions. The caller supplies
+flattened `[T,H]` tensors and restores any batch/sequence dimensions.
+
+```bash
+bash build_single.sh tests/moe/test_fused_moe.cpp && ./a.out
+```
