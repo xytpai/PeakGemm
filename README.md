@@ -111,7 +111,11 @@ For the main model, gate/up are `[385,2304,5120]` and down is
 T is the number of token rows in this invocation, not session concurrency.
 
 This is a correctness-first baseline: one CTA per token, warp-level dot products,
-and sequential selected experts. Projection inputs/weights and final output
+and sequential selected experts. Top-K uses one warp for repeated argmax with
+expert-id tie breaking via the existing warp shuffle helpers. Up to 384
+corrected scores are distributed across lane registers (covering main/draft
+models); larger expert sets use warp-parallel scans of shared scores.
+Projection inputs/weights and final output
 use unconditional 16-byte loads/stores via the existing `core::Vector`; no
 unaligned or scalar-tail fallback is provided. It uses the common CUDA/HIP
 runtime, not tensor cores or architecture-specific HGEMM tiles.

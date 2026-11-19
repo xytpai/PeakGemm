@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include "peak_gemm/backend/runtime.hpp"
+#include "peak_gemm/core/math.hpp"
 #include "peak_gemm/core/vector.hpp"
 
 namespace peak_gemm::kernel {
@@ -39,6 +40,80 @@ PEAKGEMM_DEVICE_INLINE float moe_warp_dot(const input_t *x, const scalar_t *weig
         value += Warp::shuffle_xor(value, offset);
     }
     return value;
+}
+
+// All lanes of one warp participate. Scores/weights/ids reside in shared memory.
+// CACHED_EXPERTS must cover num_experts, or be zero for a warp-parallel shared
+// scan. All scores/biases are finite, scores >= 0, and 1 <= top_k <= num_experts.
+// The caller synchronizes the block before other warps consume weights/ids.
+template <uint32_t CACHED_EXPERTS>
+PEAKGEMM_DEVICE_INLINE void moe_warp_topk(
+    float *scores, const float *bias, float *weights, uint32_t *ids, uint32_t num_experts, uint32_t top_k) {
+    using Warp = backend::Warp;
+    constexpr uint32_t ITEMS = CACHED_EXPERTS == 0 ? 1 : core::ceil_div(CACHED_EXPERTS, Warp::size);
+    const uint32_t lane = threadIdx.x % Warp::size;
+    float candidates[ITEMS];
+    if constexpr (CACHED_EXPERTS != 0) {
+#pragma unroll
+        for (uint32_t i = 0; i < ITEMS; ++i) {
+            const uint32_t expert = lane + i * Warp::size;
+            candidates[i] = expert < num_experts ? scores[expert] + bias[expert] : -INFINITY;
+        }
+    }
+
+    float sum = 0.0F;
+    for (uint32_t slot = 0; slot < top_k; ++slot) {
+        float best_value = -INFINITY;
+        uint32_t best_id = UINT32_MAX;
+        if constexpr (CACHED_EXPERTS != 0) {
+#pragma unroll
+            for (uint32_t i = 0; i < ITEMS; ++i) {
+                if (candidates[i] > best_value) {
+                    best_value = candidates[i];
+                    best_id = lane + i * Warp::size;
+                }
+            }
+        } else {
+            for (uint32_t expert = lane; expert < num_experts; expert += Warp::size) {
+                const float value = scores[expert] + bias[expert];
+                if (value > best_value) {
+                    best_value = value;
+                    best_id = expert;
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t offset = Warp::size / 2; offset > 0; offset /= 2) {
+            const float value = Warp::shuffle_xor(best_value, offset);
+            const uint32_t id = Warp::shuffle_xor(best_id, offset);
+            if (value > best_value || (value == best_value && id < best_id)) {
+                best_value = value;
+                best_id = id;
+            }
+        }
+        // Broadcast the unbiased score, not the corrected selection value.
+        float weight = 0.0F;
+        if (lane == 0) {
+            weight = scores[best_id];
+            weights[slot] = weight;
+            ids[slot] = best_id;
+        }
+        sum += Warp::shuffle(weight, 0);
+        if constexpr (CACHED_EXPERTS != 0) {
+#pragma unroll
+            for (uint32_t i = 0; i < ITEMS; ++i) {
+                if (lane + i * Warp::size == best_id) candidates[i] = -INFINITY;
+            }
+        } else {
+            if (lane == 0) scores[best_id] = -INFINITY;
+            Warp::barrier();
+        }
+    }
+    // Make lane 0's stores visible before other lanes normalize the weights.
+    Warp::barrier();
+    for (uint32_t slot = lane; slot < top_k; slot += Warp::size) {
+        weights[slot] = weights[slot] / (sum + 1.0e-20F) * 1.5F;
+    }
 }
 
 // DeepSeek-V4.1-Flash text MoE (also DSpark), with all experts on one device.
@@ -79,21 +154,11 @@ __global__ void fused_moe_kernel(
     }
     __syncthreads();
 
-    if (thread == 0) {
-        // Select by score + bias, but normalize the original, unbiased scores.
-        float sum = 0.0F;
-        for (uint32_t slot = 0; slot < top_k; ++slot) {
-            uint32_t best = 0;
-            for (uint32_t expert = 1; expert < num_experts; ++expert) {
-                if (scores[expert] + router_bias[expert] > scores[best] + router_bias[best]) best = expert;
-            }
-            ids[slot] = best;
-            weights[slot] = scores[best];
-            sum += weights[slot];
-            scores[best] = -INFINITY;
-        }
-        for (uint32_t slot = 0; slot < top_k; ++slot) {
-            weights[slot] = weights[slot] / (sum + 1.0e-20F) * 1.5F;
+    if (warp == 0) {
+        if (num_experts <= 384) {
+            moe_warp_topk<384>(scores, router_bias, weights, ids, num_experts, top_k);
+        } else {
+            moe_warp_topk<0>(scores, router_bias, weights, ids, num_experts, top_k);
         }
     }
     __syncthreads();
