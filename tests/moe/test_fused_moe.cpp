@@ -24,15 +24,6 @@ enum class InputCase {
     routed_only,
 };
 
-template <typename scalar_t>
-Data<float> to_float(const Data<scalar_t> &input) {
-    Data<float> output(input.shape());
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        output[i] = static_cast<float>(input[i]);
-    }
-    return output;
-}
-
 // Independent expert-major reference: sqrtsoftplus + correction bias for selection,
 // unbiased normalized weights * 1.5, clamped SwiGLU for routed and shared experts.
 // Reuse the existing CPU GEMM for all projections, with FP32 intermediates.
@@ -41,11 +32,11 @@ Data<float> moe_reference(
     const Data<scalar_t> &x, const Data<scalar_t> &router, const Data<float> &router_bias, const Data<scalar_t> &gate,
     const Data<scalar_t> &up, const Data<scalar_t> &down, MoeShape shape) {
     const auto [tokens, hidden, intermediate, experts, top_k] = shape;
-    const auto xf = to_float(x);
-    const auto rf = to_float(router);
-    const auto gf = to_float(gate);
-    const auto uf = to_float(up);
-    const auto df = to_float(down);
+    const auto xf = x.template astype<float>();
+    const auto rf = router.template astype<float>();
+    const auto gf = gate.template astype<float>();
+    const auto uf = up.template astype<float>();
+    const auto df = down.template astype<float>();
     const peak_gemm::bench::DefaultCpuGemmReference gemm;
     Data<float> logits({tokens, experts}), weights({tokens, experts});
     Data<float> g({tokens, intermediate}), u({tokens, intermediate}), expert_y({tokens, hidden}), output({tokens, hidden});

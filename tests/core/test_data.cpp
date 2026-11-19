@@ -123,6 +123,50 @@ void test_random_data() {
     }
 }
 
+template <typename T>
+void test_float_conversion() {
+    peak_gemm::Data<T> source({2, 3});
+    const float values[] = {-3.25F, -0.1F, 0.0F, 1.1F, 2.0F, 64.5F};
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<T>(values[i]);
+    }
+    const auto &constant = source;
+    auto converted = constant.template astype<float>();
+    assert(converted.shape() == source.shape());
+    assert(converted.device() == cpu);
+    assert(converted.device_index() == -1);
+    auto round_trip = converted.template astype<T>();
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        assert(converted[i] == static_cast<float>(source[i]));
+        assert(static_cast<float>(round_trip[i]) == static_cast<float>(source[i]));
+    }
+    converted[0] = 100.0F;
+    assert(static_cast<float>(source[0]) == values[0]);
+}
+
+void test_dtype_conversion() {
+    test_float_conversion<float>();
+    test_float_conversion<__half>();
+    test_float_conversion<__bfloat16>();
+
+    // Generic conversion must not narrow through FP32.
+    peak_gemm::Data<int> integers({2});
+    integers[0] = -17;
+    integers[1] = 16777217;
+    auto same_type = integers.astype<int>();
+    assert(same_type.data() != integers.data());
+    expect_values(same_type, {-17, 16777217});
+    expect_values(integers.astype<double>(), {-17.0, 16777217.0});
+
+    peak_gemm::Data<double> scalar({});
+    scalar[0] = 16777217.5;
+    const auto copy = scalar.astype<double>();
+    assert(copy.shape().empty());
+    assert(copy.size() == 1);
+    assert(copy[0] == scalar[0]);
+    expect_values(scalar.astype<int>(), {16777217});
+}
+
 void test_validation() {
     using Data = peak_gemm::Data<int>;
     expect_throw<std::invalid_argument>([] { Data data({2, 0, 3}); });
@@ -176,6 +220,8 @@ void test_gpu_data() {
     assert(device.device() == gpu);
     assert(device.device_index() == 0);
     expect_throw<std::logic_error>([&] { (void)device[0]; });
+    expect_throw<std::logic_error>([&] { (void)device.astype<float>(); });
+    expect_values(device.copy_to(cpu).astype<float>(), {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
     auto round_trip = device.copy_to(cpu);
     expect_values(round_trip, {1, 2, 3, 4, 5, 6});
 
@@ -241,6 +287,8 @@ int main() {
     std::cout << "[pass] move semantics\n";
     test_random_data();
     std::cout << "[pass] random data\n";
+    test_dtype_conversion();
+    std::cout << "[pass] dtype conversion\n";
     test_validation();
     std::cout << "[pass] validation\n";
     test_gpu_data();
