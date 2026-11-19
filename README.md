@@ -66,52 +66,75 @@ The `./` prefix is required because the current directory is normally not in
 `PATH`. The generated `att_out` directory contains the raw trace, instruction
 statistics, and `ui_output_agent_*_dispatch_*` data for ROCprof Compute Viewer.
 
-## Minimal fused MoE
+## Single-device DeepSeek-V4.1-Flash MoE
 
-`include/peak_gemm/kernel/fused_moe.hpp` implements the single-device equivalent
-of `MoE` / `EPMoE` in `skills/kernel_optimization/mega_kernel/transformer_example.py`:
+`include/peak_gemm/kernel/fused_moe.hpp` implements the unquantized **text MoE**
+of DeepSeek-V4.1-Flash, including its DSpark expert configuration. It started
+from `skills/kernel_optimization/mega_kernel/transformer_example.py`; the router
+and activation now follow the DSV4.1 model rather than that example's softmax.
 
 ```text
-router -> normalized top-k -> sum(weight * down(silu(gate(x)) * up(x))) + shared(x)
+scores  = sqrt(softplus(x @ router.T))
+ids     = topk(scores + router_bias, K)
+weights = scores[ids] / (sum(scores[ids]) + 1e-20) * 1.5
+expert  = down(silu(min(gate(x), 10)) * clamp(up(x), -10, 10))
+output  = sum(weights * routed_expert(x)) + shared_expert(x)
 ```
 
+The FP32 correction bias affects **selection only**, not the mixture weights.
+The clamp applies to both routed and shared experts; the shared expert is not
+multiplied by the routed scaling factor.
+
 `peak_gemm::kernel::fused_moe_gpu` performs the entire operation in **one GPU
-kernel launch**, including the router and shared expert. There is no EP
-communication, bias, external workspace, or separate dispatch/combine kernel.
+kernel launch**, including the router and shared expert. All experts reside on
+one device: no EP communication, linear projection bias, external workspace,
+or separate dispatch/combine kernel.
 
 ```cpp
 #include "peak_gemm/kernel/fused_moe.hpp"
 
-// Device pointers, contiguous row-major tensors:
-// x/y: [T,H], router: [E,H]
+// Contiguous, 16-byte-aligned device tensors:
+// x/y: [T,H], router: [E,H], router_bias: [E] (float)
 // gate/up: [E+1,I,H], down: [E+1,H,I]
-// The last expert slice (index E) contains the shared expert's weights.
+// Slice E holds the shared expert weights; all other tensors use scalar_t.
 peak_gemm::kernel::fused_moe_gpu(
-    x, router, gate, up, down, y, T, H, I, E, K, stream);
+    x, router, router_bias, gate, up, down, y, T, H, I, E, K, stream);
 ```
 
-This is a correctness-first baseline: one CTA per token, warp-level dot products,
-and sequential selected experts. Projection inputs/weights and the final output
-use unconditional 16-byte loads/stores via `core::Vector`; there is no
-unaligned or scalar-tail fallback. Mixed FP32
-activations / FP16 or BF16 weights are read in separate 16-byte chunks.
-It uses the common CUDA/HIP runtime, not
-architecture-specific HGEMM tiles or tensor cores. It is not intended to match
-grouped-GEMM throughput. FP32, FP16 and BF16 tensors are supported; accumulation,
-routing and intermediate activations use FP32, with one final cast to the output
-dtype. Thus low-precision results need not be bitwise identical to PyTorch's
-per-operation rounding.
+| Configuration | H | I | Routed experts E | Top-K |
+| --- | ---: | ---: | ---: | ---: |
+| DSV4.1-Flash main model | 5120 | 2304 | 384 | 6 |
+| DSpark draft | 5120 | 2304 | 128 | 3 |
 
-Requirements: positive H/I/E, `1 <= K <= E`, finite logits/activations, and
-`4 * (H + I + E + 2*K) <= 48 KiB` shared memory per CTA. All tensor pointers
-must be 16-byte aligned; H/I must be multiples of `16 / sizeof(scalar_t)`
-(4 for FP32, 8 for FP16/BF16). Unsupported alignment is rejected by the host
-launcher before kernel execution. Equal router logits select lower expert ids
-first (PyTorch does not guarantee the same tie order). Output must not overlap
-any input.
-`T == 0` is a no-op with otherwise valid dimensions. The caller supplies
-flattened `[T,H]` tensors and restores any batch/sequence dimensions.
+For the main model, gate/up are `[385,2304,5120]` and down is
+`[385,5120,2304]`; each CTA uses 31,280 bytes of shared memory.
+T is the number of token rows in this invocation, not session concurrency.
+
+This is a correctness-first baseline: one CTA per token, warp-level dot products,
+and sequential selected experts. Projection inputs/weights and final output
+use unconditional 16-byte loads/stores via the existing `core::Vector`; no
+unaligned or scalar-tail fallback is provided. It uses the common CUDA/HIP
+runtime, not tensor cores or architecture-specific HGEMM tiles.
+
+FP32, FP16 and BF16 tensors are supported with **FP32 accumulation/intermediates**
+and a final output cast. The checkpoint's packed FP4/FP8 tensors and scales
+are **not** accepted: dequantize and pack the logical weights before calling.
+This does not reproduce per-operation low-precision rounding or quantization,
+and is not a full-model/checkpoint loader. Vision-specific routing, original
+V4 hash-routing layers, attention, mHC and RMSNorm are outside this kernel.
+
+Requirements: positive H/I/E, `1 <= K <= E`, finite logits/bias/activations, and
+`4 * (H + I + E + 2*K) <= 48 KiB` shared memory per CTA. All tensor pointers,
+including router_bias, must be 16-byte aligned; H/I must be multiples of
+`16 / sizeof(scalar_t)` (4 for FP32, 8 for FP16/BF16).
+The host launcher rejects unsupported alignment before execution.
+Equal corrected scores prefer lower expert ids. Output must not overlap any
+input. `T == 0` is a no-op with otherwise valid dimensions.
 
 ```bash
 bash build_single.sh tests/moe/test_fused_moe.cpp && ./a.out
 ```
+
+Semantic references:
+[official DSV4.1 Gate/Expert/MoE](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py),
+[model config](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json).

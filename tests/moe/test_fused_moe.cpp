@@ -16,6 +16,10 @@ enum class InputCase {
     zero_input,
     tied_router,
     large_logits,
+    negative_logits,
+    tiny_scores,
+    biased_router,
+    clamped_activation,
     shared_only,
     routed_only,
 };
@@ -29,11 +33,12 @@ Data<float> to_float(const Data<scalar_t> &input) {
     return output;
 }
 
-// Independent expert-major reference: full softmax, top-k, then weighted sum.
+// Independent expert-major reference: sqrtsoftplus + correction bias for selection,
+// unbiased normalized weights * 1.5, clamped SwiGLU for routed and shared experts.
 // Reuse the existing CPU GEMM for all projections, with FP32 intermediates.
 template <typename scalar_t>
 Data<float> moe_reference(
-    const Data<scalar_t> &x, const Data<scalar_t> &router, const Data<scalar_t> &gate,
+    const Data<scalar_t> &x, const Data<scalar_t> &router, const Data<float> &router_bias, const Data<scalar_t> &gate,
     const Data<scalar_t> &up, const Data<scalar_t> &down, MoeShape shape) {
     const auto [tokens, hidden, intermediate, experts, top_k] = shape;
     const auto xf = to_float(x);
@@ -50,23 +55,17 @@ Data<float> moe_reference(
     std::vector<uint32_t> ids(experts);
     for (uint32_t t = 0; t < tokens; ++t) {
         auto *row = logits.data() + static_cast<std::size_t>(t) * experts;
-        const float maximum = *std::max_element(row, row + experts);
-        float sum = 0.0F;
         for (uint32_t e = 0; e < experts; ++e) {
-            row[e] = std::exp(row[e] - maximum);
-            sum += row[e];
-        }
-        for (uint32_t e = 0; e < experts; ++e) {
-            row[e] /= sum;
+            row[e] = std::sqrt(row[e] > 20.0F ? row[e] : std::log1p(std::exp(row[e])));
         }
         std::iota(ids.begin(), ids.end(), 0U);
-        std::stable_sort(ids.begin(), ids.end(), [&](uint32_t a, uint32_t b) { return row[a] > row[b]; });
+        std::stable_sort(ids.begin(), ids.end(), [&](uint32_t a, uint32_t b) { return row[a] + router_bias[a] > row[b] + router_bias[b]; });
         float selected_sum = 0.0F;
         for (uint32_t k = 0; k < top_k; ++k) {
             selected_sum += row[ids[k]];
         }
         for (uint32_t k = 0; k < top_k; ++k) {
-            weights[static_cast<std::size_t>(t) * experts + ids[k]] = row[ids[k]] / selected_sum;
+            weights[static_cast<std::size_t>(t) * experts + ids[k]] = row[ids[k]] / (selected_sum + 1.0e-20F) * 1.5F;
         }
     }
     const std::size_t stride = static_cast<std::size_t>(hidden) * intermediate;
@@ -74,7 +73,9 @@ Data<float> moe_reference(
         gemm(xf.data(), gf.data() + e * stride, g.data(), tokens, intermediate, hidden, static_cast<const float *>(nullptr));
         gemm(xf.data(), uf.data() + e * stride, u.data(), tokens, intermediate, hidden, static_cast<const float *>(nullptr));
         for (std::size_t i = 0; i < g.size(); ++i) {
-            g[i] = (g[i] / (1.0F + std::exp(-g[i]))) * u[i];
+            const float gate_value = std::min(g[i], 10.0F);
+            const float up_value = std::clamp(u[i], -10.0F, 10.0F);
+            g[i] = (gate_value / (1.0F + std::exp(-gate_value))) * up_value;
         }
         gemm(g.data(), df.data() + e * stride, expert_y.data(), tokens, hidden, intermediate, static_cast<const float *>(nullptr));
         for (uint32_t t = 0; t < tokens; ++t) {
@@ -101,11 +102,27 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
     const float down_scale = 1.0F / std::sqrt(static_cast<float>(intermediate));
     auto x = DataT::uniform({tokens, hidden}, -1.0F, 1.0F, cpu, 2026);
     auto router = DataT::uniform({experts, hidden}, -input_scale, input_scale, cpu, 2027);
+    auto router_bias = Data<float>::uniform({experts}, -0.25F, 0.25F, cpu, 2031);
     auto gate = DataT::uniform({experts + 1, intermediate, hidden}, -input_scale, input_scale, cpu, 2028);
     auto up = DataT::uniform({experts + 1, intermediate, hidden}, -input_scale, input_scale, cpu, 2029);
     auto down = DataT::uniform({experts + 1, hidden, intermediate}, -down_scale, down_scale, cpu, 2030);
     if (input_case == InputCase::zero_input) x.fill(static_cast<scalar_t>(0));
-    if (input_case == InputCase::tied_router) router.fill(static_cast<scalar_t>(0));
+    if (input_case == InputCase::tied_router || input_case == InputCase::biased_router) {
+        router.fill(static_cast<scalar_t>(0));
+        router_bias.fill(0.0F);
+        if (input_case == InputCase::biased_router) {
+            for (uint32_t e = 0; e < experts; ++e) router_bias[e] = static_cast<float>(e);
+        }
+    }
+    if (input_case == InputCase::negative_logits) {
+        x.fill(static_cast<scalar_t>(1));
+        router.fill(static_cast<scalar_t>(-1000));
+    }
+    if (input_case == InputCase::tiny_scores) {
+        x.fill(static_cast<scalar_t>(1));
+        router.fill(static_cast<scalar_t>(0));
+        for (uint32_t e = 0; e < experts; ++e) router[static_cast<std::size_t>(e) * hidden] = static_cast<scalar_t>(-100);
+    }
     if (input_case == InputCase::large_logits) {
         x.fill(static_cast<scalar_t>(1));
         for (uint32_t e = 0; e < experts; ++e) {
@@ -113,6 +130,19 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
                 router[static_cast<std::size_t>(e) * hidden + h] =
                     static_cast<scalar_t>((static_cast<float>(e) - experts / 2.0F) * 1000.0F / hidden);
             }
+        }
+    }
+    if (input_case == InputCase::clamped_activation) {
+        // Keep the post-clamp output scale comparable to the random cases.
+        down.random_uniform(-down_scale / 128.0F, down_scale / 128.0F, 2030);
+        x.fill(static_cast<scalar_t>(1));
+        gate.fill(static_cast<scalar_t>(0));
+        up.fill(static_cast<scalar_t>(0));
+        constexpr float gates[] = {20.0F, -12.0F, 5.0F, -5.0F, 10.0F, -10.0F};
+        constexpr float ups[] = {30.0F, -30.0F, -30.0F, 30.0F, -10.0F, 10.0F};
+        for (std::size_t row = 0; row < static_cast<std::size_t>(experts + 1) * intermediate; ++row) {
+            gate[row * hidden] = static_cast<scalar_t>(gates[row % 6]);
+            up[row * hidden] = static_cast<scalar_t>(ups[row % 6]);
         }
     }
     const std::size_t stride = static_cast<std::size_t>(hidden) * intermediate;
@@ -124,18 +154,19 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
     }
     auto device_x = x.copy_to(gpu);
     auto device_router = router.copy_to(gpu);
+    auto device_router_bias = router_bias.copy_to(gpu);
     auto device_gate = gate.copy_to(gpu);
     auto device_up = up.copy_to(gpu);
     auto device_down = down.copy_to(gpu);
     constexpr uint32_t guard = 16 / sizeof(scalar_t);
     DataT device_y({static_cast<std::size_t>(tokens) * hidden + 2 * guard}, gpu);
     device_y.fill(static_cast<scalar_t>(NAN));
-    const auto expected = moe_reference(x, router, gate, up, down, shape);
+    const auto expected = moe_reference(x, router, router_bias, gate, up, down, shape);
     float max_diff = 0.0F;
     // Repeated launches must overwrite output without relying on a zeroed buffer.
     for (uint32_t iteration = 0; iteration < 2; ++iteration) {
         peak_gemm::kernel::fused_moe_gpu(
-            device_x.data(), device_router.data(), device_gate.data(),
+            device_x.data(), device_router.data(), device_router_bias.data(), device_gate.data(),
             device_up.data(), device_down.data(), device_y.data() + guard,
             tokens, hidden, intermediate, experts, top_k, stream);
         check_gpu(gpuGetLastError());
@@ -150,7 +181,11 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
         for (std::size_t i = 0; i < expected.size(); ++i) {
             const float diff = std::abs(static_cast<float>(actual[guard + i]) - expected[i]);
             if (!std::isfinite(diff) || diff > 2.0e-6F + tolerance * std::abs(expected[i])) {
-                throw std::runtime_error("Fused MoE accuracy check failed at index " + std::to_string(i));
+                std::cerr << "T=" << tokens << " H=" << hidden << " I=" << intermediate << " E=" << experts << " K=" << top_k
+                          << " case=" << static_cast<int>(input_case) << " dtype=" << peak_gemm::bench::default_type_name<scalar_t>()
+                          << " index=" << i << " expected=" << expected[i] << " actual=" << static_cast<float>(actual[guard + i])
+                          << " diff=" << diff << '\n';
+                throw std::runtime_error("Fused MoE accuracy check failed");
             }
             max_diff = std::max(max_diff, diff);
         }
@@ -158,6 +193,60 @@ void check_case(MoeShape shape, InputCase input_case, gpuStream_t stream) {
     std::cout << peak_gemm::bench::default_type_name<scalar_t>()
               << " T=" << tokens << " H=" << hidden << " I=" << intermediate << " E=" << experts << " K=" << top_k
               << " case=" << static_cast<int>(input_case) << " max_diff=" << max_diff << '\n';
+}
+
+// A hand-computable case: bias selects experts 1/2 despite expert 0's larger
+// raw score. Distinct diagonal down weights expose biased mixture weights,
+// incorrect routed/shared scaling, and both directions of the SwiGLU clamp.
+template <typename scalar_t>
+void check_semantics(gpuStream_t stream) {
+    using DataT = Data<scalar_t>;
+    constexpr uint32_t H = 8, I = 8, E = 3;
+    DataT x({1, H}), router({E, H}), gate({E + 1, I, H}), up({E + 1, I, H}), down({E + 1, H, I});
+    Data<float> bias({E});
+    x.fill(static_cast<scalar_t>(0));
+    router.fill(static_cast<scalar_t>(0));
+    gate.fill(static_cast<scalar_t>(0));
+    up.fill(static_cast<scalar_t>(0));
+    down.fill(static_cast<scalar_t>(0));
+    x[0] = static_cast<scalar_t>(1);
+    router[0] = static_cast<scalar_t>(2);
+    router[H] = static_cast<scalar_t>(-1);
+    bias[0] = 0.0F;
+    bias[1] = 10.0F;
+    bias[2] = 9.0F;
+    constexpr float gates[] = {20.0F, -12.0F, 5.0F, -5.0F, 10.0F, -10.0F, 0.0F, 1.0F};
+    constexpr float ups[] = {30.0F, -30.0F, -30.0F, 30.0F, -10.0F, 10.0F, 1.0F, 0.0F};
+    for (uint32_t e = 0; e <= E; ++e) {
+        for (uint32_t i = 0; i < I; ++i) {
+            gate[(e * I + i) * H] = static_cast<scalar_t>(gates[i]);
+            up[(e * I + i) * H] = static_cast<scalar_t>(ups[i]);
+            down[(e * H + i) * I + i] = static_cast<scalar_t>((e + 1) / 64.0F);
+        }
+    }
+    auto dx = x.copy_to(gpu);
+    auto dr = router.copy_to(gpu);
+    auto db = bias.copy_to(gpu);
+    auto dg = gate.copy_to(gpu);
+    auto du = up.copy_to(gpu);
+    auto dd = down.copy_to(gpu);
+    DataT dy({1, H}, gpu);
+    peak_gemm::kernel::fused_moe_gpu(dx.data(), dr.data(), db.data(), dg.data(), du.data(), dd.data(), dy.data(), 1, H, I, E, 2, stream);
+    check_gpu(gpuGetLastError());
+    check_gpu(gpuStreamSynchronize(stream));
+    const auto actual = dy.copy_to(cpu);
+    const float s1 = std::sqrt(std::log1p(std::exp(-1.0F)));
+    const float s2 = std::sqrt(std::log(2.0F));
+    const float factor = 1.5F * (2.0F * s1 + 3.0F * s2) / (s1 + s2) / 64.0F + 4.0F / 64.0F;
+    for (uint32_t h = 0; h < H; ++h) {
+        const float g = std::min(gates[h], 10.0F);
+        const float expected = g / (1.0F + std::exp(-g)) * std::clamp(ups[h], -10.0F, 10.0F) * factor;
+        const float diff = std::abs(static_cast<float>(actual[h]) - expected);
+        if (!std::isfinite(diff) || diff > 2.0e-6F + peak_gemm::bench::default_base_tolerance<scalar_t>() * std::abs(expected)) {
+            throw std::runtime_error("DSV4.1 routing/clamp semantics check failed");
+        }
+    }
+    std::cout << peak_gemm::bench::default_type_name<scalar_t>() << " DSV4.1 bias/scale/clamp semantics: pass\n";
 }
 
 template <typename Launch>
@@ -175,7 +264,7 @@ void check_arguments() {
     constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
     auto launch = [](MoeShape shape) {
         peak_gemm::kernel::fused_moe_gpu<scalar_t>(
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             shape.tokens, shape.hidden, shape.intermediate, shape.experts, shape.top_k);
     };
     launch({0, VEC_SIZE, VEC_SIZE, 1, 1});
@@ -197,16 +286,25 @@ void check_arguments() {
     }
     // Reject every naturally aligned but non-16B-aligned pointer before launch.
     Data<scalar_t> buffer({2 * VEC_SIZE}, gpu);
+    Data<float> bias({8}, gpu);
     for (uint32_t index = 0; index < 6; ++index) {
         for (uint32_t offset = 1; offset < VEC_SIZE; ++offset) {
             scalar_t *pointers[] = {buffer.data(), buffer.data(), buffer.data(), buffer.data(), buffer.data(), buffer.data()};
             pointers[index] += offset;
             expect_invalid([&] {
                 peak_gemm::kernel::fused_moe_gpu(
-                    pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5],
+                    pointers[0], pointers[1], bias.data(), pointers[2], pointers[3], pointers[4], pointers[5],
                     1, VEC_SIZE, VEC_SIZE, 1, 1);
             });
         }
+    }
+    for (uint32_t offset = 0; offset < 4; ++offset) {
+        expect_invalid([&] {
+            peak_gemm::kernel::fused_moe_gpu(
+                buffer.data(), buffer.data(), offset == 0 ? nullptr : bias.data() + offset,
+                buffer.data(), buffer.data(), buffer.data(), buffer.data(),
+                1, VEC_SIZE, VEC_SIZE, 1, 1);
+        });
     }
     check_gpu(gpuGetLastError());
 }
@@ -214,6 +312,7 @@ void check_arguments() {
 template <typename scalar_t>
 void run(gpuStream_t stream) {
     check_arguments<scalar_t>();
+    check_semantics<scalar_t>(stream);
     constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
     const MoeShape shapes[] = {
         {1, VEC_SIZE, VEC_SIZE, 1, 1},
@@ -221,10 +320,13 @@ void run(gpuStream_t stream) {
         {5, 128, 256, 8, 2},
         {3, 520, 264, 9, 3},
         {2, 2056, 264, 5, 2},
+        {1, 5120, 2304, 1, 1},
         {3, 32, 24, 5, 1},
         {7, 72, 40, 5, 2},
         {2, 24, 72, 7, 7},
         {4, 264, 520, 17, 4},
+        {3, 72, 136, 384, 6},
+        {3, 72, 136, 128, 3},
         {3, 72, 136, 257, 8},
         {2, 24, 40, 257, 257},
         {257, 40, 72, 5, 2},
@@ -234,7 +336,7 @@ void run(gpuStream_t stream) {
     for (const auto shape : shapes) {
         check_case<scalar_t>(shape, InputCase::random, stream);
     }
-    for (const auto input_case : {InputCase::zero_input, InputCase::tied_router, InputCase::large_logits, InputCase::shared_only, InputCase::routed_only}) {
+    for (const auto input_case : {InputCase::zero_input, InputCase::tied_router, InputCase::large_logits, InputCase::negative_logits, InputCase::tiny_scores, InputCase::biased_router, InputCase::clamped_activation, InputCase::shared_only, InputCase::routed_only}) {
         check_case<scalar_t>({3, 40, 72, 5, 3}, input_case, stream);
     }
 }
