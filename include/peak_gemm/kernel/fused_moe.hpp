@@ -8,14 +8,38 @@
 #include <type_traits>
 
 #include "peak_gemm/backend/runtime.hpp"
+#include "peak_gemm/core/vector.hpp"
 
 namespace peak_gemm::kernel {
 
 template <typename input_t, typename scalar_t>
 PEAKGEMM_DEVICE_INLINE float moe_warp_dot(const input_t *x, const scalar_t *weight, uint32_t size) {
     using Warp = backend::Warp;
+    constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
+    constexpr uint32_t INPUT_VEC_SIZE = 16 / sizeof(input_t);
+    static_assert(VEC_SIZE % INPUT_VEC_SIZE == 0);
+    const uint32_t lane = threadIdx.x % Warp::size;
     float value = 0.0F;
-    for (uint32_t k = threadIdx.x % Warp::size; k < size; k += Warp::size) {
+    uint32_t vector_end = 0;
+    // Row strides and tensor views need not be 16-byte aligned.
+    if ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(weight)) % 16U == 0) {
+        vector_end = size / VEC_SIZE * VEC_SIZE;
+        for (uint32_t k = lane * VEC_SIZE; k < vector_end; k += Warp::size * VEC_SIZE) {
+            core::Vector<scalar_t, VEC_SIZE> w;
+            w.load(weight + k);
+            // FP32 activation + 16-bit weights: two 16B input loads per weight vector.
+#pragma unroll
+            for (uint32_t part = 0; part < VEC_SIZE; part += INPUT_VEC_SIZE) {
+                core::Vector<input_t, INPUT_VEC_SIZE> v;
+                v.load(x + k + part);
+#pragma unroll
+                for (uint32_t j = 0; j < INPUT_VEC_SIZE; ++j) {
+                    value += static_cast<float>(v[j]) * static_cast<float>(w[part + j]);
+                }
+            }
+        }
+    }
+    for (uint32_t k = vector_end + lane; k < size; k += Warp::size) {
         value += static_cast<float>(x[k]) * static_cast<float>(weight[k]);
     }
 #pragma unroll
@@ -43,7 +67,7 @@ __global__ void fused_moe_kernel(
     const uint32_t lane = thread % Warp::size;
     const uint32_t warp_count = blockDim.x / Warp::size;
     const auto *token = x + static_cast<std::size_t>(blockIdx.x) * hidden_size;
-    extern __shared__ float shared[];
+    extern __shared__ __align__(16) float shared[];
     float *output = shared;
     float *activation = output + hidden_size;
     float *logits = activation + intermediate_size;
@@ -104,8 +128,28 @@ __global__ void fused_moe_kernel(
         // All warps must finish reading activation before the next expert.
         __syncthreads();
     }
-    for (uint32_t h = thread; h < hidden_size; h += blockDim.x) {
-        y[static_cast<std::size_t>(blockIdx.x) * hidden_size + h] = static_cast<scalar_t>(output[h]);
+    constexpr uint32_t VEC_SIZE = 16 / sizeof(scalar_t);
+    constexpr uint32_t OUTPUT_VEC_SIZE = 16 / sizeof(float);
+    auto *token_y = y + static_cast<std::size_t>(blockIdx.x) * hidden_size;
+    uint32_t vector_end = 0;
+    if (reinterpret_cast<uintptr_t>(token_y) % 16U == 0) {
+        vector_end = hidden_size / VEC_SIZE * VEC_SIZE;
+        for (uint32_t h = thread * VEC_SIZE; h < vector_end; h += blockDim.x * VEC_SIZE) {
+            core::Vector<scalar_t, VEC_SIZE> result;
+#pragma unroll
+            for (uint32_t part = 0; part < VEC_SIZE; part += OUTPUT_VEC_SIZE) {
+                core::Vector<float, OUTPUT_VEC_SIZE> values;
+                values.load(output + h + part);
+#pragma unroll
+                for (uint32_t j = 0; j < OUTPUT_VEC_SIZE; ++j) {
+                    result[part + j] = static_cast<scalar_t>(values[j]);
+                }
+            }
+            result.store(token_y + h);
+        }
+    }
+    for (uint32_t h = vector_end + thread; h < hidden_size; h += blockDim.x) {
+        token_y[h] = static_cast<scalar_t>(output[h]);
     }
 }
 

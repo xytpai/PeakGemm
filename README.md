@@ -91,7 +91,11 @@ peak_gemm::kernel::fused_moe_gpu(
 ```
 
 This is a correctness-first baseline: one CTA per token, warp-level dot products,
-and sequential selected experts. It uses the common CUDA/HIP runtime, not
+and sequential selected experts. Projection inputs/weights and the final output
+use 16-byte loads/stores via `core::Vector` when row addresses are aligned;
+unaligned rows and incomplete vector tails use scalar accesses. Mixed FP32
+activations / FP16 or BF16 weights are read in separate 16-byte chunks.
+It uses the common CUDA/HIP runtime, not
 architecture-specific HGEMM tiles or tensor cores. It is not intended to match
 grouped-GEMM throughput. FP32, FP16 and BF16 tensors are supported; accumulation,
 routing and intermediate activations use FP32, with one final cast to the output
