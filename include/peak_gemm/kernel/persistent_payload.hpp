@@ -20,7 +20,7 @@ struct alignas(64) PayloadChannel {
 };
 
 // CTA-wide wait: leader polls; all threads acquire on success (conservative).
-PEAKGEMM_DEVICE_INLINE bool payload_wait(uint32_t *flag, uint32_t epoch, uint32_t *cancelled, uint32_t max_polls) {
+PEAKGEMM_DEVICE_INLINE bool cta_wait_epoch(uint32_t *flag, uint32_t epoch, uint32_t *cancelled, uint32_t max_polls) {
     __shared__ uint32_t success;
     if (threadIdx.x == 0) {
         success = 0;
@@ -41,7 +41,7 @@ PEAKGEMM_DEVICE_INLINE bool payload_wait(uint32_t *flag, uint32_t epoch, uint32_
 }
 
 // All threads fence before the leader publishes completion.
-PEAKGEMM_DEVICE_INLINE void payload_publish(uint32_t *flag, uint32_t epoch) {
+PEAKGEMM_DEVICE_INLINE void cta_publish_epoch(uint32_t *flag, uint32_t epoch) {
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) backend::store_release_system(flag, epoch);
@@ -63,17 +63,17 @@ __global__ void persistent_payload_kernel(
         if constexpr (PRODUCER) {
             // Wait until this slot's previous epoch is consumed.
             const uint32_t previous = epoch > SLOTS ? epoch - SLOTS : 0;
-            if (!payload_wait(&channel->consumed[slot], previous, &channel->cancelled, max_polls)) return;
+            if (!cta_wait_epoch(&channel->consumed[slot], previous, &channel->cancelled, max_polls)) return;
             for (uint32_t h = threadIdx.x * 4; h < WIDTH; h += blockDim.x * 4) {
                 core::Vector<float, 4> values;
                 values.load(input + static_cast<std::size_t>(tile) * WIDTH + h);
                 values.store(channel->payload[slot] + h);
             }
             // Publish after all payload stores.
-            payload_publish(&channel->ready[slot], epoch);
+            cta_publish_epoch(&channel->ready[slot], epoch);
         } else {
             // Acquire before reading payload.
-            if (!payload_wait(&channel->ready[slot], epoch, &channel->cancelled, max_polls)) return;
+            if (!cta_wait_epoch(&channel->ready[slot], epoch, &channel->cancelled, max_polls)) return;
             for (uint32_t h = threadIdx.x * 4; h < WIDTH; h += blockDim.x * 4) {
                 core::Vector<float, 4> values;
                 values.load(channel->payload[slot] + h);
@@ -82,7 +82,7 @@ __global__ void persistent_payload_kernel(
                 values.store(output + static_cast<std::size_t>(tile) * WIDTH + h);
             }
             // Allow reuse after all payload reads.
-            payload_publish(&channel->consumed[slot], epoch);
+            cta_publish_epoch(&channel->consumed[slot], epoch);
         }
     }
 }
