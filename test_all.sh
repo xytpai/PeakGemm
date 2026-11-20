@@ -13,6 +13,7 @@ tests=(
     tests/arch_bench/*.cpp
     tests/common_bench/*.cpp
     tests/gemm/*.cpp
+    tests/moe/*.cpp
 )
 
 for test_source in "${tests[@]}"; do

@@ -183,6 +183,18 @@ public:
         return result;
     }
 
+    // Return an independent CPU copy with the same shape and converted dtype.
+    // GPU data must be explicitly copied to CPU before conversion.
+    template <typename U>
+    Data<U> astype() const {
+        require_cpu();
+        Data<U> result(shape_);
+        for (std::size_t index = 0; index < size_; ++index) {
+            result[index] = static_cast<U>(data_[index]);
+        }
+        return result;
+    }
+
     Data copy_to(
         DataDevice target,
         int target_device_index = 0) const {
