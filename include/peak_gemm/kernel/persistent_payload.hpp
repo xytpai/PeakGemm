@@ -7,9 +7,8 @@
 
 namespace peak_gemm::kernel {
 
-// One producer GPU -> one consumer GPU. Allocate on the consumer, enable producer
-// P2P access, and zero once before BOTH launches. HIP requires fine-grained memory.
-// A slot may be overwritten only after its previous epoch has been consumed.
+// SPSC channel on the consumer GPU; zero before use and enable producer P2P access.
+// HIP requires fine-grained memory. Epoch 0 means unused.
 template <uint32_t WIDTH, uint32_t SLOTS = 2>
 struct alignas(64) PayloadChannel {
     static_assert(WIDTH > 0 && WIDTH % 4 == 0, "Payload rows must be 16-byte aligned");
@@ -20,9 +19,7 @@ struct alignas(64) PayloadChannel {
     alignas(64) uint32_t cancelled;
 };
 
-// Collective over the CTA. Only the leader polls. Conservatively let every
-// participant acquire the publication directly before accessing the slot;
-// this does not rely on forwarding a leader-only acquire through the CTA barrier.
+// CTA-wide wait: leader polls; all threads acquire on success (conservative).
 PEAKGEMM_DEVICE_INLINE bool payload_wait(uint32_t *flag, uint32_t epoch, uint32_t *cancelled, uint32_t max_polls) {
     __shared__ uint32_t success;
     if (threadIdx.x == 0) {
@@ -43,8 +40,7 @@ PEAKGEMM_DEVICE_INLINE bool payload_wait(uint32_t *flag, uint32_t epoch, uint32_
     return acquired;
 }
 
-// All payload-writing/reading threads participate. Drain every thread's accesses
-// before the leader publishes; a leader-only fence cannot drain other writers.
+// All threads fence before the leader publishes completion.
 PEAKGEMM_DEVICE_INLINE void payload_publish(uint32_t *flag, uint32_t epoch) {
     __threadfence_system();
     __syncthreads();
@@ -52,45 +48,40 @@ PEAKGEMM_DEVICE_INLINE void payload_publish(uint32_t *flag, uint32_t epoch) {
     __syncthreads();
 }
 
-// Teaching example, NOT an MoE/all-to-all or a throughput-tuned transport.
-// Launch exactly ONE 1D CTA on each GPU, on separate device streams:
-//   producer: input [tiles, WIDTH] local to producer, output == nullptr;
-//   consumer: input == nullptr, output [tiles, WIDTH] local to consumer.
-// Inputs/outputs are 16B aligned and do not alias channel storage.
-// first_epoch starts at 1, advances by tiles per invocation, and must not wrap.
-// Relaunch/reset/free only after BOTH kernels finish; do not overlap invocations.
-// max_polls bounds a missing/slow peer (not a wall-clock timeout); on cancellation,
-// discard output, synchronize both GPUs, then reset the channel before retrying.
+// Demo: one 1D CTA per GPU. Launch both endpoints before waiting for either.
+// Producer input / consumer output: [tiles, WIDTH], 16B aligned, no aliasing.
+// Epochs start at 1, continue across calls, and must not wrap.
+// Both kernels must finish before relaunch/reset/free. Cancellation invalidates
+// output; reset before retrying. max_polls is an iteration budget, not a timer.
 template <bool PRODUCER, uint32_t WIDTH, uint32_t SLOTS = 2>
 __global__ void persistent_payload_kernel(
     const float *input, float *output, PayloadChannel<WIDTH, SLOTS> *channel,
     uint32_t tiles, uint32_t first_epoch, uint32_t max_polls) {
     for (uint32_t tile = 0; tile < tiles; ++tile) {
         const uint32_t epoch = first_epoch + tile;
-        const uint32_t slot = (epoch - 1) % SLOTS;
+        const uint32_t slot = epoch % SLOTS;
         if constexpr (PRODUCER) {
-            // 1. Backpressure: don't overwrite data the peer is still reading.
+            // Wait until this slot's previous epoch is consumed.
             const uint32_t previous = epoch > SLOTS ? epoch - SLOTS : 0;
             if (!payload_wait(&channel->consumed[slot], previous, &channel->cancelled, max_polls)) return;
-            // 2. Vector stores target the consumer's device memory over P2P.
             for (uint32_t h = threadIdx.x * 4; h < WIDTH; h += blockDim.x * 4) {
                 core::Vector<float, 4> values;
                 values.load(input + static_cast<std::size_t>(tile) * WIDTH + h);
                 values.store(channel->payload[slot] + h);
             }
-            // 3. Publish ready only AFTER the entire payload is visible.
+            // Publish after all payload stores.
             payload_publish(&channel->ready[slot], epoch);
         } else {
-            // 4. Acquire ready BEFORE reading payload. No host event per tile.
+            // Acquire before reading payload.
             if (!payload_wait(&channel->ready[slot], epoch, &channel->cancelled, max_polls)) return;
             for (uint32_t h = threadIdx.x * 4; h < WIDTH; h += blockDim.x * 4) {
                 core::Vector<float, 4> values;
                 values.load(channel->payload[slot] + h);
 #pragma unroll
-                for (uint32_t j = 0; j < 4; ++j) values[j] += 1.0F; // Stand-in for tile compute.
+                for (uint32_t j = 0; j < 4; ++j) values[j] += 1.0F; // Demo compute.
                 values.store(output + static_cast<std::size_t>(tile) * WIDTH + h);
             }
-            // 5. Release the slot only AFTER all threads have consumed it.
+            // Allow reuse after all payload reads.
             payload_publish(&channel->consumed[slot], epoch);
         }
     }

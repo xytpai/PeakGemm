@@ -127,7 +127,7 @@ void check_channel(int producer, int consumer) {
             const float value = valid ? host[i - 4] + 1.0F : -12345.0F;
             if (actual[i] != value) throw std::runtime_error("Stale/partial payload or output guard overwritten");
         }
-        for (uint32_t t = 0; t < tiles; ++t) expected[(epoch + t - 1) % SLOTS] = epoch + t;
+        for (uint32_t t = 0; t < tiles; ++t) expected[(epoch + t) % SLOTS] = epoch + t;
         for (uint32_t s = 0; s < SLOTS; ++s) {
             if (state.ready[s] != expected[s] || state.consumed[s] != expected[s]) {
                 throw std::runtime_error("Payload epoch/ack mismatch");
@@ -149,14 +149,14 @@ void check_missing_peer(int producer, int consumer) {
     ChannelStorage<Channel> storage(consumer);
     Data<float> input({3, 5120}, gpu, producer), output({3, 5120}, gpu, consumer);
     input.fill(1.0F);
-    // Producer can fill two slots, but must not overwrite slot 0 without an ack.
+    // Epochs 1/2 fill slots 1/0; epoch 3 must wait for slot 1's ack.
     check_gpu(gpuSetDevice(producer));
     peak_gemm::kernel::persistent_payload_kernel<true, 5120><<<1, 256>>>(
         input.data(), nullptr, storage.pointer, 3, 1, 128);
     check_gpu(gpuGetLastError());
     check_gpu(gpuDeviceSynchronize());
     auto state = storage.snapshot();
-    if (!state.cancelled || state.ready[0] != 1 || state.ready[1] != 2 || state.consumed[0] != 0) {
+    if (!state.cancelled || state.ready[0] != 2 || state.ready[1] != 1 || state.consumed[0] != 0 || state.consumed[1] != 0) {
         throw std::runtime_error("Producer backpressure/cancellation failed");
     }
     // A late consumer observes cancellation and must not consume partial/stale work.
@@ -177,7 +177,7 @@ void check_missing_peer(int producer, int consumer) {
     check_gpu(gpuGetLastError());
     check_gpu(gpuDeviceSynchronize());
     state = storage.snapshot();
-    if (!state.cancelled || state.consumed[0] != 0) throw std::runtime_error("Consumer cancellation failed");
+    if (!state.cancelled || state.consumed[1] != 0) throw std::runtime_error("Consumer cancellation failed");
     std::cout << "[pass] missing peer / backpressure / cancellation\n";
 }
 
@@ -198,6 +198,7 @@ int main() {
     check_channel<5120, 1>(0, 1);
     check_channel<5120, 2>(0, 1);
     check_channel<5120, 2>(1, 0);
+    check_channel<5120, 3>(0, 1);
     check_channel<8200, 2>(0, 1);
     check_missing_peer(0, 1);
     check_gpu(gpuSetDevice(original));

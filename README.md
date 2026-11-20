@@ -145,64 +145,36 @@ Semantic references:
 
 ## Minimal persistent P2P payload handshake
 
-Start with `include/peak_gemm/kernel/persistent_payload.hpp` (the two
-`PRODUCER` branches are the entire data path) and
-`tests/core/test_persistent_payload.cpp` (two-GPU setup and launch order).
-This is a **single-producer/single-consumer teaching example**, not an EP8
-MoE implementation or a throughput-tuned transport.
+`kernel/persistent_payload.hpp` is a two-GPU SPSC demo, not EP8 MoE or a tuned
+transport. One persistent CTA sends rows; the other adds one and writes output.
+Payload accesses reuse `core::Vector<float, 4>` (16B).
 
-One persistent CTA runs on each of two GPUs. GPU0 copies rows to a two-slot
-channel in GPU1's memory; GPU1 reads a row, adds one, and writes local output.
-Both roles reuse `core::Vector<float, 4>` for 16B payload loads/stores.
+Epochs start at 1; `slot = epoch % SLOTS`. Two slots allow sending the next row
+while the peer consumes the previous one. A single slot also works.
 
 ```text
-Producer GPU0                          Consumer GPU1
-wait consumed[slot] == previous epoch
-write the whole payload over P2P
-all writers fence + CTA barrier
-release ready[slot] = epoch     ------> acquire ready[slot] == epoch
-                                       all reader threads acquire
-                                       read payload / compute / write output
-                                       all readers fence + CTA barrier
-acquire consumed before reuse  <------ release consumed[slot] = epoch
+producer: wait consumed[slot] == max(epoch - SLOTS, 0)
+          write payload -> release ready[slot] = epoch
+consumer: acquire ready[slot] == epoch
+          read / compute -> release consumed[slot] = epoch
 ```
 
-With two slots, sending row N+1 may overlap consuming row N; the ack prevents
-overwriting a row still being consumed. No host event or extra launch per row.
-This example demonstrates ordering/backpressure, **not measured overlap or
-an expected speedup**.
-
-Important constraints:
-
-- Exactly one 1D CTA per GPU, with the same row count and epoch sequence.
-  Launch both endpoints before synchronizing either stream. A same-GPU
-  producer/consumer launch would need a separate residency/progress design.
-- `PayloadChannel` lives on the consumer GPU and is P2P-accessible from the
-  producer. The test checks P2P/native atomic support. HIP uses
-  `hipExtMallocWithFlags(..., hipDeviceMallocFinegrained)` for the **whole
-  channel**, not ordinary coarse-grained `Data` allocation; inputs/outputs
-  still reuse `Data`. CUDA requires a native-peer-atomic-capable GPU pair.
-- System-scope release/acquire helpers are in `backend/system_atomic.hpp`.
-  Every writer fences before the leader publishes ready. Conservatively, every
-  consumer thread acquires before loading payload; this is not a claim that
-  leader-only acquire followed by a correctly ordered CTA barrier is invalid.
-  The example does not rely on that alternative. `volatile` alone is not a
-  publication protocol.
-- Zero the channel once before use. Start epoch at 1 and advance it by the
-  number of rows after each invocation; no uint32 wrap. Wait for **both**
-  kernels before relaunching, resetting or freeing the channel. No overlapping
-  invocations on one channel.
-- Polling is bounded by `max_polls` (iterations, not time). A timeout sets a
-  shared cancellation flag; all output is then invalid. After both endpoints
-  finish, reset the channel and restart at epoch 1. This is a debug escape,
-  not recovery from a failed GPU or a production distributed fault protocol.
-
-Run (automatically included in `test_all.sh`; skips unsupported GPU pairs):
+- Zero the channel before first use; epoch 0 means unused. Continue epochs
+  across calls without uint32 wrap. Wait for both kernels before relaunch,
+  reset or free; no concurrent invocations on the same channel.
+- Launch both endpoints before synchronizing either. Each GPU runs one 1D CTA.
+- Allocate the channel on the consumer GPU with producer P2P access and native
+  peer atomics. HIP needs fine-grained allocation for the whole channel
+  (`hipExtMallocWithFlags`); ordinary inputs/outputs use `Data`.
+- All threads fence before the leader publishes. The demo conservatively uses
+  per-thread acquire after leader polling. See `backend/system_atomic.hpp`.
+- `max_polls` bounds polling iterations, not elapsed time. Cancellation makes
+  output invalid: finish both kernels, reset the channel, restart at epoch 1.
+  This is a debug escape, not GPU-failure recovery.
 
 ```bash
 bash build_single.sh tests/core/test_persistent_payload.cpp && ./a.out
 ```
 
-Tests cover 16B and multi-iteration rows, H=5120, one/two slots, repeated
-invocations without resetting flags, delayed producer/consumer startup,
-both transfer directions, output guards and missing-peer cancellation.
+The test covers slot reuse, delayed/missing peers, both transfer directions and
+output guards; unsupported GPU pairs are skipped. No performance claim.
